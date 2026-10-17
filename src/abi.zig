@@ -1858,11 +1858,15 @@ test "stream and free: writing and reading many pages, memory follows one page" 
     const per_page_limit = 64;
     try std.testing.expect(pdf.items.len / pages > per_page_limit * 4);
     try std.testing.expect(write_live[pages - 1] - write_live[9] <= per_page_limit * (pages - 10));
-    // Reading: after the first page (which loads the font), each page leaves nothing behind
-    // and needs no more than the last.
+    // Reading: after the first page (which loads the font), each page leaves nothing behind, and
+    // no page needs more working memory than the early pages did. The peak is a bound, not one
+    // value: the same page's peak can differ by allocator state (on aarch64 Linux with glibc it
+    // alternates between two values, 18 KB apart, from page to page), while working memory kept
+    // by mistake would grow with the page number and pass the bound.
+    const early_peak = std.mem.max(usize, read_peak[1..11]);
     for (1..pages) |p| {
         try std.testing.expectEqual(read_live[1], read_live[p]);
-        try std.testing.expectEqual(read_peak[1], read_peak[p]);
+        try std.testing.expect(read_peak[p] <= early_peak);
         // A page's content streams are read once and not cached. A cached one costs only some
         // 150 bytes in an arena that grows by chunks, so live bytes alone would not show it
         // until a chunk fills (about 1000 pages here).

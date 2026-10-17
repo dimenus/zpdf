@@ -13,6 +13,11 @@
 
 #include "zpdf.h"
 
+#ifdef _WIN32
+#include <fcntl.h>
+#include <io.h>
+#endif
+
 #define THREADS 4
 #define ROUNDS 8
 
@@ -278,6 +283,10 @@ int main(int argc, char **argv) {
     for (size_t i = 0; i < THREADS; i++) EXPECT(pthread_join(threads[i], NULL) == 0);
     free(font_bytes);
     free(pdf_bytes);
+#ifdef _WIN32
+    // Text-mode stdout writes "\r\n" for "\n", and the build compares the bytes.
+    _setmode(_fileno(stdout), _O_BINARY);
+#endif
     printf("abi-test: ok\n");
     return 0;
 }
