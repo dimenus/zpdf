@@ -247,6 +247,16 @@ pub fn build(b: *std.Build) void {
     csharp_check.addArg("tools/zig build dotnet-codegen");
     test_step.dependOn(&csharp_check.step);
 
+    // README.md's C# examples are the code a test compiles and runs (ReadmeExamples.cs).
+    const readme_check = b.addRunArtifact(b.addExecutable(.{ .name = "readme-examples", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/readme-examples.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) }));
+    readme_check.addFileArg(b.path("README.md"));
+    readme_check.addFileArg(b.path("dotnet/Zpdf.Tests/ReadmeExamples.cs"));
+    test_step.dependOn(&readme_check.step);
+
     // The .NET library's tests against this libzpdf. Needs the .NET SDK.
     const dotnet_test = b.addSystemCommand(&.{ "dotnet", "test", "dotnet/Zpdf.Tests/Zpdf.Tests.csproj", "-c", "Release" });
     dotnet_test.addPrefixedDirectoryArg("--property:ZpdfNativeDir=", native.getEmittedBin().dirname());

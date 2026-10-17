@@ -18,6 +18,9 @@
         <Version>0.1.0</Version>
         <Description>A PDF writer and text reader (zpdf, in Zig) for .NET.</Description>
         <PackageLicenseFile>LICENSE</PackageLicenseFile>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+        <RepositoryUrl>https://github.com/dimenus/zpdf</RepositoryUrl>
+        <PackageProjectUrl>https://github.com/dimenus/zpdf</PackageProjectUrl>
     </PropertyGroup>
 
     <PropertyGroup>
@@ -45,6 +48,7 @@
         <None Include="$(_ZpdfRuntimes)/osx-arm64/native/libzpdf.dylib" Pack="true" PackagePath="runtimes/osx-arm64/native/" Visible="false" />
         <None Include="$(_ZpdfRuntimes)/win-x64/native/zpdf.dll" Pack="true" PackagePath="runtimes/win-x64/native/" Visible="false" />
         <None Include="$(MSBuildThisFileDirectory)../../LICENSE" Pack="true" PackagePath="" Visible="false" />
+        <None Include="$(MSBuildThisFileDirectory)../../README.md" Pack="true" PackagePath="" Visible="false" />
     </ItemGroup>
 
     <ItemGroup>
