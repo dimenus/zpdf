@@ -143,9 +143,11 @@ static int32_t lend_commit(void *user, size_t len) {
 // One page: the line in the embedded font, "Helvetica", a rectangle, and a place for later text.
 // Returns the later place and Helvetica's id.
 static void draw_page(zpdf_context *ctx, uint32_t doc, uint32_t font, const char *line, uint32_t *later, uint32_t *helvetica) {
-    uint32_t embedded = 0, page = 0;
+    uint32_t embedded = 0, standard = 0, page = 0;
     CHECK(zpdf_doc_add_font(ctx, doc, font, &embedded));
-    CHECK(zpdf_doc_add_standard_font(ctx, doc, 0, helvetica));
+    CHECK(zpdf_font_open_standard(ctx, 0, &standard));
+    CHECK(zpdf_doc_add_font(ctx, doc, standard, helvetica));
+    CHECK(zpdf_font_close(ctx, standard));
     CHECK(zpdf_doc_begin_page(ctx, doc, 612, 792, &page));
     CHECK(zpdf_doc_draw_text(ctx, doc, page, embedded, 24, 72, 720, 0, 0, 0, (const uint8_t *)line, strlen(line), 0));
     CHECK(zpdf_doc_draw_text(ctx, doc, page, *helvetica, 12, 72, 690, 0, 0.5, 0.5, (const uint8_t *)"Helvetica", 9, 0));

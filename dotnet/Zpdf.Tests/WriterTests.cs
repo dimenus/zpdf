@@ -45,9 +45,11 @@ public sealed class WriterTests
         try
         {
             uint doc;
+            uint standard;
             uint font;
             ZpdfLibrary.Check(ZpdfAbi.zpdf_doc_new(context, 1, &doc));
-            ZpdfLibrary.Check(ZpdfAbi.zpdf_doc_add_standard_font(context, doc, (uint)StandardFont.Helvetica, &font));
+            ZpdfLibrary.Check(ZpdfAbi.zpdf_font_open_standard(context, (uint)StandardFont.Helvetica, &standard));
+            ZpdfLibrary.Check(ZpdfAbi.zpdf_doc_add_font(context, doc, standard, &font));
             for (var p = 0; p < Pages; p++)
             {
                 uint page;

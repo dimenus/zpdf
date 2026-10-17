@@ -41,7 +41,7 @@ namespace Zpdf;
 public sealed unsafe partial class PdfWriter : IDisposable
 {
     // Text up to this many UTF-8 bytes is encoded on the stack; longer text in a pooled array.
-    private const int StackTextBytes = 512;
+    internal const int StackTextBytes = 512;
 
     private static readonly UTF8Encoding StrictUtf8 = new(encoderShouldEmitUTF8Identifier: false, throwOnInvalidBytes: true);
 
@@ -104,8 +104,12 @@ public sealed unsafe partial class PdfWriter : IDisposable
     /// <summary>One of the 14 standard fonts that need no embedding (the text ones).</summary>
     public FontId AddStandardFont(StandardFont font)
     {
+        var context = Enter();
+        uint standard;
         uint id;
-        Call(ZpdfAbi.zpdf_doc_add_standard_font(Enter(), _document, (uint)font, &id));
+        Call(ZpdfAbi.zpdf_font_open_standard(context, (uint)font, &standard));
+        Call(ZpdfAbi.zpdf_doc_add_font(context, _document, standard, &id));
+        Call(ZpdfAbi.zpdf_font_close(context, standard));
         return new FontId(id);
     }
 
@@ -240,7 +244,7 @@ public sealed unsafe partial class PdfWriter : IDisposable
 
     // UTF-8 for zpdf, in `stack` when it fits; invalid UTF-16 (a lone surrogate) throws rather than
     // being drawn as U+FFFD.
-    private static ReadOnlySpan<byte> Encode(ReadOnlySpan<char> text, Span<byte> stack, out byte[]? rented)
+    internal static ReadOnlySpan<byte> Encode(ReadOnlySpan<char> text, Span<byte> stack, out byte[]? rented)
     {
         var most = StrictUtf8.GetMaxByteCount(text.Length);
         rented = most > stack.Length ? ArrayPool<byte>.Shared.Rent(most) : null;
@@ -248,7 +252,7 @@ public sealed unsafe partial class PdfWriter : IDisposable
         return buffer[..StrictUtf8.GetBytes(text, buffer)];
     }
 
-    private static void Return(byte[]? rented)
+    internal static void Return(byte[]? rented)
     {
         if (rented != null)
         {

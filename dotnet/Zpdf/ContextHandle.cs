@@ -4,7 +4,7 @@ using Zpdf.Native;
 
 namespace Zpdf;
 
-// One zpdf context, owned by one PdfReader or PdfWriter. Freeing it closes every handle opened in
+// One zpdf context, owned by one PdfReader, PdfWriter or FontMetrics. Freeing it closes every handle opened in
 // it. Free (from Dispose) throws when zpdf refuses, because then the owner gave out a buffer it
 // never freed; the finalizer path cannot throw, and reports it through SafeHandle's release-failed
 // path instead.

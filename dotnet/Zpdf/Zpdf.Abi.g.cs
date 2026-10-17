@@ -51,6 +51,7 @@ internal enum ZpdfError
     ContextBusy = -33,
     BuffersOutstanding = -34,
     SinkFailed = -35,
+    NotEmbedded = -36,
     Unknown = -127,
 }
 
@@ -72,6 +73,24 @@ internal unsafe struct ShapeHeader
 {
     public int pen_x;
     public int pen_y;
+}
+
+// zpdf_font_wrap: this, then line_count LineRecords.
+[StructLayout(LayoutKind.Sequential, Size = 8)]
+internal unsafe struct WrapHeader
+{
+    public uint line_count;
+    public uint reserved;
+}
+
+// One wrapped line: bytes start to start + len of the text, without its trailing spaces or its
+// line break, and its width in points.
+[StructLayout(LayoutKind.Sequential, Size = 16)]
+internal unsafe struct LineRecord
+{
+    public uint start;
+    public uint len;
+    public double width;
 }
 
 // In kb's order. The origin is zpdf.Pen's, the rule the PDF uses.
@@ -181,7 +200,7 @@ internal unsafe struct GlyphRecord
 
 internal static unsafe partial class ZpdfAbi
 {
-    public const uint AbiVersion = 2;
+    public const uint AbiVersion = 3;
     public const string LibraryName = "zpdf";
 
     // abi_version. A caller checks it once, when it loads the library.
@@ -226,12 +245,30 @@ internal static unsafe partial class ZpdfAbi
     [LibraryImport(LibraryName, EntryPoint = "zpdf_font_open")]
     public static partial int zpdf_font_open(ZpdfContext* ctx, byte* bytes, nuint len, int index, byte* variations, nuint variations_len, uint* @out);
 
+    // One of the standard fonts as a font handle: standard is zpdf.StandardFont's order (0
+    // Helvetica ... 11 Courier-BoldOblique). It can be measured, wrapped and added to a document;
+    // shaping, outlines, axes and units per em need a font file (NotEmbedded).
+    [LibraryImport(LibraryName, EntryPoint = "zpdf_font_open_standard")]
+    public static partial int zpdf_font_open_standard(ZpdfContext* ctx, uint standard, uint* @out);
+
     // A document that uses the font keeps it alive until the document closes.
     [LibraryImport(LibraryName, EntryPoint = "zpdf_font_close")]
     public static partial int zpdf_font_close(ZpdfContext* ctx, uint font);
 
     [LibraryImport(LibraryName, EntryPoint = "zpdf_font_units_per_em")]
     public static partial int zpdf_font_units_per_em(ZpdfContext* ctx, uint font, uint* @out);
+
+    // The width of `text` (UTF-8) at `size` points, as one run with no breaks, in points.
+    // direction as in zpdf_font_shape. A standard font's text must be WinAnsi (NotWinAnsi).
+    [LibraryImport(LibraryName, EntryPoint = "zpdf_font_measure")]
+    public static partial int zpdf_font_measure(ZpdfContext* ctx, uint font, double size, byte* text, nuint len, uint direction, double* @out);
+
+    // The lines `text` (UTF-8) wraps to at `max_width` points: a WrapHeader, then a LineRecord
+    // per line. The rules are zpdf.text_layout's: breaks after spaces and around CJK, forced
+    // breaks at line ends, trailing spaces dropped. flags bit 0 breaks a word wider than the line
+    // between characters; without it such a word stands alone on a line wider than max_width.
+    [LibraryImport(LibraryName, EntryPoint = "zpdf_font_wrap")]
+    public static partial int zpdf_font_wrap(ZpdfContext* ctx, uint font, double size, byte* text, nuint len, uint direction, double max_width, uint flags, byte** out_ptr, nuint* out_len);
 
     // AxisRecords, one per axis.
     [LibraryImport(LibraryName, EntryPoint = "zpdf_font_axes")]
@@ -261,10 +298,6 @@ internal static unsafe partial class ZpdfAbi
     // The document's id for the font, for drawing.
     [LibraryImport(LibraryName, EntryPoint = "zpdf_doc_add_font")]
     public static partial int zpdf_doc_add_font(ZpdfContext* ctx, uint doc, uint font, uint* out_font_id);
-
-    // standard: zpdf.StandardFont's order (0 Helvetica ... 11 Courier-BoldOblique).
-    [LibraryImport(LibraryName, EntryPoint = "zpdf_doc_add_standard_font")]
-    public static partial int zpdf_doc_add_standard_font(ZpdfContext* ctx, uint doc, uint standard, uint* out_font_id);
 
     [LibraryImport(LibraryName, EntryPoint = "zpdf_doc_begin_page")]
     public static partial int zpdf_doc_begin_page(ZpdfContext* ctx, uint doc, double width, double height, uint* out_page_id);
