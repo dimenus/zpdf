@@ -1,6 +1,6 @@
 .{
     .name = .zpdf,
-    .version = "0.1.0",
+    .version = "0.1.1",
     .fingerprint = 0xd4779d7ae6ed4dc1,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
