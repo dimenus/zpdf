@@ -1,21 +1,23 @@
 # zpdf
 
-A PDF writer and text reader written in Zig, with one C ABI that the browser (WebAssembly), C and
-.NET all use.
+zpdf writes PDFs and reads the text back out of them. It's written in Zig, and one C ABI serves
+the browser (WebAssembly), C and .NET.
 
-**Writing**
-- TrueType and OpenType fonts, shaped with [kb_text_shape](https://github.com/JimmyLefevre/kb),
-  including complex scripts such as Arabic, Hebrew and Devanagari. Each font is embedded as a
-  subset, and its text can be copied and searched.
-- The 14 standard PDF fonts, which need no embedding.
-- Lines, filled and stroked rectangles, and text placed later, such as "Page 3 of 12".
-- Each page is written when it ends, so memory follows one page, not the whole document.
+## What it does
 
-**Reading**
-- The page count, each page's boxes and rotation, and the text each page draws, as positioned runs,
-  one page at a time. Encrypted files are refused.
+Writing:
+- Real fonts. TrueType and OpenType, shaped with [kb_text_shape](https://github.com/JimmyLefevre/kb),
+  so Arabic, Hebrew, Devanagari and other complex scripts are shaped too. Fonts get embedded as
+  subsets, and the text stays copyable and searchable.
+- The 14 standard PDF fonts, when you don't want to embed anything.
+- Lines, rectangles, and text you fill in later, like "Page 3 of 12".
+- Pages go out as they end. Memory follows one page, not the whole document.
 
-zpdf is young (0.x). Its C ABI carries a version number, which changes whenever the ABI does.
+Reading:
+- Page count, page boxes and rotation, and the text each page draws as positioned runs, one page
+  at a time. Encrypted files are refused.
+
+It's early (0.x). The C ABI has a version number, and it changes whenever the ABI does.
 
 ## .NET
 
@@ -23,11 +25,12 @@ zpdf is young (0.x). Its C ABI carries a version number, which changes whenever 
 dotnet add package Zpdf
 ```
 
-.NET 10, on linux-x64, linux-arm64, osx-arm64 and win-x64. The package carries the native library
-for each.
+.NET 10 on linux-x64, linux-arm64, osx-arm64 and win-x64. The native library for each one ships
+in the package.
 
-Write a PDF into any `Stream` (a file, an HTTP response body). zpdf writes each page straight into
-the pipe's memory, and the flush after each page is where the I/O waits:
+Write a PDF into any Stream, like a file or an HTTP response body. zpdf writes each page straight
+into the pipe's memory, so there's no extra copy, and the flush after each page is where the I/O
+waits:
 
 <!-- example: write -->
 ```csharp
@@ -45,7 +48,7 @@ using (var pdf = PdfWriter.Create(pipe, compress: true))
 await pipe.CompleteAsync();
 ```
 
-Read its pages and text back:
+Read it back:
 
 <!-- example: read -->
 ```csharp
@@ -61,9 +64,9 @@ for (var i = 0; i < reader.PageCount; i++)
 }
 ```
 
-Units are points (1/72 inch), with y going up from the bottom of the page. `PdfWriter` takes any
-`IBufferWriter<byte>`; `AddFont` embeds a font file. Both types are documented in their source,
-in [dotnet/Zpdf](dotnet/Zpdf).
+Units are points (1/72 inch), and y goes up from the bottom of the page. `PdfWriter` takes any
+`IBufferWriter<byte>`, and `AddFont` embeds a font file. The source in [dotnet/Zpdf](dotnet/Zpdf)
+documents both.
 
 ## C
 
@@ -71,32 +74,30 @@ in [dotnet/Zpdf](dotnet/Zpdf).
 tools/zig build abi
 ```
 
-This installs the shared library (in `zig-out/lib`, or `zig-out/bin` on Windows) and its header,
-`zig-out/include/zpdf.h`. The header's comments are the protocol: contexts, handles, buffers and
+You get the shared library (`zig-out/lib`, or `zig-out/bin` on Windows) and `zpdf.h` in
+`zig-out/include`. The comments in the header are the protocol: contexts, handles, buffers and
 error codes.
 
-## In the browser
+## Browser
 
 ```
 tools/zig build wasm
 ```
 
-This builds `zig-out/bin/zpdf.wasm`. [web/zpdf.js](web/zpdf.js) is a small JavaScript wrapper
-for it.
+That builds `zig-out/bin/zpdf.wasm`. [web/zpdf.js](web/zpdf.js) is a thin wrapper around it.
 
-## Building and testing
+## Building
 
-zpdf builds with the Zig version named in `build.zig.zon`. `tools/zig` runs that version through
-[mise](https://mise.jdx.dev); with that version on your PATH, plain `zig` works too.
+Use the Zig version in `build.zig.zon`. `tools/zig` picks it for you through
+[mise](https://mise.jdx.dev); if that version is already on your PATH, plain `zig` is fine.
 
 ```
 tools/zig build test          # unit tests, golden PDFs, the C ABI, the wasm build
 tools/zig build dotnet-test   # the .NET library (needs the .NET 10 SDK)
 ```
 
-[AGENTS.md](AGENTS.md) lists the other checks: valgrind, benchmarks, browser tests and mutation
-testing.
+[AGENTS.md](AGENTS.md) has the rest: valgrind, benchmarks, browser tests and mutation testing.
 
 ## License
 
-zlib; see [LICENSE](LICENSE). kb_text_shape, which zpdf builds in, is also under the zlib license.
+zlib, see [LICENSE](LICENSE). kb_text_shape is zlib too.
