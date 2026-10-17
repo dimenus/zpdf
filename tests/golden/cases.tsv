@@ -1,0 +1,46 @@
+# zig build golden: each row is one zpdf-text run, made twice (compressed, and .plain with --no-compress).
+# name<TAB>font, relative to the harfbuzz package's test/<TAB>zpdf-text arguments, one per column.
+# --text-file=X reads tests/golden/X. Expected hashes: tests/golden/sha256.txt.
+# The corpus cases: t3153's grading corpus (default size 24).
+# Its three cases on macOS system fonts (helvetica-bold-ttc, arialuni-mixed, sfhebrew-variable) are left out:
+# this gate must run from a checkout on any machine. ttc-face1 stands in for the collection case.
+roboto-office	subset/data/fonts/Roboto-Regular.ttf	--index=0	--unicodes=U+006F,U+0066,U+0066,U+0069,U+0063,U+0065
+roboto-eacute	subset/data/fonts/Roboto-Regular.ttf	--index=0	--unicodes=U+0065,U+0301
+deva-brief	subset/data/fonts/NotoSansDevanagari-Regular.ttf	--index=0	--unicodes=U+0915,U+093F,U+0020,U+0915,U+094D,U+0937
+amiri-brief	subset/data/fonts/Amiri-Regular.ttf	--index=0	--unicodes=U+0628,U+0633,U+0645,U+0020,U+0627,U+0644,U+0644,U+0647
+hebrew-brief	subset/data/fonts/NotoIKEAHebrewLatin-Regular.ttf	--index=0	--unicodes=U+05E9,U+05DC,U+05D5,U+05DD,U+0020,U+05E2,U+05D5,U+05DC,U+05DD
+mixed-brief	subset/data/fonts/NotoIKEAHebrewLatin-Regular.ttf	--index=0	--unicodes=U+0068,U+0065,U+006C,U+006C,U+006F,U+0020,U+05E9,U+05DC,U+05D5,U+05DD
+roboto-kern	subset/data/fonts/Roboto-Regular.ttf	--index=0	--unicodes=U+0041,U+0056,U+0041,U+0054,U+0041,U+0052,U+0020,U+0054,U+006F,U+006C,U+006B,U+0069,U+0065,U+006E
+roboto-viet-decomposed	subset/data/fonts/Roboto-Regular.ttf	--index=0	--unicodes=U+0054,U+0069,U+0065,U+0302,U+0301,U+006E,U+0067,U+0020,U+0056,U+0069,U+0065,U+0323,U+0302,U+0074
+roboto-two-lines	subset/data/fonts/Roboto-Regular.ttf	--index=0	--unicodes=U+0066,U+0069,U+0072,U+0073,U+0074	--unicodes=U+0073,U+0065,U+0063,U+006F,U+006E,U+0064
+amiri-harakat	subset/data/fonts/Amiri-Regular.ttf	--index=0	--unicodes=U+0628,U+0650,U+0633,U+0652,U+0645,U+0650
+amiri-lamalef	subset/data/fonts/Amiri-Regular.ttf	--index=0	--unicodes=U+0644,U+0627,U+0020,U+0645,U+0631,U+062D,U+0628,U+0627
+hebrew-niqqud	subset/data/fonts/NotoIKEAHebrewLatin-Regular.ttf	--index=0	--unicodes=U+05E9,U+05B8,U+05C1,U+05DC,U+05D5,U+05B9,U+05DD
+deva-hindi	subset/data/fonts/NotoSansDevanagari-Regular.ttf	--index=0	--unicodes=U+0939,U+093F,U+0928,U+094D,U+0926,U+0940
+t3150-zwnj	shape/data/in-house/fonts/34da9aab7bee86c4dfc3b85e423435822fdf4b62.ttf	--index=0	--unicodes=U+0628,U+200C,U+0628
+t3150-indic-dotted	shape/data/in-house/fonts/1a5face3fcbd929d228235c2f72bbd6f8eb37424.ttf	--index=0	--unicodes=U+0904,U+0020,U+0905,U+0946
+t3150-use-dotted	shape/data/in-house/fonts/46669c8860cbfea13562a6ca0d83130ee571137b.ttf	--index=0	--unicodes=U+0905,U+093A
+ttc-face1	shape/data/in-house/fonts/TTC.ttc	--index=1	--unicodes=U+0041,U+0056,U+0041
+# An RTL paragraph with Latin and digits: runs in kb's visual order (see visualOrder in src/root.zig).
+mixed-rtl	subset/data/fonts/NotoIKEAHebrewLatin-Regular.ttf	--direction=rtl	--unicodes=U+05E9,U+05DC,U+05D5,U+05DD,U+0020,U+0061,U+0062,U+0063,U+0020,U+0031,U+0032,U+0033,U+0020,U+05E2,U+05D5,U+05DC,U+05DD
+# Standard fonts: named, not embedded, WinAnsi text (escapes, the 0x80-0x9F characters, Latin-1).
+std-helvetica	-	--standard=helvetica	--unicodes=U+0043,U+0061,U+0066,U+00E9,U+0020,U+20AC,U+0035,U+0020,U+0028,U+0029,U+005C,U+0020,U+201C,U+006F,U+006B,U+201D,U+0020,U+2014,U+0020,U+00C5,U+0152,U+017D,U+00FF
+std-times-bold	-	--standard=times_bold	--size=18	--text-file=latin-tiny.txt
+std-courier-two-lines	-	--standard=courier_oblique	--size=10	--unicodes=U+0049,U+0074,U+0065,U+006D,U+0020,U+0030,U+0030,U+0031	--unicodes=U+0054,U+006F,U+0074,U+0061,U+006C,U+0020,U+0024,U+0031,U+0032,U+002E,U+0035,U+0030
+# The bench texts (bench/compare.py make_lines), at the bench's 12 pt.
+latin-tiny	subset/data/fonts/Roboto-Regular.ttf	--size=12	--text-file=latin-tiny.txt
+latin-small	subset/data/fonts/Roboto-Regular.ttf	--size=12	--text-file=latin-small.txt
+devanagari-tiny	subset/data/fonts/NotoSansDevanagari-Regular.ttf	--size=12	--text-file=devanagari-tiny.txt
+devanagari-small	subset/data/fonts/NotoSansDevanagari-Regular.ttf	--size=12	--text-file=devanagari-small.txt
+arabic-tiny	subset/data/fonts/Amiri-Regular.ttf	--size=12	--text-file=arabic-tiny.txt
+arabic-small	subset/data/fonts/Amiri-Regular.ttf	--size=12	--text-file=arabic-small.txt
+hebrew-tiny	subset/data/fonts/NotoIKEAHebrewLatin-Regular.ttf	--size=12	--text-file=hebrew-tiny.txt
+hebrew-small	subset/data/fonts/NotoIKEAHebrewLatin-Regular.ttf	--size=12	--text-file=hebrew-small.txt
+# Variable fonts at an instance (instanced outlines, /W, MVAR metrics, the instance name).
+fraunces-thin	subset/data/fonts/Fraunces.ttf	--variation=opsz=144,wght=100	--unicodes=U+006F,U+0066,U+0066,U+0069,U+0063,U+0065
+flex-black-narrow	subset/data/fonts/RobotoFlex-Variable.ttf	--variation=wght=1000,wdth=25	--unicodes=U+0041,U+0056,U+0041,U+0020,U+006F,U+0066,U+0066,U+0069,U+0063,U+0065
+flex-hidden-axes	subset/data/fonts/RobotoFlex-Variable.ttf	--variation=XOPQ=175,YTUC=528,slnt=-10	--unicodes=U+0048,U+0061,U+006D,U+0062,U+0075,U+0072,U+0067
+noto-vf-bold	subset/data/fonts/NotoSans-VF.abc.ttf	--variation=wght=900,wdth=62.5	--unicodes=U+0061,U+0062,U+0063
+mada-black	api/fonts/Mada-VF.ttf	--variation=wght=900	--unicodes=U+0628,U+0633,U+0645,U+0020,U+0627,U+0644,U+0644,U+0647
+gpos-four	shape/data/text-rendering-tests/fonts/TestGPOSFour.ttf	--variation=wght=700	--unicodes=U+0041,U+0056,U+0041
+roboto-variable	subset/data/fonts/Roboto-Variable.ttf	--variation=wght=800,wdth=75	--unicodes=U+0041,U+0056,U+0041,U+0020,U+006F,U+0066,U+0066,U+0069,U+0063,U+0065

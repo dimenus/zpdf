@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# The zig this checkout builds with: build.zig.zon's minimum_zig_version, as mise installs it.
+#
+#   tools/zig <zig arguments>      # in any directory of a zpdf checkout or worktree
+#
+# `zig` on PATH can be another version, and build.zig refuses a different minor version. Run in
+# a worktree of an older commit, this picks that commit's version, so the benches build their base
+# with the zig it needs.
+set -euo pipefail
+root="$(git rev-parse --show-toplevel)"
+version="$(sed -n 's/.*\.minimum_zig_version = "\([^"]*\)".*/\1/p' "$root/build.zig.zon")"
+if [ -z "$version" ]; then
+  echo "tools/zig: no minimum_zig_version in $root/build.zig.zon" >&2
+  exit 2
+fi
+zig="$HOME/.local/share/mise/installs/zig/$version/bin/zig"
+if [ ! -x "$zig" ]; then
+  echo "tools/zig: zig $version is not installed; run: mise install zig@$version" >&2
+  exit 2
+fi
+exec "$zig" "$@"

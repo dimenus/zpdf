@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <!-- The generated C# declarations (zig build abi) compiled and run against libzpdf.
+         `zig build abi-dotnet-test` passes both; the generated file is not in this folder. -->
+    <PropertyGroup>
+        <OutputType>Exe</OutputType>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>disable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+        <StartupObject>Zpdf.AbiTest.Program</StartupObject>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <Compile Include="$([System.IO.Path]::GetFullPath('$(ZpdfAbiCs)', '$(MSBuildStartupDirectory)'))" Condition="'$(ZpdfAbiCs)' != ''" />
+    </ItemGroup>
+
+    <Target Name="RequireZpdfAbiCs" BeforeTargets="Build">
+        <Error Condition="'$(ZpdfAbiCs)' == ''" Text="Set ZpdfAbiCs to the generated Zpdf.Abi.g.cs; zig build abi-dotnet-test does." />
+    </Target>
+
+</Project>

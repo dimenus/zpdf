@@ -1,0 +1,17 @@
+.{
+    .name = .zpdf,
+    .version = "0.0.0",
+    .fingerprint = 0xd4779d7ae6ed4dc1,
+    .minimum_zig_version = "0.17.0",
+    .dependencies = .{
+        .harfbuzz = .{
+            .url = "https://github.com/harfbuzz/harfbuzz/releases/download/14.6.0/harfbuzz-14.6.0.tar.xz",
+            .hash = "N-V-__8AALA2MwYsRwu2ztOutL_7hfr730IcTZrfrcDKkS6V",
+        },
+        .kb = .{
+            .url = "https://codeload.github.com/dimenus/kb/tar.gz/80e3e030c4b2eea3d4da4a5bbd7a6152d94daff9",
+            .hash = "N-V-__8AAGgnHgCv1wSDL4_IKgrH3pIF8IjnIe-fdZa5nnVP",
+        },
+    },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "LICENSE" },
+}

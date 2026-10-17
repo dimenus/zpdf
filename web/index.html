@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>zpdf in the browser</title>
+<style>
+  body { font: 15px system-ui, sans-serif; margin: 24px; max-width: 900px; }
+  label { display: block; margin: 8px 0 4px; }
+  input[type=text] { width: 100%; font-size: 18px; padding: 4px; box-sizing: border-box; }
+  #status { margin: 12px 0; min-height: 1.4em; }
+  #status.error { color: #b00020; }
+  canvas { border: 1px solid #ccc; max-width: 100%; }
+  #axes .axis { display: grid; grid-template-columns: 4em 1fr 5em; gap: 8px; align-items: center; }
+  /* The display rules above would otherwise win over the hidden attribute. */
+  [hidden] { display: none !important; }
+</style>
+</head>
+<body>
+<h1>zpdf in the browser</h1>
+<p>Pick a font and type a line. zpdf.wasm draws it twice: straight onto a canvas from its
+own glyph outlines, and as a PDF that pdf.js draws below. A variable font gets a slider
+per axis; moving one draws both again.</p>
+<label for="font">Font file (.ttf, .otf, .ttc)</label>
+<input id="font" type="file" accept=".ttf,.otf,.ttc,font/*">
+<label for="text">Text</label>
+<input id="text" type="text" value="office AVA">
+<div id="axes"></div>
+<label id="show-hidden-label" hidden><input id="show-hidden" type="checkbox"> Show hidden axes</label>
+<p><button id="make" type="button">Make PDF</button> <a id="download" hidden download="zpdf.pdf">Download PDF</a></p>
+<div id="status"></div>
+<p>Drawn by zpdf (canvas):</p>
+<canvas id="direct" width="612" height="120"></canvas>
+<p>The PDF, drawn by pdf.js:</p>
+<canvas id="page"></canvas>
+
+<script type="module">
+import { Zpdf, drawText, textToPdf } from "./zpdf.js";
+import * as pdfjs from "./pdfjs/pdf.mjs";
+
+pdfjs.GlobalWorkerOptions.workerSrc = "./pdfjs/pdf.worker.mjs";
+const wasm_module = await WebAssembly.compileStreaming(fetch("./zpdf.wasm"));
+
+// The line, as textToPdf places it: 24 pt at x=72, baseline 720 pt up a 792 pt page.
+const SIZE = 24;
+const X = 72;
+const BASELINE_FROM_TOP = 792 - 720;
+
+// Draws page 1 of `pdfBytes` onto `canvas` at `scale` px per PDF point.
+async function renderPdf(pdfBytes, canvas, scale) {
+  // getDocument takes ownership of the buffer it is given, so give it a copy.
+  const loading_task = pdfjs.getDocument({ data: pdfBytes.slice() });
+  try {
+    const doc = await loading_task.promise;
+    const page = await doc.getPage(1);
+    const viewport = page.getViewport({ scale });
+    canvas.width = viewport.width;
+    canvas.height = viewport.height;
+    await page.render({ canvas, viewport }).promise;
+  } finally {
+    // Ends the document's worker-side state; one document per render.
+    await loading_task.destroy();
+  }
+}
+
+// Clears `canvas` to white and fills `text` with `font` at the PDF's place.
+function drawDirect(canvas, font, text) {
+  const ctx = canvas.getContext("2d");
+  ctx.fillStyle = "#fff";
+  ctx.fillRect(0, 0, canvas.width, canvas.height);
+  ctx.fillStyle = "#000";
+  drawText(ctx, font, text, X, BASELINE_FROM_TOP, SIZE);
+}
+
+// Number of pixels darker than mid-grey. The browser test uses it to prove a render drew ink.
+function darkPixels(canvas) {
+  const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+  let count = 0;
+  for (let i = 0; i < data.length; i += 4) {
+    const alpha = data[i + 3] / 255;
+    // Composite over white, because an unpainted pixel is transparent black.
+    const luma = (0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]) * alpha + 255 * (1 - alpha);
+    if (luma < 128) {
+      count++;
+    }
+  }
+  return count;
+}
+
+const status = document.getElementById("status");
+const download = document.getElementById("download");
+const canvas = document.getElementById("page");
+const direct = document.getElementById("direct");
+const axes_box = document.getElementById("axes");
+const show_hidden = document.getElementById("show-hidden");
+
+// The chosen font's bytes, or null before a font is picked or when it failed to load.
+let font_bytes = null;
+// One instance for the canvas view, made again if a trap retires it; the font open in
+// it is the current instance of the chosen font.
+let zpdf = null;
+let open_font = null;
+
+async function liveZpdf() {
+  if (zpdf === null || zpdf.retired) {
+    zpdf = await Zpdf.create(wasm_module);
+    open_font = null;
+  }
+  return zpdf;
+}
+
+// Shows one finished step. `data-seq` counts finished steps, so the browser test can
+// wait for the result of its own action and not read an earlier one.
+function finish(text, isError) {
+  status.className = isError ? "error" : "";
+  status.textContent = text;
+  status.dataset.seq = String(Number(status.dataset.seq ?? 0) + 1);
+}
+
+// The current slider values, as textToPdf's `variations`.
+function variations() {
+  const out = {};
+  for (const input of axes_box.querySelectorAll("input")) {
+    out[input.dataset.tag] = Number(input.value);
+  }
+  return out;
+}
+
+// One row per axis: tag, slider at the default, value. A hidden axis's row shows only
+// when "Show hidden axes" is ticked.
+function buildAxes(axes) {
+  axes_box.replaceChildren();
+  for (const axis of axes) {
+    const row = document.createElement("label");
+    row.className = "axis";
+    row.dataset.hiddenAxis = String(axis.hidden);
+    row.hidden = axis.hidden && !show_hidden.checked;
+    const input = document.createElement("input");
+    input.type = "range";
+    input.dataset.tag = axis.tag;
+    input.min = String(axis.min);
+    input.max = String(axis.max);
+    input.step = "any";
+    input.value = String(axis.default);
+    const value = document.createElement("output");
+    value.textContent = String(axis.default);
+    input.addEventListener("input", () => {
+      value.textContent = String(Math.round(Number(input.value) * 100) / 100);
+      requestMake();
+    });
+    row.append(axis.tag, input, value);
+    axes_box.append(row);
+  }
+  document.getElementById("show-hidden-label").hidden = !axes.some((axis) => axis.hidden);
+}
+
+show_hidden.addEventListener("change", () => {
+  for (const row of axes_box.children) {
+    row.hidden = row.dataset.hiddenAxis === "true" && !show_hidden.checked;
+  }
+});
+
+// Copies `from` onto the visible `to`, size included.
+function show(to, from) {
+  to.width = from.width;
+  to.height = from.height;
+  to.getContext("2d").drawImage(from, 0, 0);
+}
+
+// Clears a visible canvas, so an error never sits beside an older drawing.
+function blank(c) {
+  c.getContext("2d").clearRect(0, 0, c.width, c.height);
+}
+
+async function make() {
+  // The font pick this make belongs to. A make that a newer pick overtook while it
+  // awaited publishes nothing: that pick's own make (or its error) is the current one.
+  const pick = picks;
+  status.className = "";
+  status.textContent = "Working...";
+  download.hidden = true;
+  try {
+    if (font_bytes === null) {
+      throw new Error("Pick a font file first.");
+    }
+    const bytes = font_bytes;
+    const text = document.getElementById("text").value;
+    const z = await liveZpdf();
+    open_font?.close();
+    open_font = null;
+    open_font = z.openFont(bytes, { variations: variations() });
+    // Both views are drawn offscreen and shown together, only when both worked.
+    const direct_off = document.createElement("canvas");
+    direct_off.width = direct.width;
+    direct_off.height = direct.height;
+    drawDirect(direct_off, open_font, text);
+    const pdf = await textToPdf(wasm_module, bytes, text, variations());
+    const page_off = document.createElement("canvas");
+    await renderPdf(pdf, page_off, 1);
+    if (pick !== picks) {
+      return;
+    }
+    show(direct, direct_off);
+    show(canvas, page_off);
+    if (download.href !== "") {
+      URL.revokeObjectURL(download.href);
+    }
+    download.href = URL.createObjectURL(new Blob([pdf], { type: "application/pdf" }));
+    download.hidden = false;
+    finish(`PDF: ${pdf.length} bytes.`, false);
+  } catch (error) {
+    if (pick !== picks) {
+      return;
+    }
+    blank(direct);
+    blank(canvas);
+    finish(error.message, true);
+    // Leaves the error in the console too, with its stack.
+    console.error(error);
+  }
+}
+
+// One make at a time on the canvases. A request during a make runs once after it,
+// with the values current then, so a slider drag ends on its last position.
+let making = null;
+let again = false;
+function requestMake() {
+  if (making !== null) {
+    again = true;
+    return making;
+  }
+  making = (async () => {
+    do {
+      again = false;
+      await make();
+    } while (again);
+    making = null;
+  })();
+  return making;
+}
+
+// Counts font picks, so a pick whose axes arrive after a newer pick is dropped.
+let picks = 0;
+async function pickFont() {
+  const pick = ++picks;
+  font_bytes = null;
+  axes_box.replaceChildren();
+  document.getElementById("show-hidden-label").hidden = true;
+  const file = document.getElementById("font").files[0];
+  if (file === undefined) {
+    return;
+  }
+  try {
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    const z = await liveZpdf();
+    const probe = z.openFont(bytes);
+    let axes;
+    try {
+      axes = probe.axes();
+    } finally {
+      // After a trap the instance is gone; closing would replace the trap's error.
+      if (!z.retired) {
+        probe.close();
+      }
+    }
+    if (pick !== picks) {
+      return;
+    }
+    buildAxes(axes);
+    font_bytes = bytes;
+  } catch (error) {
+    if (pick !== picks) {
+      return;
+    }
+    finish(error.message, true);
+    console.error(error);
+    return;
+  }
+  await requestMake();
+}
+
+document.getElementById("font").addEventListener("change", pickFont);
+document.getElementById("make").addEventListener("click", requestMake);
+
+// For the browser test in web/test/.
+window.zpdfPage = {
+  textToPdf,
+  renderPdf,
+  darkPixels,
+  drawDirect,
+  wasmModule: wasm_module,
+  isIdle: () => making === null,
+  liveBytes: () => zpdf?.liveBytes() ?? 0,
+};
+document.body.dataset.ready = "true";
+</script>
+</body>
+</html>

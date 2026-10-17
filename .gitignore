@@ -1,0 +1,8 @@
+zig-out/
+.zig-cache/
+zig-pkg/
+zig-out-linux/
+web/node_modules/
+tests/abi/dotnet/bin/
+tests/abi/dotnet/obj/
+zig-out-win/
