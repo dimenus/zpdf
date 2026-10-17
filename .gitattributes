@@ -1,0 +1,6 @@
+# LF everywhere, Windows checkouts too: the build compares committed files byte for byte (the C#
+# copy of the generated declarations) and parses others line by line (tests/golden/cases.tsv).
+* text=auto eol=lf
+*.pdf binary
+*.ttf binary
+*.otf binary

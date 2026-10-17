@@ -1,0 +1,30 @@
+# zig build test (unit tests, golden PDFs, the C ABI test, the export check, wasm) and the .NET
+# library's tests, on each OS a .NET package ships for. The Zig version is build.zig.zon's
+# minimum_zig_version (setup-zig reads it).
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: mlugg/setup-zig@v2
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: 10.0.x
+      - name: zig build test
+        run: zig build test --summary failures
+      - name: zig build dotnet-test
+        run: zig build dotnet-test --summary failures
