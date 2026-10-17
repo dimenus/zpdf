@@ -11,7 +11,7 @@ also when the run is interrupted. Write mutants that compile: a mutant that does
 as COMPILE ERROR and proves nothing.
 
 Each line of output is one mutant:
-    <index> killed <the first failing test>
+    <index> killed <the first failing test, or the check program that failed>
     <index> SURVIVED
     <index> COMPILE ERROR <the first error>
     <index> TIMEOUT after 900 s   (a hang: no test named, so it needs reading)
@@ -60,16 +60,19 @@ def main():
                 continue
             out = p.stdout + p.stderr
             lines = out.splitlines()
+            # A failing test: Zig's test runner, xunit's "<test> [FAIL]" (dotnet-test), or a check
+            # program that ran and failed ("run exe check-exports failure" in the build summary). A
+            # mutant can fail one of these and also break a build elsewhere; the check names the kill.
+            named = next((l.strip() for l in lines if re.match(r"error: '.*' (failed|terminated)", l)
+                          or l.rstrip().endswith("[FAIL]") or re.search(r"run exe \S+ failure$", l.rstrip())), "")
             if p.returncode == 0:
                 verdict, why = "SURVIVED", ""
+            elif named:
+                verdict, why = "killed", named
             elif "compilation error" in out or re.search(r"error CS\d+", out):
                 verdict, why = "COMPILE ERROR", next((l for l in lines if ": error:" in l or re.search(r"error CS\d+", l)), "")
             else:
-                verdict = "killed"
-                # Zig's test runner, and xunit's "<test> [FAIL]" (dotnet-test).
-                why = next((l.strip() for l in lines if re.match(r"error: '.*' (failed|terminated)", l) or l.rstrip().endswith("[FAIL]")), "")
-                if not why:
-                    why = "NO FAILING TEST FOUND: " + " | ".join(lines[-3:])
+                verdict, why = "killed", "NO FAILING TEST FOUND: " + " | ".join(lines[-3:])
             if verdict != "killed":
                 bad += 1
             print(i, verdict, why[:200], flush=True)

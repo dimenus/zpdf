@@ -46,6 +46,8 @@
   builds libzpdf for the four .NET RIDs into `zig-out/runtimes/`. `zig build test` runs
   `tests/abi/abi-test.c` against the library. A change to an export, a wire record or an error code bumps `abi_version`;
   the test "the ABI surface is the one abi_version names" fails until it does, and prints the new hash.
+  `zig build test` also reads each native-all library's export table (ELF, Mach-O, PE) and fails
+  when it differs from the generated C#'s entry points (`tools/check-exports.zig`).
 - .NET (`dotnet/Zpdf`: PdfReader and PdfWriter over the C ABI; needs the .NET SDK):
   `zig build dotnet-test` runs `dotnet/Zpdf.Tests` against this libzpdf; `zig build dotnet-pack`
   writes the NuGet package with libzpdf for every RID to `zig-out/nuget`. The library keeps a copy

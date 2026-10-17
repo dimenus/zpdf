@@ -196,9 +196,18 @@ pub fn build(b: *std.Build) void {
     const native_all = b.step("native-all", "Build libzpdf for linux-x64, linux-arm64, osx-arm64 and win-x64");
     // The same libraries laid out as runtimes/<rid>/native/<file>, for the NuGet package.
     const runtimes = b.addWriteFiles();
+    // Each shipped library's export table against the generated C# declarations.
+    const check_exports = b.addRunArtifact(b.addExecutable(.{ .name = "check-exports", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/check-exports.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) }));
+    check_exports.addFileArg(csharp);
+    test_step.dependOn(&check_exports.step);
     for (native_targets) |t| {
         const lib = addNative(b, kb, build_options, &cid, b.resolveTargetQuery(t.query), true);
         _ = runtimes.addCopyFile(lib.getEmittedBin(), b.fmt("runtimes/{s}/native/{s}", .{ t.rid, t.file }));
+        check_exports.addFileArg(lib.getEmittedBin());
         b.addNamedLazyPath(b.fmt("libzpdf-{s}", .{t.rid}), lib.getEmittedBin());
         native_all.dependOn(&b.addInstallArtifact(lib, .{
             .dest_dir = .{ .override = .{ .custom = b.pathJoin(&.{ "runtimes", t.rid, "native" }) } },
