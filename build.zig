@@ -17,8 +17,15 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const kb = b.dependency("kb", .{});
-    const harfbuzz = b.dependency("harfbuzz", .{});
+    const cid = packCidMaps(b);
 
+    // What a package that depends on zpdf gets, by name:
+    //   zpdf.module("zpdf"), with b.dependency("zpdf", .{ .target = ..., .optimize = ... });
+    //   zpdf.namedLazyPath("zpdf.h") and zpdf.namedLazyPath("Zpdf.Abi.g.cs"), the C ABI's header
+    //   and C# declarations;
+    //   zpdf.namedLazyPath("libzpdf-<rid>") for each rid in native_targets (the file is that
+    //   entry's `file`), stripped, as native-all installs it.
+    // build.zig.zon's .paths ships what this part reads, and nothing the rest of build() needs.
     const mod = b.addModule("zpdf", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -26,6 +33,40 @@ pub fn build(b: *std.Build) void {
         // kb's default allocator is malloc.
         .link_libc = true,
     });
+    mod.addOptions("abi_options", abiOptions(b, false, false));
+    addKb(b, mod, kb, .libc);
+    addCidMaps(mod, &cid, true);
+
+    // libzpdf: the C ABI (src/abi.zig) as a native shared library, for .NET and C.
+    const native = addNative(b, kb, &cid, target, false);
+
+    // zpdf.h and the C# declarations, written from src/abi.zig.
+    const gen_abi_mod = b.createModule(.{
+        .root_source_file = b.path("tools/gen-abi.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    gen_abi_mod.addImport("zpdf", addZpdfModule(b, kb, &cid, b.graph.host));
+    const gen_abi = b.addRunArtifact(b.addExecutable(.{ .name = "gen-abi", .root_module = gen_abi_mod }));
+    gen_abi.addFileArg(b.path("src/abi.zig"));
+    const header = gen_abi.addOutputFileArg("zpdf.h");
+    const csharp = gen_abi.addOutputFileArg("Zpdf.Abi.g.cs");
+    b.addNamedLazyPath("zpdf.h", header);
+    b.addNamedLazyPath("Zpdf.Abi.g.cs", csharp);
+
+    // libzpdf for each runtime a .NET package carries.
+    var native_libs: [native_targets.len]*std.Build.Step.Compile = undefined;
+    for (native_targets, &native_libs) |t, *lib| {
+        lib.* = addNative(b, kb, &cid, b.resolveTargetQuery(t.query), true);
+        b.addNamedLazyPath(b.fmt("libzpdf-{s}", .{t.rid}), lib.*.getEmittedBin());
+    }
+
+    // The rest is zpdf's own development: tests, golden PDFs, tools, benchmarks, the browser test
+    // and the .NET library. A package that depends on zpdf runs none of it, and does not have the
+    // files it reads.
+    if (!b.isRoot()) return;
+    // Test fonts only; lazy, so a package that depends on zpdf never downloads it.
+    const harfbuzz = b.lazyDependency("harfbuzz", .{}) orelse return;
 
     const build_options = b.addOptions();
     build_options.addOptionPath("test_font_latin", harfbuzz.path("test/shape/data/in-house/fonts/7bbd3175734d5d291e1c15271ec0cbb97b626ebf.ttf"));
@@ -55,11 +96,18 @@ pub fn build(b: *std.Build) void {
     build_options.addOptionPath("winansi_table", b.path("tests/winansi/table.tsv"));
     build_options.addOptionPath("test_font_anchor", harfbuzz.path("test/api/fonts/SourceSansVariable-Roman.anchor.ttf"));
     build_options.addOptionPath("test_font_duplicate_axes", harfbuzz.path("test/shape/data/in-house/fonts/e8691822f6a705e3e9fb48a0405c645b1a036590.ttf"));
-    mod.addOptions("build_options", build_options);
-    mod.addOptions("abi_options", abiOptions(b, false, false));
-    addKb(b, mod, kb, .libc);
-    const cid = packCidMaps(b);
-    addCidMaps(mod, &cid, true);
+    // The unit tests' module: the library plus build_options (test fonts and fixtures), which
+    // only tests read.
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/root.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    test_mod.addOptions("build_options", build_options);
+    test_mod.addOptions("abi_options", abiOptions(b, false, false));
+    addKb(b, test_mod, kb, .libc);
+    addCidMaps(test_mod, &cid, true);
 
     const shape_exe_mod = b.createModule(.{
         .root_source_file = b.path("src/zpdf-shape.zig"),
@@ -100,7 +148,7 @@ pub fn build(b: *std.Build) void {
     // filtered run must go through this option instead.
     const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose name contains this (repeatable)") orelse &.{};
     checkTestRoots(b);
-    const tests = b.addTest(.{ .root_module = mod, .filters = test_filters });
+    const tests = b.addTest(.{ .root_module = test_mod, .filters = test_filters });
     // The test binary, installed but not run, so tools/test-valgrind.sh can
     // cross-compile it (-Dtarget=aarch64-linux-musl) and run it on Linux.
     const test_artifacts = b.step("test-artifacts", "Install the test binary to <prefix>/test without running it");
@@ -140,14 +188,14 @@ pub fn build(b: *std.Build) void {
 
     // The browser build: wasm32 with no C runtime. It is part of `zig build test`
     // so code that only breaks on wasm fails in the normal loop, not later.
-    const wasm = addWasm(b, kb, build_options, &cid, "zpdf", false);
+    const wasm = addWasm(b, kb, &cid, "zpdf", false);
     b.installArtifact(wasm);
     const wasm_step = b.step("wasm", "Build for wasm32-freestanding");
     wasm_step.dependOn(&wasm.step);
     test_step.dependOn(&wasm.step);
     // The same build plus a panic on demand (zpdf_wasm_test_panic), only for the
     // browser test of the trap policy; never installed.
-    const wasm_test_build = addWasm(b, kb, build_options, &cid, "zpdf-test", true);
+    const wasm_test_build = addWasm(b, kb, &cid, "zpdf-test", true);
 
     // The wasm in headless Chromium, through web/index.html and pdf.js. Needs bun on
     // PATH; `bun install` fetches pdf.js and Playwright, and the first run may need
@@ -165,32 +213,11 @@ pub fn build(b: *std.Build) void {
     web_test.step.dependOn(&web_install.step);
     b.step("web-test", "Build zpdf.wasm and test it in headless Chromium (web/)").dependOn(&web_test.step);
 
-    // libzpdf: the C ABI (src/abi.zig) as a native shared library, for .NET and C.
-    const native = addNative(b, kb, build_options, &cid, target, false);
     b.installArtifact(native);
-
-    // zpdf.h and the C# declarations, written from src/abi.zig.
-    const gen_abi_mod = b.createModule(.{
-        .root_source_file = b.path("tools/gen-abi.zig"),
-        .target = b.graph.host,
-        .optimize = .Debug,
-    });
-    gen_abi_mod.addImport("zpdf", addZpdfModule(b, kb, build_options, &cid, b.graph.host));
-    const gen_abi = b.addRunArtifact(b.addExecutable(.{ .name = "gen-abi", .root_module = gen_abi_mod }));
-    gen_abi.addFileArg(b.path("src/abi.zig"));
-    const header = gen_abi.addOutputFileArg("zpdf.h");
-    const csharp = gen_abi.addOutputFileArg("Zpdf.Abi.g.cs");
     const abi_step = b.step("abi", "Install libzpdf, include/zpdf.h and csharp/Zpdf.Abi.g.cs");
     abi_step.dependOn(&b.addInstallArtifact(native, .{}).step);
     abi_step.dependOn(&b.addInstallHeaderFile(header, "zpdf.h").step);
     abi_step.dependOn(&b.addInstallFileWithDir(csharp, .{ .custom = "csharp" }, "Zpdf.Abi.g.cs").step);
-
-    // For a package that depends on zpdf (a .NET package's native build, say), by name:
-    //   zpdf.namedLazyPath("zpdf.h"), zpdf.namedLazyPath("Zpdf.Abi.g.cs"), and
-    //   zpdf.namedLazyPath("libzpdf-<rid>") for each rid in native_targets (the file is that
-    //   entry's `file`), stripped, as native-all installs it.
-    b.addNamedLazyPath("zpdf.h", header);
-    b.addNamedLazyPath("Zpdf.Abi.g.cs", csharp);
 
     // libzpdf for each runtime a .NET package carries, as runtimes/<rid>/native/<file>.
     const native_all = b.step("native-all", "Build libzpdf for linux-x64, linux-arm64, osx-arm64 and win-x64");
@@ -204,11 +231,9 @@ pub fn build(b: *std.Build) void {
     }) }));
     check_exports.addFileArg(csharp);
     test_step.dependOn(&check_exports.step);
-    for (native_targets) |t| {
-        const lib = addNative(b, kb, build_options, &cid, b.resolveTargetQuery(t.query), true);
+    for (native_targets, native_libs) |t, lib| {
         _ = runtimes.addCopyFile(lib.getEmittedBin(), b.fmt("runtimes/{s}/native/{s}", .{ t.rid, t.file }));
         check_exports.addFileArg(lib.getEmittedBin());
-        b.addNamedLazyPath(b.fmt("libzpdf-{s}", .{t.rid}), lib.getEmittedBin());
         native_all.dependOn(&b.addInstallArtifact(lib, .{
             .dest_dir = .{ .override = .{ .custom = b.pathJoin(&.{ "runtimes", t.rid, "native" }) } },
             .dest_sub_path = t.file,
@@ -288,14 +313,13 @@ const native_targets = [_]NativeTarget{
 };
 
 /// The zpdf module for `target`, with no exports, for a host tool that reads its types.
-fn addZpdfModule(b: *std.Build, kb: *std.Build.Dependency, build_options: *std.Build.Step.Options, cid: *const CidMaps, target: std.Build.ResolvedTarget) *std.Build.Module {
+fn addZpdfModule(b: *std.Build, kb: *std.Build.Dependency, cid: *const CidMaps, target: std.Build.ResolvedTarget) *std.Build.Module {
     const m = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = .Debug,
         .link_libc = true,
     });
-    m.addOptions("build_options", build_options);
     m.addOptions("abi_options", abiOptions(b, false, false));
     addKb(b, m, kb, .libc);
     addCidMaps(m, cid, true);
@@ -305,7 +329,7 @@ fn addZpdfModule(b: *std.Build, kb: *std.Build.Dependency, build_options: *std.B
 /// libzpdf: ReleaseSafe with kb's C undefined behaviour set to trap, for the reason zpdf.wasm
 /// is (addWasm). In a native process a defect then ends the process, which src/abi.zig's
 /// protocol says. kb's symbols are hidden, so only the zpdf_ exports leave the library.
-fn addNative(b: *std.Build, kb: *std.Build.Dependency, build_options: *std.Build.Step.Options, cid: *const CidMaps, target: std.Build.ResolvedTarget, strip: bool) *std.Build.Step.Compile {
+fn addNative(b: *std.Build, kb: *std.Build.Dependency, cid: *const CidMaps, target: std.Build.ResolvedTarget, strip: bool) *std.Build.Step.Compile {
     const m = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
@@ -315,7 +339,6 @@ fn addNative(b: *std.Build, kb: *std.Build.Dependency, build_options: *std.Build
         .sanitize_c = .trap,
         .strip = strip,
     });
-    m.addOptions("build_options", build_options);
     m.addOptions("abi_options", abiOptions(b, false, true));
     addKb(b, m, kb, .libc_hidden);
     addCidMaps(m, cid, true);
@@ -336,7 +359,7 @@ fn abiOptions(b: *std.Build, test_exports: bool, export_c: bool) *std.Build.Step
 /// src/abi.zig) instead of going on with bad state, which ReleaseSmall would do
 /// for an out-of-bounds read, `unreachable` or an assert. Stripped, since the
 /// browser cannot use the debug info.
-fn addWasm(b: *std.Build, kb: *std.Build.Dependency, build_options: *std.Build.Step.Options, cid: *const CidMaps, name: []const u8, test_exports: bool) *std.Build.Step.Compile {
+fn addWasm(b: *std.Build, kb: *std.Build.Dependency, cid: *const CidMaps, name: []const u8, test_exports: bool) *std.Build.Step.Compile {
     const wasm_mod = b.createModule(.{
         .root_source_file = b.path("src/root.zig"),
         .target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding }),
@@ -344,7 +367,6 @@ fn addWasm(b: *std.Build, kb: *std.Build.Dependency, build_options: *std.Build.S
         .sanitize_c = .trap,
         .strip = true,
     });
-    wasm_mod.addOptions("build_options", build_options);
     wasm_mod.addOptions("abi_options", abiOptions(b, test_exports, false));
     addKb(b, wasm_mod, kb, .no_crt);
     addCidMaps(wasm_mod, cid, false);
