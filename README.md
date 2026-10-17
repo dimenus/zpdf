@@ -154,4 +154,6 @@ tools/zig build dotnet-test   # the .NET library (needs the .NET 10 SDK)
 
 ## License
 
-zlib, see [LICENSE](LICENSE). kb_text_shape is zlib too.
+zlib, see [LICENSE](LICENSE). kb_text_shape is zlib too. The library also holds Adobe's standard-font
+metrics, glyph names and CJK character maps; their notices are in
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md), which ships in every package.

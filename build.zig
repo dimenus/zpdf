@@ -272,6 +272,26 @@ pub fn build(b: *std.Build) void {
     csharp_check.addArg("tools/zig build dotnet-codegen");
     test_step.dependOn(&csharp_check.step);
 
+    // THIRD-PARTY-NOTICES.md is generated from the files it covers (tools/gen-notices.zig), and
+    // ships in the NuGet package and the Zig package; `zig build test` fails when it is stale.
+    const notices_run = b.addRunArtifact(b.addExecutable(.{ .name = "gen-notices", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/gen-notices.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) }));
+    const notices = notices_run.addOutputFileArg("THIRD-PARTY-NOTICES.md");
+    notices_run.addFileArg(b.path("src/read_tables.zig"));
+    notices_run.addFileArg(kb.path("LICENSE"));
+    for (cid_orderings) |ordering| notices_run.addFileArg(b.path(b.fmt("src/cid/Adobe-{s}-UCS2", .{ordering})));
+    const update_notices = b.addUpdateSourceFiles();
+    update_notices.addCopyFileToSource(notices, "THIRD-PARTY-NOTICES.md");
+    b.step("notices", "Write THIRD-PARTY-NOTICES.md from the files it covers").dependOn(&update_notices.step);
+    const notices_check = b.addRunArtifact(same_file);
+    notices_check.addFileArg(notices);
+    notices_check.addFileArg(b.path("THIRD-PARTY-NOTICES.md"));
+    notices_check.addArg("tools/zig build notices");
+    test_step.dependOn(&notices_check.step);
+
     // README.md's C# examples are the code a test compiles and runs (ReadmeExamples.cs).
     const readme_check = b.addRunArtifact(b.addExecutable(.{ .name = "readme-examples", .root_module = b.createModule(.{
         .root_source_file = b.path("tools/readme-examples.zig"),

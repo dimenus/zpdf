@@ -15,7 +15,7 @@
         <IsRidAgnostic>false</IsRidAgnostic>
         <RuntimeIdentifiers>linux-x64;linux-arm64;osx-arm64;win-x64</RuntimeIdentifiers>
         <PackageId>Zpdf</PackageId>
-        <Version>0.3.0</Version>
+        <Version>0.3.1</Version>
         <Description>A PDF writer and text reader (zpdf, in Zig) for .NET.</Description>
         <PackageLicenseFile>LICENSE</PackageLicenseFile>
         <PackageReadmeFile>README.md</PackageReadmeFile>
@@ -49,6 +49,8 @@
         <None Include="$(_ZpdfRuntimes)/win-x64/native/zpdf.dll" Pack="true" PackagePath="runtimes/win-x64/native/" Visible="false" />
         <None Include="$(MSBuildThisFileDirectory)../../LICENSE" Pack="true" PackagePath="" Visible="false" />
         <None Include="$(MSBuildThisFileDirectory)../../README.md" Pack="true" PackagePath="" Visible="false" />
+        <!-- The native library holds Adobe data whose terms require their notices to travel with it. -->
+        <None Include="$(MSBuildThisFileDirectory)../../THIRD-PARTY-NOTICES.md" Pack="true" PackagePath="" Visible="false" />
     </ItemGroup>
 
     <ItemGroup>

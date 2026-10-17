@@ -44,7 +44,7 @@ jobs:
           packages=(zig-out/nuget/*.nupkg)
           if [ ${#packages[@]} -ne 1 ]; then echo "expected one package, found: ${packages[*]}" >&2; exit 1; fi
           listing=$(unzip -Z1 "${packages[0]}")
-          for file in lib/net10.0/Zpdf.dll LICENSE runtimes/linux-x64/native/libzpdf.so runtimes/linux-arm64/native/libzpdf.so runtimes/osx-arm64/native/libzpdf.dylib runtimes/win-x64/native/zpdf.dll; do
+          for file in lib/net10.0/Zpdf.dll LICENSE THIRD-PARTY-NOTICES.md runtimes/linux-x64/native/libzpdf.so runtimes/linux-arm64/native/libzpdf.so runtimes/osx-arm64/native/libzpdf.dylib runtimes/win-x64/native/zpdf.dll; do
             grep -qx "$file" <<<"$listing" || { echo "${packages[0]} has no $file" >&2; exit 1; }
           done
           echo "${packages[0]}:"; echo "$listing"

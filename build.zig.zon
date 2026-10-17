@@ -1,6 +1,6 @@
 .{
     .name = .zpdf,
-    .version = "0.3.0",
+    .version = "0.3.1",
     .fingerprint = 0xd4779d7ae6ed4dc1,
     .minimum_zig_version = "0.17.0",
     .dependencies = .{
@@ -16,5 +16,5 @@
         },
     },
     // What a package that depends on zpdf needs: build.zig's first part reads only these.
-    .paths = .{ "build.zig", "build.zig.zon", "src", "tools/gen-abi.zig", "tools/gen-cid-table.zig", "LICENSE" },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "tools/gen-abi.zig", "tools/gen-cid-table.zig", "LICENSE", "THIRD-PARTY-NOTICES.md" },
 }
