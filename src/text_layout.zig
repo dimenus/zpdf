@@ -17,8 +17,10 @@
 //!   before a combining mark, a variation selector, a zero-width joiner or a skin-tone modifier),
 //!   and otherwise stands on its own line, wider than the width, which the caller can see.
 //!
-//! Widths are measured word by word, so kerning between a word and the space beside it is not
-//! counted; a word's own kerning is.
+//! A line's width is the whole line measured, spaces included, so kerning across a space counts.
+//!
+//! Beside measuring and wrapping: a font's vertical metrics, the first character it cannot draw,
+//! and the longest prefix of a text that fits a width (for truncating with an ellipsis).
 
 const std = @import("std");
 const zpdf = @import("root.zig");
@@ -78,11 +80,151 @@ fn measureEmbedded(gpa: std.mem.Allocator, font: *zpdf.Font, size: f64, utf8: []
 }
 
 fn standardWidths(font: zpdf.StandardFont) []const tables.CodePointWidth {
+    return standardTable(font).widths;
+}
+
+fn standardTable(font: zpdf.StandardFont) *const @TypeOf(tables.text_font_widths[0]) {
     const name = font.baseFont();
     for (&tables.text_font_widths) |*f| {
-        if (std.mem.eql(u8, f.name, name)) return f.widths;
+        if (std.mem.eql(u8, f.name, name)) return f;
     }
     unreachable; // every StandardFont has a table: the test "every standard font has widths" checks it
+}
+
+/// How far a font reaches above and below the baseline, in em (1.0 is the font size).
+pub const VerticalMetrics = struct {
+    ascender: f64,
+    /// Below the baseline, so usually negative.
+    descender: f64,
+};
+
+/// A standard font's AFM Ascender and Descender; an embedded font's hhea ascender and descender at
+/// its instance. Both are what the writer puts in the font's /Ascent and /Descent.
+pub fn verticalMetrics(font: FontRef) !VerticalMetrics {
+    switch (font) {
+        .standard => |s| {
+            const t = standardTable(s);
+            return .{ .ascender = @as(f64, @floatFromInt(t.ascender)) / 1000.0, .descender = @as(f64, @floatFromInt(t.descender)) / 1000.0 };
+        },
+        .embedded => |f| {
+            const face = try sfnt.open(f.bytes, f.index);
+            const v = try f.verticalMetrics(face);
+            const upem: f64 = @floatFromInt(face.units_per_em);
+            return .{ .ascender = @as(f64, @floatFromInt(v.ascent)) / upem, .descender = @as(f64, @floatFromInt(v.descent)) / upem };
+        },
+    }
+}
+
+/// The byte offset of the first character in `utf8` the font cannot draw, or `utf8.len` when it
+/// can draw them all. A standard font draws WinAnsi characters that have an AFM width; anything
+/// else is NotWinAnsi when measured or drawn. An embedded font cannot draw a character its shaping
+/// maps to glyph 0 (.notdef), so a character the font composes from others counts as drawable.
+pub fn firstMissing(gpa: std.mem.Allocator, font: FontRef, utf8: []const u8, options: zpdf.ShapeOptions) !usize {
+    if (!std.unicode.utf8ValidateSlice(utf8)) return error.InvalidUtf8;
+    switch (font) {
+        .standard => |s| {
+            const widths = standardWidths(s);
+            var it = std.unicode.Utf8View.initUnchecked(utf8).iterator();
+            var at: usize = 0;
+            while (it.nextCodepointSlice()) |slice| : (at += slice.len) {
+                const cp = std.unicode.utf8Decode(slice) catch unreachable;
+                if (winansi.encode(cp) == null or widthOf(widths, cp) == null) return at;
+            }
+            return utf8.len;
+        },
+        .embedded => |f| {
+            if (utf8.len == 0) return 0;
+            var shaped = try zpdf.shape(gpa, f, utf8, options);
+            defer shaped.deinit(gpa);
+            // Glyphs are in visual order, so the first missing character is the lowest cluster
+            // (a codepoint index) among the .notdef glyphs.
+            var first: ?u32 = null;
+            for (shaped.glyphs) |g| {
+                if (g.id == 0 and (first == null or g.cluster < first.?)) first = g.cluster;
+            }
+            const index = first orelse return utf8.len;
+            var it = std.unicode.Utf8View.initUnchecked(utf8).iterator();
+            var at: usize = 0;
+            var n: u32 = 0;
+            while (it.nextCodepointSlice()) |slice| : ({
+                at += slice.len;
+                n += 1;
+            }) {
+                if (n == index) return at;
+            }
+            return error.InvalidFont; // a cluster past the text: kb and this walk disagree on codepoints
+        },
+    }
+}
+
+/// The longest prefix of `utf8` that fits `max_width` points as one run, and its width.
+pub const Fit = struct {
+    /// Bytes; always at the end of a character (never before a combining mark, a variation
+    /// selector, a zero-width joiner or a skin-tone modifier).
+    len: usize,
+    width: f64,
+};
+
+/// The longest prefix of `utf8` whose width at `size` is at most `max_width`: what to keep when
+/// truncating, before adding an ellipsis (measure the ellipsis and subtract it from the width).
+/// The width is the one `measure` gives the prefix. A standard font's prefix widths only grow, so
+/// its answer is the longest. An embedded font is searched by halves, which assumes the same;
+/// shaping can make a longer prefix a little narrower (kerning), and then a shorter prefix that
+/// fits is returned. The prefix always fits.
+pub fn fit(gpa: std.mem.Allocator, font: FontRef, size: f64, utf8: []const u8, max_width: f64, options: zpdf.ShapeOptions) !Fit {
+    if (!(std.math.isFinite(size) and size > 0)) return error.InvalidNumber;
+    if (!(std.math.isFinite(max_width) and max_width >= 0)) return error.InvalidNumber;
+    if (!std.unicode.utf8ValidateSlice(utf8)) return error.InvalidUtf8;
+    switch (font) {
+        .standard => |s| {
+            // One pass. The width is computed as measure computes it (the AFM sum times the size
+            // over 1000), so it equals measure of the prefix exactly.
+            const widths = standardWidths(s);
+            var total: u64 = 0;
+            var kept: Fit = .{ .len = 0, .width = 0 };
+            var at: usize = 0;
+            while (at < utf8.len) {
+                const end = nextCharacter(utf8, at, utf8.len);
+                var it = std.unicode.Utf8View.initUnchecked(utf8[at..end]).iterator();
+                var next = total;
+                while (it.nextCodepoint()) |cp| {
+                    _ = winansi.encode(cp) orelse return error.NotWinAnsi;
+                    next += widthOf(widths, cp) orelse return error.NotWinAnsi;
+                }
+                const width = @as(f64, @floatFromInt(next)) * size / 1000.0;
+                if (width > max_width + fit_slack) break;
+                total = next;
+                kept = .{ .len = end, .width = width };
+                at = end;
+            }
+            return kept;
+        },
+        .embedded => {
+            var ends: std.ArrayList(usize) = .empty;
+            defer ends.deinit(gpa);
+            var at: usize = 0;
+            while (at < utf8.len) {
+                at = nextCharacter(utf8, at, utf8.len);
+                try ends.append(gpa, at);
+            }
+            // kept: characters known to fit; above: a count known not to.
+            var kept: Fit = .{ .len = 0, .width = 0 };
+            var kept_count: usize = 0;
+            var above = ends.items.len + 1;
+            while (above - kept_count > 1) {
+                const middle = kept_count + (above - kept_count) / 2;
+                const end = ends.items[middle - 1];
+                const width = try measure(gpa, font, size, utf8[0..end], options);
+                if (width <= max_width + fit_slack) {
+                    kept = .{ .len = end, .width = width };
+                    kept_count = middle;
+                } else {
+                    above = middle;
+                }
+            }
+            return kept;
+        },
+    }
 }
 
 fn widthOf(widths: []const tables.CodePointWidth, cp: u21) ?u16 {
@@ -182,24 +324,21 @@ const Wrapper = struct {
     fn breakWord(w: *Wrapper, text: []const u8, start: usize, end: usize) !void {
         var piece = start;
         while (piece < end) {
-            var fit = nextCharacter(text, piece, end);
-            var fit_width = try measure(w.gpa, w.font, w.size, text[piece..fit], w.options.shape);
-            while (fit < end) {
-                const next = nextCharacter(text, fit, end);
-                const next_width = try measure(w.gpa, w.font, w.size, text[piece..next], w.options.shape);
-                if (next_width > w.max + fit_slack) break;
-                fit = next;
-                fit_width = next_width;
+            var kept = try fit(w.gpa, w.font, w.size, text[piece..end], w.max, w.options.shape);
+            if (kept.len == 0) {
+                const one = nextCharacter(text, piece, end);
+                kept = .{ .len = one - piece, .width = try measure(w.gpa, w.font, w.size, text[piece..one], w.options.shape) };
             }
-            if (fit == end) {
+            const piece_end = piece + kept.len;
+            if (piece_end == end) {
                 // The last piece stays open, so a following word can join its line.
                 w.line_start = piece;
                 w.line_end = end;
-                w.line_width = fit_width;
+                w.line_width = kept.width;
                 return;
             }
-            try w.emit(piece, fit, fit_width);
-            piece = fit;
+            try w.emit(piece, piece_end, kept.width);
+            piece = piece_end;
         }
     }
 
@@ -478,4 +617,77 @@ test "text_layout: a line's width is the whole line shaped, kerning across its s
     const lines = try wrap(gpa, f, 10, "T y", whole, .{ .break_words = false });
     defer gpa.free(lines);
     try testing.expectEqualSlices(Line, &.{.{ .start = 0, .len = 3, .width = whole }}, lines);
+}
+
+test "text_layout: vertical metrics are the AFM's for a standard font and hhea's for an embedded one" {
+    // Adobe's AFMs: Helvetica Ascender 718 Descender -207, Times-Roman 683 -217, Courier 629 -157.
+    try testing.expectEqual(VerticalMetrics{ .ascender = 0.718, .descender = -0.207 }, try verticalMetrics(.{ .standard = .helvetica_bold_oblique }));
+    try testing.expectEqual(VerticalMetrics{ .ascender = 0.683, .descender = -0.217 }, try verticalMetrics(.{ .standard = .times_roman }));
+    try testing.expectEqual(VerticalMetrics{ .ascender = 0.629, .descender = -0.157 }, try verticalMetrics(.{ .standard = .courier }));
+    const gpa = testing.allocator;
+    const bytes = try loadTestFont();
+    defer gpa.free(bytes);
+    var font = try zpdf.Font.init(gpa, bytes, 0, &.{});
+    defer font.deinit();
+    // Roboto's hhea: ascender 1900, descender -500, 2048 units per em.
+    try testing.expectEqual(VerticalMetrics{ .ascender = 1900.0 / 2048.0, .descender = -500.0 / 2048.0 }, try verticalMetrics(.{ .embedded = &font }));
+}
+
+test "text_layout: firstMissing is the first character the font cannot draw, or the text's length" {
+    const gpa = testing.allocator;
+    const h: FontRef = .{ .standard = .helvetica };
+    try testing.expectEqual(@as(usize, 3), try firstMissing(gpa, h, "abc", .{}));
+    try testing.expectEqual(@as(usize, 2), try firstMissing(gpa, h, "ab\u{3A9}c", .{}));
+    // Ł has an AFM width but no WinAnsi code.
+    try testing.expectEqual(@as(usize, 1), try firstMissing(gpa, h, "a\u{141}", .{}));
+    // The euro is WinAnsi 0x80, outside Latin-1.
+    try testing.expectEqual(@as(usize, 4), try firstMissing(gpa, h, "\u{20AC}x", .{}));
+    try testing.expectEqual(@as(usize, 0), try firstMissing(gpa, h, "", .{}));
+    try testing.expectError(error.InvalidUtf8, firstMissing(gpa, h, "\xff", .{}));
+
+    const bytes = try loadTestFont();
+    defer gpa.free(bytes);
+    var font = try zpdf.Font.init(gpa, bytes, 0, &.{});
+    defer font.deinit();
+    const r: FontRef = .{ .embedded = &font };
+    // Roboto has Latin and Greek but no CJK: the first missing one is at its byte offset.
+    const mixed = "caf\u{E9} \u{3A9} \u{4E2D}\u{6587}";
+    try testing.expectEqual(std.mem.indexOf(u8, mixed, "\u{4E2D}").?, try firstMissing(gpa, r, mixed, .{}));
+    // e + COMBINING ACUTE: both drawable, so the answer is the length, 4 bytes.
+    try testing.expectEqual(@as(usize, 4), try firstMissing(gpa, r, "e\u{301}x", .{}));
+    try testing.expectEqual(@as(usize, 0), try firstMissing(gpa, r, "", .{}));
+}
+
+test "text_layout: fit keeps the longest prefix that fits, with measure's width" {
+    const gpa = testing.allocator;
+    const h: FontRef = .{ .standard = .helvetica };
+    // Helvetica at 10pt, "Hello": 7.22, 12.78, 15.0, 17.22, 22.78.
+    try testing.expectEqual(Fit{ .len = 3, .width = 15.0 }, try fit(gpa, h, 10, "Hello", 15, .{}));
+    try testing.expectEqual(Fit{ .len = 2, .width = 12.78 }, try fit(gpa, h, 10, "Hello", 14.99, .{}));
+    try testing.expectEqual(Fit{ .len = 0, .width = 0 }, try fit(gpa, h, 10, "Hello", 0, .{}));
+    try testing.expectEqual(Fit{ .len = 5, .width = try measure(gpa, h, 10, "Hello", .{}) }, try fit(gpa, h, 10, "Hello", 100, .{}));
+    try testing.expectError(error.NotWinAnsi, fit(gpa, h, 10, "a\u{4E2D}", 100, .{}));
+    try testing.expectError(error.InvalidNumber, fit(gpa, h, 10, "a", -1, .{}));
+    try testing.expectError(error.InvalidNumber, fit(gpa, h, 10, "a", std.math.inf(f64), .{}));
+
+    const bytes = try loadTestFont();
+    defer gpa.free(bytes);
+    var font = try zpdf.Font.init(gpa, bytes, 0, &.{});
+    defer font.deinit();
+    const r: FontRef = .{ .embedded = &font };
+    const text = "Truncated description of a stock item";
+    for ([_]f64{ 0, 5, 40, 77.7, 150, 1000 }) |max| {
+        const kept = try fit(gpa, r, 11, text, max, .{});
+        try testing.expectEqual(try measure(gpa, r, 11, text[0..kept.len], .{}), kept.width);
+        try testing.expect(kept.width <= max + fit_slack);
+        // One more character does not fit.
+        if (kept.len < text.len) {
+            const next = nextCharacter(text, kept.len, text.len);
+            try testing.expect(try measure(gpa, r, 11, text[0..next], .{}) > max);
+        }
+    }
+    // An accent stays with its letter: with room for "e" alone, nothing is kept.
+    const e = try measure(gpa, r, 10, "e", .{});
+    try testing.expectEqual(@as(usize, 0), (try fit(gpa, r, 10, "e\u{301}e", e * 0.99, .{})).len);
+    try testing.expectEqual(@as(usize, 3), (try fit(gpa, r, 10, "e\u{301}e", try measure(gpa, r, 10, "e\u{301}", .{}), .{})).len);
 }

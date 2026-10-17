@@ -69,12 +69,12 @@ const is_wasm = builtin.target.cpu.arch == .wasm32;
 
 /// Changes when an export, a wire record or an error code changes. A caller checks it once,
 /// when it loads the library.
-pub const abi_version: u32 = 3;
+pub const abi_version: u32 = 4;
 
 /// The hash of the ABI that abi_version names (surfaceHash). The test "exports: the ABI surface
 /// is the one abi_version names" fails when they differ: then bump abi_version and set this to
 /// the hash the test prints.
-const abi_surface: u64 = 0xe56330f4f4905475;
+const abi_surface: u64 = 0xad695a285864e58;
 
 comptime {
     // The records are written with their in-memory bytes; every target zpdf builds for
@@ -684,6 +684,33 @@ pub const Runtime = struct {
         return text_layout.measure(rt.gpa, f.layoutFont(), size, text, .{ .paragraph_direction = try toDirection(direction) });
     }
 
+    pub fn fontVerticalMetrics(rt: *Runtime, handle: u32) !text_layout.VerticalMetrics {
+        return text_layout.verticalMetrics((try rt.font(handle)).layoutFont());
+    }
+
+    pub fn fontFirstMissing(rt: *Runtime, handle: u32, text: []const u8, direction: u32) !usize {
+        const f = try rt.font(handle);
+        return text_layout.firstMissing(rt.gpa, f.layoutFont(), text, .{ .paragraph_direction = try toDirection(direction) });
+    }
+
+    pub fn fontFit(rt: *Runtime, handle: u32, size: f64, text: []const u8, direction: u32, max_width: f64) !text_layout.Fit {
+        const f = try rt.font(handle);
+        return text_layout.fit(rt.gpa, f.layoutFont(), size, text, max_width, .{ .paragraph_direction = try toDirection(direction) });
+    }
+
+    /// The font's name, owned by rt.gpa: a standard font's base font name, an embedded font's
+    /// PostScript name at its instance (the PDF's /BaseFont after the subset prefix).
+    pub fn fontName(rt: *Runtime, handle: u32) ![]u8 {
+        const f = try rt.font(handle);
+        switch (f.font) {
+            .standard => |standard| return rt.gpa.dupe(u8, standard.baseFont()),
+            .embedded => |*e| {
+                const name = try e.postscriptName(try sfnt.open(e.bytes, e.index));
+                return rt.gpa.dupe(u8, name.slice());
+            },
+        }
+    }
+
     /// A WrapHeader then LineRecords (text_layout.wrap), owned by rt.gpa.
     pub fn fontWrap(rt: *Runtime, handle: u32, size: f64, text: []const u8, direction: u32, max_width: f64, flags: u32) ![]u8 {
         const f = try rt.font(handle);
@@ -1248,6 +1275,59 @@ pub const exports = struct {
         defer c.leave();
         c.reserveBuffer() catch |err| return mapError(err);
         c.give(o, c.rt.fontWrap(font, size, t, direction, max_width, flags) catch |err| return mapError(err));
+        return 0;
+    }
+
+    /// How far the font reaches above and below the baseline, in em (1.0 is the font size): a
+    /// standard font's AFM Ascender and Descender, an embedded font's hhea ascender and descender
+    /// at its instance. The descender is below the baseline, so usually negative.
+    pub fn zpdf_font_vertical_metrics(ctx: ?*Context, font: u32, out_ascender: ?*f64, out_descender: ?*f64) callconv(.c) i32 {
+        const a = output(f64, out_ascender) catch |err| return mapError(err);
+        const d = output(f64, out_descender) catch |err| return mapError(err);
+        const c = Context.enter(ctx) catch |err| return mapError(err);
+        defer c.leave();
+        const v = c.rt.fontVerticalMetrics(font) catch |err| return mapError(err);
+        a.* = v.ascender;
+        d.* = v.descender;
+        return 0;
+    }
+
+    /// The byte offset in `text` (UTF-8) of the first character the font cannot draw, or len when
+    /// it can draw them all. A standard font draws WinAnsi characters; an embedded font cannot draw
+    /// a character its shaping maps to glyph 0. direction as in zpdf_font_shape.
+    pub fn zpdf_font_first_missing(ctx: ?*Context, font: u32, text: ?[*]const u8, len: usize, direction: u32, out: ?*usize) callconv(.c) i32 {
+        const o = output(usize, out) catch |err| return mapError(err);
+        const t = input(text, len) catch |err| return mapError(err);
+        const c = Context.enter(ctx) catch |err| return mapError(err);
+        defer c.leave();
+        o.* = c.rt.fontFirstMissing(font, t, direction) catch |err| return mapError(err);
+        return 0;
+    }
+
+    /// The longest prefix of `text` (UTF-8) that fits `max_width` points at `size`, as one run:
+    /// its length in bytes (always at the end of a character) and its width, the one
+    /// zpdf_font_measure gives it. For truncating with an ellipsis, pass the width less the
+    /// ellipsis's. max_width is finite and not negative (InvalidNumber).
+    pub fn zpdf_font_fit(ctx: ?*Context, font: u32, size: f64, text: ?[*]const u8, len: usize, direction: u32, max_width: f64, out_len: ?*usize, out_width: ?*f64) callconv(.c) i32 {
+        const l = output(usize, out_len) catch |err| return mapError(err);
+        const w = output(f64, out_width) catch |err| return mapError(err);
+        const t = input(text, len) catch |err| return mapError(err);
+        const c = Context.enter(ctx) catch |err| return mapError(err);
+        defer c.leave();
+        const kept = c.rt.fontFit(font, size, t, direction, max_width) catch |err| return mapError(err);
+        l.* = kept.len;
+        w.* = kept.width;
+        return 0;
+    }
+
+    /// The font's name as ASCII: a standard font's base font name (Helvetica-Bold), an embedded
+    /// font's PostScript name at its instance. A buffer the caller frees with zpdf_free.
+    pub fn zpdf_font_name(ctx: ?*Context, font: u32, out_ptr: ?*?[*]u8, out_len: ?*usize) callconv(.c) i32 {
+        const o = outputBuffer(out_ptr, out_len) catch |err| return mapError(err);
+        const c = Context.enter(ctx) catch |err| return mapError(err);
+        defer c.leave();
+        c.reserveBuffer() catch |err| return mapError(err);
+        c.give(o, c.rt.fontName(font) catch |err| return mapError(err));
         return 0;
     }
 
@@ -1864,6 +1944,54 @@ test "exports: measure and wrap give text_layout's answers, for a standard font 
     defer _ = e.zpdf_free(c, pdf, pdf_len);
     try std.testing.expect(std.mem.indexOf(u8, pdf.?[0..pdf_len], "/BaseFont /Helvetica") != null);
     try std.testing.expectEqual(ok, e.zpdf_doc_close(c, doc));
+}
+
+test "exports: vertical metrics, first missing, fit and name give text_layout's answers" {
+    const e = exports;
+    const ok: i32 = 0;
+    const gpa = std.testing.allocator;
+    const options = @import("build_options");
+    const font_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, options.test_font_roboto, gpa, .unlimited);
+    defer gpa.free(font_bytes);
+    const c = e.zpdf_context_new().?;
+    defer _ = e.zpdf_context_free(c);
+
+    var courier: u32 = 0;
+    try std.testing.expectEqual(ok, e.zpdf_font_open_standard(c, @backingInt(zpdf.StandardFont.courier_bold), &courier));
+    var roboto: u32 = 0;
+    try std.testing.expectEqual(ok, e.zpdf_font_open(c, font_bytes.ptr, font_bytes.len, 0, null, 0, &roboto));
+
+    var ascender: f64 = 0;
+    var descender: f64 = 0;
+    try std.testing.expectEqual(ok, e.zpdf_font_vertical_metrics(c, courier, &ascender, &descender));
+    try std.testing.expectEqual(@as(f64, 0.629), ascender);
+    try std.testing.expectEqual(@as(f64, -0.157), descender);
+    try std.testing.expectEqual(ok, e.zpdf_font_vertical_metrics(c, roboto, &ascender, &descender));
+    try std.testing.expectEqual(1900.0 / 2048.0, ascender);
+    try std.testing.expectEqual(mapError(error.InvalidPointer), e.zpdf_font_vertical_metrics(c, roboto, &ascender, null));
+
+    var missing: usize = 99;
+    try std.testing.expectEqual(ok, e.zpdf_font_first_missing(c, courier, "ab\u{3A9}", 4, 0, &missing));
+    try std.testing.expectEqual(@as(usize, 2), missing);
+    try std.testing.expectEqual(ok, e.zpdf_font_first_missing(c, roboto, "ab\u{3A9}", 4, 0, &missing));
+    try std.testing.expectEqual(@as(usize, 4), missing);
+
+    // Courier is 600 thousandths a character: at 10pt, 6pt each, so 20pt keeps 3.
+    var kept: usize = 0;
+    var width: f64 = 0;
+    try std.testing.expectEqual(ok, e.zpdf_font_fit(c, courier, 10, "abcdef", 6, 0, 20, &kept, &width));
+    try std.testing.expectEqual(@as(usize, 3), kept);
+    try std.testing.expectEqual(@as(f64, 18), width);
+    try std.testing.expectEqual(mapError(error.InvalidNumber), e.zpdf_font_fit(c, courier, 10, "abcdef", 6, 0, -1, &kept, &width));
+    try std.testing.expectEqual(@as(usize, 0), kept);
+
+    for ([_]struct { font: u32, name: []const u8 }{ .{ .font = courier, .name = "Courier-Bold" }, .{ .font = roboto, .name = "Roboto-Regular" } }) |want| {
+        var name: ?[*]u8 = null;
+        var name_len: usize = 0;
+        try std.testing.expectEqual(ok, e.zpdf_font_name(c, want.font, &name, &name_len));
+        defer _ = e.zpdf_free(c, name, name_len);
+        try std.testing.expectEqualStrings(want.name, name.?[0..name_len]);
+    }
 }
 
 fn readRecord(comptime T: type, bytes: []const u8, at: usize) T {
