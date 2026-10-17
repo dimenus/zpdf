@@ -1,9 +1,9 @@
 //! Fails when a README code example differs from the tested code it shows.
 //!
-//!     readme-examples <README.md> <source file>
+//!     readme-examples <README.md> <source file>...
 //!
-//! In the README, `<!-- example: <name> -->` comes just before a fenced code block. In the source
-//! file (a test that compiles and runs), the same code sits between `// readme: <name>` and
+//! In the README, `<!-- example: <name> -->` comes just before a fenced code block. In a source
+//! file (code that compiles and runs: a test, or tests/consumer), the same code sits between `// readme: <name>` and
 //! `// readme: end`, indented as the code around it. Each named block must equal the source's,
 //! once the source's common indentation is removed, and every name must appear on both sides.
 
@@ -14,31 +14,32 @@ const Examples = std.StringArrayHashMapUnmanaged([]const u8);
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len != 3) {
-        std.debug.print("usage: readme-examples <README.md> <source file>\n", .{});
+    if (args.len < 3) {
+        std.debug.print("usage: readme-examples <README.md> <source file>...\n", .{});
         std.process.exit(2);
     }
     const io = init.io;
     const cwd = std.Io.Dir.cwd();
     const readme = try readmeExamples(arena, try cwd.readFileAlloc(io, args[1], arena, .limited(1 << 22)));
-    const source = try sourceExamples(arena, try cwd.readFileAlloc(io, args[2], arena, .limited(1 << 22)));
+    var source: Examples = .empty;
+    for (args[2..]) |path| try sourceExamples(arena, try cwd.readFileAlloc(io, path, arena, .limited(1 << 22)), &source);
     // A parse that found nothing would compare nothing and pass; that is a failure instead.
     if (readme.count() == 0) fail("{s}: no `<!-- example: name -->` blocks", .{args[1]});
 
     var bad = false;
     for (readme.keys(), readme.values()) |name, code| {
         const tested = source.get(name) orelse {
-            std.debug.print("{s}: example \"{s}\" has no `// readme: {s}` block in {s}\n", .{ args[1], name, name, args[2] });
+            std.debug.print("{s}: example \"{s}\" has no `// readme: {s}` block in any source file\n", .{ args[1], name, name });
             bad = true;
             continue;
         };
         if (!std.mem.eql(u8, code, tested)) {
-            std.debug.print("{s}: example \"{s}\" differs from {s}'s; copy the tested code into the README\n", .{ args[1], name, args[2] });
+            std.debug.print("{s}: example \"{s}\" differs from the tested code; copy that into the README\n", .{ args[1], name });
             bad = true;
         }
     }
     for (source.keys()) |name| if (!readme.contains(name)) {
-        std.debug.print("{s}: block \"{s}\" is shown nowhere in {s}\n", .{ args[2], name, args[1] });
+        std.debug.print("block \"{s}\" is shown nowhere in {s}\n", .{ name, args[1] });
         bad = true;
     };
     if (bad) std.process.exit(1);
@@ -72,8 +73,7 @@ fn readmeExamples(arena: std.mem.Allocator, text: []const u8) !Examples {
 }
 
 /// Each `// readme: name` ... `// readme: end` block, with the common indentation removed.
-fn sourceExamples(arena: std.mem.Allocator, text: []const u8) !Examples {
-    var out: Examples = .empty;
+fn sourceExamples(arena: std.mem.Allocator, text: []const u8, out: *Examples) !void {
     var lines = std.mem.splitScalar(u8, text, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \r");
@@ -98,5 +98,4 @@ fn sourceExamples(arena: std.mem.Allocator, text: []const u8) !Examples {
         }
         if (try out.fetchPut(arena, name, code.items)) |_| fail("source: block \"{s}\" appears twice", .{name});
     }
-    return out;
 }

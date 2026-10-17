@@ -1,0 +1,9 @@
+.{
+    .name = .zpdf_consumer,
+    .version = "0.0.0",
+    .fingerprint = 0x2ff32ab057e8d3a9,
+    .minimum_zig_version = "0.17.0",
+    // CI adds zpdf here with `zig fetch --save=zpdf`, from an archive of the commit under test.
+    .dependencies = .{},
+    .paths = .{ "build.zig", "build.zig.zon", "src" },
+}

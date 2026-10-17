@@ -68,6 +68,44 @@ Units are points (1/72 inch), and y goes up from the bottom of the page. `PdfWri
 `IBufferWriter<byte>`, and `AddFont` embeds a font file. The source in [dotnet/Zpdf](dotnet/Zpdf)
 documents both.
 
+## Zig
+
+```
+zig fetch --save git+https://github.com/dimenus/zpdf
+```
+
+That pins the current commit in your `build.zig.zon`. Then import the module in `build.zig`:
+
+<!-- example: zig-build -->
+```zig
+const zpdf = b.dependency("zpdf", .{ .target = target, .optimize = optimize });
+const exe = b.addExecutable(.{ .name = "hello", .root_module = b.createModule(.{
+    .root_source_file = b.path("src/main.zig"),
+    .target = target,
+    .optimize = optimize,
+    .imports = &.{.{ .name = "zpdf", .module = zpdf.module("zpdf") }},
+}) });
+```
+
+And write a PDF with it:
+
+<!-- example: zig-main -->
+```zig
+var out: std.Io.Writer.Allocating = .init(gpa);
+defer out.deinit();
+
+var doc = try zpdf.Document.begin(gpa, &out.writer, .{ .compress = true });
+defer doc.deinit();
+const helvetica = try doc.addStandardFont(.helvetica);
+const page = try doc.beginPage(612, 792);
+try doc.drawText(page, helvetica, 24, 72, 720, .black, "Hello from zpdf", .{});
+try doc.endPage(page);
+try doc.finish();
+```
+
+`Document` writes into any `std.Io.Writer`, so a file or a socket works as well as memory. You get
+just the library: zpdf's tests and tools stay out of your build.
+
 ## C
 
 ```

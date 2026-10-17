@@ -182,7 +182,7 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(golden_step);
 
     // Unformatted code fails `zig build test`; `zig build fmt` fixes it.
-    const fmt_paths: []const std.Build.LazyPath = &.{ b.path("src"), b.path("tools"), b.path("build.zig"), b.path("build.zig.zon") };
+    const fmt_paths: []const std.Build.LazyPath = &.{ b.path("src"), b.path("tools"), b.path("tests/consumer"), b.path("build.zig"), b.path("build.zig.zon") };
     test_step.dependOn(&b.addFmt(.{ .paths = fmt_paths, .check = true }).step);
     b.step("fmt", "Format the Zig sources").dependOn(&b.addFmt(.{ .paths = fmt_paths }).step);
 
@@ -280,6 +280,8 @@ pub fn build(b: *std.Build) void {
     }) }));
     readme_check.addFileArg(b.path("README.md"));
     readme_check.addFileArg(b.path("dotnet/Zpdf.Tests/ReadmeExamples.cs"));
+    readme_check.addFileArg(b.path("tests/consumer/build.zig"));
+    readme_check.addFileArg(b.path("tests/consumer/src/main.zig"));
     test_step.dependOn(&readme_check.step);
 
     // The .NET library's tests against this libzpdf. Needs the .NET SDK.
