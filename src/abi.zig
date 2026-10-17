@@ -544,7 +544,7 @@ pub const Runtime = struct {
     /// A ShapeHeader then ShapedGlyphs, owned by rt.gpa.
     pub fn fontShape(rt: *Runtime, handle: u32, text: []const u8, direction: u32) ![]u8 {
         const f = try rt.font(handle);
-        var shaped = try zpdf.shape(rt.gpa, &f.font, text, .{ .paragraph_direction = @fromBackingInt(@intCast(direction)) });
+        var shaped = try zpdf.shape(rt.gpa, &f.font, text, .{ .paragraph_direction = try toDirection(direction) });
         defer shaped.deinit(rt.gpa);
         const out = try rt.gpa.alloc(u8, @sizeOf(ShapeHeader) + shaped.glyphs.len * @sizeOf(ShapedGlyph));
         errdefer rt.gpa.free(out);
@@ -642,7 +642,8 @@ pub const Runtime = struct {
 
     pub fn docDrawText(rt: *Runtime, handle: u32, page: u32, font_id: u32, size: f64, x: f64, y: f64, color: zpdf.Color, text: []const u8, direction: u32) !void {
         const d = try rt.doc(handle);
-        try d.doc.drawText(@fromBackingInt(@intCast(page)), @fromBackingInt(@intCast(font_id)), size, x, y, color, text, .{ .paragraph_direction = @fromBackingInt(@intCast(direction)) });
+        const dir = try toDirection(direction);
+        try d.doc.drawText(@fromBackingInt(@intCast(page)), @fromBackingInt(@intCast(font_id)), size, x, y, color, text, .{ .paragraph_direction = dir });
     }
 
     pub fn docReserveLater(rt: *Runtime, handle: u32, page: u32) !u32 {
@@ -652,7 +653,8 @@ pub const Runtime = struct {
 
     pub fn docDrawTextLater(rt: *Runtime, handle: u32, later: u32, font_id: u32, size: f64, x: f64, y: f64, color: zpdf.Color, text: []const u8, direction: u32) !void {
         const d = try rt.doc(handle);
-        d.doc.drawTextLater(@fromBackingInt(@intCast(later)), @fromBackingInt(@intCast(font_id)), size, x, y, color, text, .{ .paragraph_direction = @fromBackingInt(@intCast(direction)) }) catch |err| return d.writeError(err);
+        const dir = try toDirection(direction);
+        d.doc.drawTextLater(@fromBackingInt(@intCast(later)), @fromBackingInt(@intCast(font_id)), size, x, y, color, text, .{ .paragraph_direction = dir }) catch |err| return d.writeError(err);
         // It writes its form now: a sink has it, and no caller buffer is held, on return.
         if (d.out != .buffer) d.doc.flushOutput() catch |err| return d.writeError(err);
     }
@@ -1021,6 +1023,18 @@ fn rgb(r: f64, g: f64, b: f64) zpdf.Color {
 /// zpdf.wasm's panic message, for JS to read before it drops the instance.
 var panic_buf: [512]u8 = undefined;
 var panic_len: usize = 0;
+
+/// An export's direction number (0 from the text, 1 left to right, 2 right to left) as zpdf's.
+/// Any other number is InvalidDirection whichever font draws the text: a standard font is not
+/// shaped, so zpdf.shape's own check never sees it.
+fn toDirection(n: u32) error{InvalidDirection}!zpdf.Direction {
+    return switch (n) {
+        0 => .dont_know,
+        1 => .ltr,
+        2 => .rtl,
+        else => error.InvalidDirection,
+    };
+}
 
 /// zpdf.wasm's panic handler (see `panic` in root.zig): keeps the message, then traps.
 pub fn capturePanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
@@ -2291,5 +2305,26 @@ test "sinks: draw_text_later's form is in the caller's memory when it returns, e
     try std.testing.expect(caller.bytes.items.len - before > 64 * 1024);
     const none = try c.rt.docFinish(d);
     c.rt.gpa.free(none);
+    try c.rt.docClose(d);
+}
+
+test "exports: a direction other than 0, 1 or 2 is InvalidDirection, for a standard font too" {
+    const gpa = std.testing.allocator;
+    const c = try Context.create(gpa);
+    defer c.destroy();
+    const d = try c.rt.docNew(false);
+    const font = try c.rt.docAddStandardFont(d, 0);
+    const page = try c.rt.docBeginPage(d, 612, 792);
+    const later = try c.rt.docReserveLater(d, page);
+    for ([_]u32{ 3, 9, std.math.maxInt(u32) }) |bad| {
+        try std.testing.expectError(error.InvalidDirection, c.rt.docDrawText(d, page, font, 9, 10, 40, .black, "a", bad));
+        try std.testing.expectError(error.InvalidDirection, c.rt.docDrawTextLater(d, later, font, 9, 10, 40, .black, "a", bad));
+    }
+    // The refusals changed nothing: the document goes on.
+    try c.rt.docDrawText(d, page, font, 9, 10, 40, .black, "a", 1);
+    try c.rt.docEndPage(d, page);
+    try c.rt.docDrawTextLater(d, later, font, 9, 10, 40, .black, "b", 0);
+    const pdf = try c.rt.docFinish(d);
+    c.rt.gpa.free(pdf);
     try c.rt.docClose(d);
 }
