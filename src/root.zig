@@ -386,6 +386,27 @@ pub const Font = struct {
         return @intFromFloat(delta);
     }
 
+    /// hhea's ascender and descender at this instance, in font units: plus MVAR's "hasc" and
+    /// "hdsc" deltas, which are 0 at the default instance and for a font without axes. The PDF's
+    /// /Ascent and /Descent, and text_layout.verticalMetrics, are these.
+    pub fn verticalMetrics(self: *const Font, face: sfnt.Face) !struct { ascent: i32, descent: i32 } {
+        return .{
+            .ascent = @as(i32, face.ascent) + try self.metricDelta("hasc"),
+            .descent = @as(i32, face.descent) + try self.metricDelta("hdsc"),
+        };
+    }
+
+    /// The font's PostScript name at this instance: the name table's for the default instance
+    /// and a font without axes, Adobe TN 5902's instance name otherwise. The PDF's /BaseFont is
+    /// this after its subset prefix.
+    pub fn postscriptName(self: *const Font, face: sfnt.Face) !sfnt.InstanceName {
+        if (self.isInstanced()) return sfnt.instancePostscriptName(face, self.coordinates);
+        var name: sfnt.InstanceName = .{};
+        @memcpy(name.buf[0..face.postscriptName().len], face.postscriptName());
+        name.len = face.postscriptName().len;
+        return name;
+    }
+
     /// The advance kb's shaping gives `glyph_id` before GPOS, in font units, at
     /// this instance: hmtx plus the HVAR delta, or gvar's phantom points for a
     /// variable font without HVAR (kbts_GetGlyphAdvanceX).

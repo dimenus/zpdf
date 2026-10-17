@@ -200,7 +200,7 @@ internal unsafe struct GlyphRecord
 
 internal static unsafe partial class ZpdfAbi
 {
-    public const uint AbiVersion = 3;
+    public const uint AbiVersion = 4;
     public const string LibraryName = "zpdf";
 
     // abi_version. A caller checks it once, when it loads the library.
@@ -269,6 +269,30 @@ internal static unsafe partial class ZpdfAbi
     // between characters; without it such a word stands alone on a line wider than max_width.
     [LibraryImport(LibraryName, EntryPoint = "zpdf_font_wrap")]
     public static partial int zpdf_font_wrap(ZpdfContext* ctx, uint font, double size, byte* text, nuint len, uint direction, double max_width, uint flags, byte** out_ptr, nuint* out_len);
+
+    // How far the font reaches above and below the baseline, in em (1.0 is the font size): a
+    // standard font's AFM Ascender and Descender, an embedded font's hhea ascender and descender
+    // at its instance. The descender is below the baseline, so usually negative.
+    [LibraryImport(LibraryName, EntryPoint = "zpdf_font_vertical_metrics")]
+    public static partial int zpdf_font_vertical_metrics(ZpdfContext* ctx, uint font, double* out_ascender, double* out_descender);
+
+    // The byte offset in `text` (UTF-8) of the first character the font cannot draw, or len when
+    // it can draw them all. A standard font draws WinAnsi characters; an embedded font cannot draw
+    // a character its shaping maps to glyph 0. direction as in zpdf_font_shape.
+    [LibraryImport(LibraryName, EntryPoint = "zpdf_font_first_missing")]
+    public static partial int zpdf_font_first_missing(ZpdfContext* ctx, uint font, byte* text, nuint len, uint direction, nuint* @out);
+
+    // The longest prefix of `text` (UTF-8) that fits `max_width` points at `size`, as one run:
+    // its length in bytes (always at the end of a character) and its width, the one
+    // zpdf_font_measure gives it. For truncating with an ellipsis, pass the width less the
+    // ellipsis's. max_width is finite and not negative (InvalidNumber).
+    [LibraryImport(LibraryName, EntryPoint = "zpdf_font_fit")]
+    public static partial int zpdf_font_fit(ZpdfContext* ctx, uint font, double size, byte* text, nuint len, uint direction, double max_width, nuint* out_len, double* out_width);
+
+    // The font's name as ASCII: a standard font's base font name (Helvetica-Bold), an embedded
+    // font's PostScript name at its instance. A buffer the caller frees with zpdf_free.
+    [LibraryImport(LibraryName, EntryPoint = "zpdf_font_name")]
+    public static partial int zpdf_font_name(ZpdfContext* ctx, uint font, byte** out_ptr, nuint* out_len);
 
     // AxisRecords, one per axis.
     [LibraryImport(LibraryName, EntryPoint = "zpdf_font_axes")]

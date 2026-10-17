@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;
+using System.Text;
 using Zpdf.Native;
 
 namespace Zpdf;
@@ -33,7 +34,34 @@ public sealed unsafe class FontMetrics : IDisposable
     {
         _context = context;
         _font = font;
+        double ascender;
+        double descender;
+        ZpdfLibrary.Check(ZpdfAbi.zpdf_font_vertical_metrics(context.Pointer, font, &ascender, &descender));
+        Ascender = ascender;
+        Descender = descender;
+        byte* name;
+        nuint length;
+        ZpdfLibrary.Check(ZpdfAbi.zpdf_font_name(context.Pointer, font, &name, &length));
+        try
+        {
+            Name = Encoding.ASCII.GetString(name, checked((int)length));
+        }
+        finally
+        {
+            ZpdfLibrary.Check(ZpdfAbi.zpdf_free(context.Pointer, name, length));
+        }
     }
+
+    /// <summary>How far the font reaches above the baseline, in em (1.0 is the font size): a
+    /// standard font's AFM Ascender, an embedded font's hhea ascender.</summary>
+    public double Ascender { get; }
+
+    /// <summary>How far the font reaches below the baseline, in em; usually negative.</summary>
+    public double Descender { get; }
+
+    /// <summary>A standard font's base font name (<c>Helvetica-Bold</c>); an embedded font's
+    /// PostScript name.</summary>
+    public string Name { get; }
 
     public static FontMetrics Open(StandardFont font)
     {
@@ -94,6 +122,58 @@ public sealed unsafe class FontMetrics : IDisposable
         }
     }
 
+    /// <summary>The index in <paramref name="text"/> of the first character this font cannot draw,
+    /// or <c>text.Length</c> when it can draw them all. A standard font draws WinAnsi characters;
+    /// an embedded font cannot draw what its shaping maps to glyph 0.</summary>
+    public int FirstMissing(ReadOnlySpan<char> text, TextDirection direction)
+    {
+        var context = Enter();
+        Span<byte> stack = stackalloc byte[PdfWriter.StackTextBytes];
+        var utf8 = PdfWriter.Encode(text, stack, out var rented);
+        try
+        {
+            nuint missing;
+            fixed (byte* bytes = utf8)
+            {
+                ZpdfLibrary.Check(ZpdfAbi.zpdf_font_first_missing(context, _font, bytes, (nuint)utf8.Length, (uint)direction, &missing));
+            }
+            return new Utf16Walk(text, utf8.Length, "zpdf_font_first_missing").To(checked((int)missing));
+        }
+        finally
+        {
+            PdfWriter.Return(rented);
+        }
+    }
+
+    /// <summary>
+    /// The length of the longest prefix of <paramref name="text"/> that fits
+    /// <paramref name="maxWidth"/> points at <paramref name="size"/>, drawn as one line, and its
+    /// width in <paramref name="width"/>. The prefix ends at a character's end (never inside a
+    /// surrogate pair or before a combining mark). For truncating with an ellipsis, pass the width
+    /// less the ellipsis's <see cref="Measure"/>.
+    /// </summary>
+    public int Fit(ReadOnlySpan<char> text, double size, double maxWidth, TextDirection direction, out double width)
+    {
+        var context = Enter();
+        Span<byte> stack = stackalloc byte[PdfWriter.StackTextBytes];
+        var utf8 = PdfWriter.Encode(text, stack, out var rented);
+        try
+        {
+            nuint kept;
+            double kept_width;
+            fixed (byte* bytes = utf8)
+            {
+                ZpdfLibrary.Check(ZpdfAbi.zpdf_font_fit(context, _font, size, bytes, (nuint)utf8.Length, (uint)direction, maxWidth, &kept, &kept_width));
+            }
+            width = kept_width;
+            return new Utf16Walk(text, utf8.Length, "zpdf_font_fit").To(checked((int)kept));
+        }
+        finally
+        {
+            PdfWriter.Return(rented);
+        }
+    }
+
     /// <summary>
     /// Replaces the contents of <paramref name="lines"/> with the lines <paramref name="text"/>
     /// wraps to at <paramref name="maxWidth"/> points. Empty text gives no lines. A word wider than
@@ -145,7 +225,7 @@ public sealed unsafe class FontMetrics : IDisposable
             throw new InvalidOperationException(
                 $"zpdf_font_wrap returned {wire.Length} bytes, and its header describes {header.line_count} lines.");
         }
-        var walk = new Utf16Walk(text, utf8.Length);
+        var walk = new Utf16Walk(text, utf8.Length, "zpdf_font_wrap");
         for (var i = 0; i < (int)header.line_count; i++)
         {
             var line = MemoryMarshal.Read<LineRecord>(wire[(sizeof(WrapHeader) + i * sizeof(LineRecord))..]);
@@ -162,20 +242,22 @@ public sealed unsafe class FontMetrics : IDisposable
     {
         private readonly ReadOnlySpan<char> _text;
         private readonly int _byteLength;
+        private readonly string _call;
         private int _char;
         private int _byte;
 
-        public Utf16Walk(ReadOnlySpan<char> text, int byteLength)
+        public Utf16Walk(ReadOnlySpan<char> text, int byteLength, string call)
         {
             _text = text;
             _byteLength = byteLength;
+            _call = call;
         }
 
         public int To(int target)
         {
             if (target < _byte || target > _byteLength)
             {
-                throw new InvalidOperationException($"zpdf_font_wrap gave byte offset {target}, at {_byte} of {_byteLength}.");
+                throw new InvalidOperationException($"{_call} gave byte offset {target}, at {_byte} of {_byteLength}.");
             }
             while (_byte < target)
             {
@@ -193,7 +275,7 @@ public sealed unsafe class FontMetrics : IDisposable
             }
             if (_byte != target)
             {
-                throw new InvalidOperationException($"zpdf_font_wrap gave byte offset {target}, inside a character.");
+                throw new InvalidOperationException($"{_call} gave byte offset {target}, inside a character.");
             }
             return _char;
         }

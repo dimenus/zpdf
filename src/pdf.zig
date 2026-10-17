@@ -977,16 +977,14 @@ const FontDescription = struct {
 ///   gvar gives two glyphs no phantom deltas that its HVAR does vary.
 /// ItalicAngle stays post's: MVAR has no tag for it, and fontTools leaves it.
 fn fontDescription(scratch: std.mem.Allocator, face: sfnt.Face, font: *const zpdf.Font, seeds: []const u16) !FontDescription {
+    const vertical = try font.verticalMetrics(face);
     if (!font.isInstanced()) {
-        var name: sfnt.InstanceName = .{};
-        @memcpy(name.buf[0..face.postscriptName().len], face.postscriptName());
-        name.len = face.postscriptName().len;
         return .{
             .subset = try sfnt.subset(scratch, face, seeds),
-            .name = name,
+            .name = try font.postscriptName(face),
             .bbox = .{ face.x_min, face.y_min, face.x_max, face.y_max },
-            .ascent = face.ascent,
-            .descent = face.descent,
+            .ascent = vertical.ascent,
+            .descent = vertical.descent,
             .cap_height = face.cap_height,
         };
     }
@@ -1000,10 +998,10 @@ fn fontDescription(scratch: std.mem.Allocator, face: sfnt.Face, font: *const zpd
     const inst = try instancer.subsetInstance(scratch, face, seeds, font.normalized, advances);
     return .{
         .subset = inst.bytes,
-        .name = try sfnt.instancePostscriptName(face, font.coordinates),
+        .name = try font.postscriptName(face),
         .bbox = .{ inst.x_min, inst.y_min, inst.x_max, inst.y_max },
-        .ascent = @as(i32, face.ascent) + try font.metricDelta("hasc"),
-        .descent = @as(i32, face.descent) + try font.metricDelta("hdsc"),
+        .ascent = vertical.ascent,
+        .descent = vertical.descent,
         .cap_height = @as(i32, face.cap_height) + try font.metricDelta("cpht"),
     };
 }
