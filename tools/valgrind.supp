@@ -13,3 +13,18 @@
    fun:*huffman.buildValues
    fun:*huffman.build
 }
+
+# std 0.17 lib/std/heap/SafeAllocator.zig, AllocFooter.Modify.setNone: an atomic exchange
+# of a 16-bit field in an allocation's footer. A Debug build for aarch64 lowers the exchange to a
+# compare-and-swap loop: it reads the old value, then compares it with what the exclusive load
+# reads. When a resize writes a footer into memory the allocator has marked undefined (a valgrind
+# client request), both values are undefined and memcheck reports the two branches of that loop.
+# The value stored does not depend on the old one. A program with no zpdf code reproduces it: malloc
+# two bytes, write them, mark them undefined with std.valgrind.memcheck.makeMemUndefined, and
+# @atomicRmw(u16, p, .Xchg, 0x2962, .monotonic) gives the same two reports; without the mark,
+# none. zpdf meets it through ArenaAllocator resizes in the instancer tests.
+{
+   std-safe-allocator-footer-exchange
+   Memcheck:Cond
+   fun:*SafeAllocator.AllocFooter.Modify.setNone
+}
