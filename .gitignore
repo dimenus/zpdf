@@ -3,6 +3,6 @@ zig-out/
 zig-pkg/
 zig-out-linux/
 web/node_modules/
-tests/abi/dotnet/bin/
-tests/abi/dotnet/obj/
+dotnet/*/bin/
+dotnet/*/obj/
 zig-out-win/

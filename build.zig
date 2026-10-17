@@ -194,8 +194,11 @@ pub fn build(b: *std.Build) void {
 
     // libzpdf for each runtime a .NET package carries, as runtimes/<rid>/native/<file>.
     const native_all = b.step("native-all", "Build libzpdf for linux-x64, linux-arm64, osx-arm64 and win-x64");
+    // The same libraries laid out as runtimes/<rid>/native/<file>, for the NuGet package.
+    const runtimes = b.addWriteFiles();
     for (native_targets) |t| {
         const lib = addNative(b, kb, build_options, &cid, b.resolveTargetQuery(t.query), true);
+        _ = runtimes.addCopyFile(lib.getEmittedBin(), b.fmt("runtimes/{s}/native/{s}", .{ t.rid, t.file }));
         b.addNamedLazyPath(b.fmt("libzpdf-{s}", .{t.rid}), lib.getEmittedBin());
         native_all.dependOn(&b.addInstallArtifact(lib, .{
             .dest_dir = .{ .override = .{ .custom = b.pathJoin(&.{ "runtimes", t.rid, "native" }) } },
@@ -217,14 +220,41 @@ pub fn build(b: *std.Build) void {
     abi_test.expectStdOutEqual("abi-test: ok\n");
     test_step.dependOn(&abi_test.step);
 
-    // The generated C# compiled and run against libzpdf by a .NET program. Needs the .NET SDK.
-    const dotnet_test = b.addSystemCommand(&.{ "dotnet", "run", "--project", "tests/abi/dotnet/AbiTest.csproj", "-c", "Release" });
-    dotnet_test.addPrefixedFileArg("--property:ZpdfAbiCs=", csharp);
-    dotnet_test.addArg("--");
-    dotnet_test.addArtifactArg(native);
-    dotnet_test.addFileArg(b.path("tests/read/objstm.pdf"));
+    // The .NET library (dotnet/Zpdf) keeps the generated declarations beside its own code, so it
+    // builds with dotnet alone; `zig build test` fails when that copy differs from what
+    // gen-abi writes now.
+    const csharp_copy = "dotnet/Zpdf/Zpdf.Abi.g.cs";
+    const update_csharp = b.addUpdateSourceFiles();
+    update_csharp.addCopyFileToSource(csharp, csharp_copy);
+    b.step("dotnet-codegen", "Write " ++ csharp_copy ++ " from src/abi.zig").dependOn(&update_csharp.step);
+    const same_file = b.addExecutable(.{ .name = "same-file", .root_module = b.createModule(.{
+        .root_source_file = b.path("tools/same-file.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    }) });
+    const csharp_check = b.addRunArtifact(same_file);
+    csharp_check.addFileArg(csharp);
+    csharp_check.addFileArg(b.path(csharp_copy));
+    csharp_check.addArg("tools/zig build dotnet-codegen");
+    test_step.dependOn(&csharp_check.step);
+
+    // The .NET library's tests against this libzpdf. Needs the .NET SDK.
+    const dotnet_test = b.addSystemCommand(&.{ "dotnet", "test", "dotnet/Zpdf.Tests/Zpdf.Tests.csproj", "-c", "Release" });
+    dotnet_test.addPrefixedDirectoryArg("--property:ZpdfNativeDir=", native.getEmittedBin().dirname());
+    dotnet_test.addPrefixedFileArg("--property:ZpdfTestFont=", harfbuzz.path("test/subset/data/fonts/Roboto-Regular.ttf"));
     dotnet_test.has_side_effects = true;
-    b.step("abi-dotnet-test", "Run the generated C# declarations against libzpdf (needs dotnet)").dependOn(&dotnet_test.step);
+    b.step("dotnet-test", "Run the .NET library's tests against libzpdf (needs dotnet)").dependOn(&dotnet_test.step);
+
+    // The NuGet package, with libzpdf for every RID native-all builds, into <prefix>/nuget.
+    const dotnet_pack = b.addSystemCommand(&.{ "dotnet", "pack", "dotnet/Zpdf/Zpdf.csproj", "-c", "Release" });
+    dotnet_pack.addPrefixedDirectoryArg("--property:ZpdfRuntimes=", runtimes.getDirectory().path(b, "runtimes"));
+    dotnet_pack.addPrefixedDirectoryArg("--property:ZpdfNativeDir=", native.getEmittedBin().dirname());
+    dotnet_pack.addArg("--output");
+    const nuget = dotnet_pack.addOutputDirectoryArg("nuget");
+    dotnet_pack.has_side_effects = true;
+    b.step("dotnet-pack", "Pack the .NET library with libzpdf for every RID (needs dotnet)").dependOn(
+        &b.addInstallDirectory(.{ .source_dir = nuget, .install_dir = .prefix, .install_subdir = "nuget" }).step,
+    );
 }
 
 const NativeTarget = struct { rid: []const u8, query: std.Target.Query, file: []const u8 };
@@ -381,12 +411,13 @@ fn checkTestRoots(b: *std.Build) void {
     const root = readRootFile(b, "src/root.zig", 1 << 22) catch |err| std.debug.panic("src/root.zig: {t}", .{err});
     const start = std.mem.indexOf(u8, root, "\ntest {\n") orelse std.debug.panic("src/root.zig has no `test {{` block", .{});
     const block = root[start..][0 .. std.mem.indexOf(u8, root[start..], "\n}\n") orelse std.debug.panic("src/root.zig: `test {{` block not closed", .{})];
+    b.dependOnDirectoryContents(b.path("src"));
     var dir = b.root.openDir(b.graph.io, "src", .{ .iterate = true }) catch |err| std.debug.panic("src: {t}", .{err});
     defer dir.close(b.graph.io);
     var it = dir.iterate();
     while (it.next(b.graph.io) catch |err| std.debug.panic("src: {t}", .{err})) |entry| {
         if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig") or std.mem.eql(u8, entry.name, "root.zig")) continue;
-        const text = dir.readFileAlloc(b.graph.io, entry.name, b.allocator, .limited(1 << 24)) catch |err| std.debug.panic("src/{s}: {t}", .{ entry.name, err });
+        const text = readRootFile(b, b.fmt("src/{s}", .{entry.name}), 1 << 24) catch |err| std.debug.panic("src/{s}: {t}", .{ entry.name, err });
         if (std.mem.indexOf(u8, text, "\ntest \"") == null and !std.mem.startsWith(u8, text, "test \"")) continue;
         const stem = entry.name[0 .. entry.name.len - 4];
         if (std.mem.indexOf(u8, block, b.fmt("_ = {s};", .{stem})) != null) continue;
@@ -395,8 +426,11 @@ fn checkTestRoots(b: *std.Build) void {
     }
 }
 
-/// A file of zpdf's checkout, read when the build is configured.
+/// A file of zpdf's checkout, read when the build is configured. Zig 0.17 reuses a cached
+/// configuration until build.zig or a declared input changes, so every such read declares its file
+/// (dependOnFileContents); without that, an edit to the file went unseen.
 fn readRootFile(b: *std.Build, sub_path: []const u8, limit: usize) ![]u8 {
+    b.dependOnFileContents(b.path(sub_path));
     var dir = try b.root.openDir(b.graph.io, ".", .{});
     defer dir.close(b.graph.io);
     return dir.readFileAlloc(b.graph.io, sub_path, b.allocator, .limited(limit));

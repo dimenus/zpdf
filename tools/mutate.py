@@ -6,7 +6,7 @@
     uv run tools/mutate.py <mutants.json> [index ...]
 
 mutants.json is a list of [path, old, new, step]: `old` must occur exactly once in `path`; it is
-replaced by `new`, `zig build <step>` runs (step "test" or "web-test"), and the file is restored,
+replaced by `new`, `zig build <step>` runs (step "test", "web-test" or "dotnet-test"), and the file is restored,
 also when the run is interrupted. Write mutants that compile: a mutant that does not is reported
 as COMPILE ERROR and proves nothing.
 
@@ -62,11 +62,12 @@ def main():
             lines = out.splitlines()
             if p.returncode == 0:
                 verdict, why = "SURVIVED", ""
-            elif "compilation error" in out:
-                verdict, why = "COMPILE ERROR", next((l for l in lines if ": error:" in l), "")
+            elif "compilation error" in out or re.search(r"error CS\d+", out):
+                verdict, why = "COMPILE ERROR", next((l for l in lines if ": error:" in l or re.search(r"error CS\d+", l)), "")
             else:
                 verdict = "killed"
-                why = next((l for l in lines if re.match(r"error: '.*' (failed|terminated)", l) or "(fail)" in l), "")
+                # Zig's test runner, and xunit's "<test> [FAIL]" (dotnet-test).
+                why = next((l.strip() for l in lines if re.match(r"error: '.*' (failed|terminated)", l) or l.rstrip().endswith("[FAIL]")), "")
                 if not why:
                     why = "NO FAILING TEST FOUND: " + " | ".join(lines[-3:])
             if verdict != "killed":

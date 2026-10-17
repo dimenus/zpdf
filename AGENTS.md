@@ -44,7 +44,11 @@
 - The C ABI (`src/abi.zig`, shared by zpdf.wasm and libzpdf): `zig build abi` installs libzpdf,
   `include/zpdf.h` and `csharp/Zpdf.Abi.g.cs` (generated; never edit them); `zig build native-all`
   builds libzpdf for the four .NET RIDs into `zig-out/runtimes/`. `zig build test` runs
-  `tests/abi/abi-test.c` against the library; `zig build abi-dotnet-test` runs the generated C#
-  (needs the .NET SDK). A change to an export, a wire record or an error code bumps `abi_version`;
+  `tests/abi/abi-test.c` against the library. A change to an export, a wire record or an error code bumps `abi_version`;
   the test "the ABI surface is the one abi_version names" fails until it does, and prints the new hash.
+- .NET (`dotnet/Zpdf`: PdfReader and PdfWriter over the C ABI; needs the .NET SDK):
+  `zig build dotnet-test` runs `dotnet/Zpdf.Tests` against this libzpdf; `zig build dotnet-pack`
+  writes the NuGet package with libzpdf for every RID to `zig-out/nuget`. The library keeps a copy
+  of the generated `Zpdf.Abi.g.cs`; after an ABI change, `zig build dotnet-codegen` rewrites it
+  (`zig build test` fails until then).
 - Wasm in a real browser (Playwright Chromium + pdf.js): `zig build web-test`; if Chromium is missing, `bun web/node_modules/playwright-core/cli.js install --only-shell chromium`.

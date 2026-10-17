@@ -1,0 +1,40 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <!-- Run through `tools/zig build dotnet-test`, which builds libzpdf and passes it and the test
+         font. A plain `dotnet test` needs both properties set by hand. -->
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>disable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+        <OutputType>Exe</OutputType>
+        <IsPackable>false</IsPackable>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.9.0" />
+        <PackageReference Include="xunit.v3" Version="3.2.2" />
+        <PackageReference Include="xunit.runner.visualstudio" Version="3.1.5">
+            <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+            <PrivateAssets>all</PrivateAssets>
+        </PackageReference>
+    </ItemGroup>
+
+    <ItemGroup>
+        <ProjectReference Include="..\Zpdf\Zpdf.csproj" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <!-- The reader fixtures: one 3-page file from zpdf, and qpdf's rewrites of it
+             (tools/read-fixtures.sh). -->
+        <None Include="..\..\tests\read\*.pdf" Link="Fixtures\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+        <!-- A TrueType font for the writer's tests (harfbuzz's Roboto-Regular, from build.zig.zon). -->
+        <None Include="$([System.IO.Path]::GetFullPath('$(ZpdfTestFont)', '$(MSBuildStartupDirectory)'))" Link="Fixtures\TestFont.ttf" CopyToOutputDirectory="PreserveNewest" Condition="'$(ZpdfTestFont)' != ''" />
+    </ItemGroup>
+
+    <Target Name="RequireZpdfTestFont" BeforeTargets="Build">
+        <Error Condition="'$(ZpdfTestFont)' == ''" Text="Set ZpdfTestFont to a TrueType font; tools/zig build dotnet-test does." />
+    </Target>
+
+</Project>

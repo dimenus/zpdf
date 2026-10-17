@@ -1,0 +1,64 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+    <!-- zpdf for .NET: PdfReader and PdfWriter over libzpdf's C ABI. Zpdf.Abi.g.cs is generated
+         (`tools/zig build dotnet-codegen`, never edited; `zig build test` fails when it is stale).
+
+         libzpdf: a build copies the host's (or the build RID's) from ZpdfNativeDir, which
+         `zig build dotnet-test` sets; on its own, it is zig-out/lib after `tools/zig build abi`.
+         `zig build dotnet-pack` packs all four RIDs from `zig build native-all`'s output. -->
+    <PropertyGroup>
+        <TargetFramework>net10.0</TargetFramework>
+        <ImplicitUsings>disable</ImplicitUsings>
+        <Nullable>enable</Nullable>
+        <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+        <IsRidAgnostic>false</IsRidAgnostic>
+        <RuntimeIdentifiers>linux-x64;linux-arm64;osx-arm64;win-x64</RuntimeIdentifiers>
+        <PackageId>Zpdf</PackageId>
+        <Version>0.1.0</Version>
+        <Description>A PDF writer and text reader (zpdf, in Zig) for .NET.</Description>
+        <PackageLicenseFile>LICENSE</PackageLicenseFile>
+    </PropertyGroup>
+
+    <PropertyGroup>
+        <ZpdfNativeDir Condition="'$(ZpdfNativeDir)' == ''">$(MSBuildThisFileDirectory)../../zig-out/lib</ZpdfNativeDir>
+        <ZpdfRuntimes Condition="'$(ZpdfRuntimes)' == ''">$(MSBuildThisFileDirectory)../../zig-out/runtimes</ZpdfRuntimes>
+        <!-- Relative paths are the caller's (zig build passes paths relative to the repo root). -->
+        <!-- A property set on the command line cannot be reassigned, so the full paths get their own. -->
+        <_ZpdfNativeDir>$([System.IO.Path]::GetFullPath('$(ZpdfNativeDir)', '$(MSBuildStartupDirectory)'))</_ZpdfNativeDir>
+        <_ZpdfRuntimes>$([System.IO.Path]::GetFullPath('$(ZpdfRuntimes)', '$(MSBuildStartupDirectory)'))</_ZpdfRuntimes>
+        <ZpdfNativeRid Condition="'$(RuntimeIdentifier)' != ''">$(RuntimeIdentifier)</ZpdfNativeRid>
+        <ZpdfNativeRid Condition="'$(ZpdfNativeRid)' == ''">$(NETCoreSdkPortableRuntimeIdentifier)</ZpdfNativeRid>
+    </PropertyGroup>
+
+    <!-- A build for another RID takes that RID's library from native-all's output. -->
+    <PropertyGroup Condition="'$(RuntimeIdentifier)' != '' AND '$(RuntimeIdentifier)' != '$(NETCoreSdkPortableRuntimeIdentifier)'">
+        <_ZpdfNativeDir>$(_ZpdfRuntimes)/$(RuntimeIdentifier)/native</_ZpdfNativeDir>
+    </PropertyGroup>
+
+    <ItemGroup>
+        <None Include="$(_ZpdfNativeDir)/libzpdf.dylib" Condition="Exists('$(_ZpdfNativeDir)/libzpdf.dylib')" Link="runtimes/$(ZpdfNativeRid)/native/libzpdf.dylib" CopyToOutputDirectory="PreserveNewest" Pack="false" Visible="false" />
+        <None Include="$(_ZpdfNativeDir)/libzpdf.so" Condition="Exists('$(_ZpdfNativeDir)/libzpdf.so')" Link="runtimes/$(ZpdfNativeRid)/native/libzpdf.so" CopyToOutputDirectory="PreserveNewest" Pack="false" Visible="false" />
+        <None Include="$(_ZpdfNativeDir)/zpdf.dll" Condition="Exists('$(_ZpdfNativeDir)/zpdf.dll')" Link="runtimes/$(ZpdfNativeRid)/native/zpdf.dll" CopyToOutputDirectory="PreserveNewest" Pack="false" Visible="false" />
+        <None Include="$(_ZpdfRuntimes)/linux-x64/native/libzpdf.so" Pack="true" PackagePath="runtimes/linux-x64/native/" Visible="false" />
+        <None Include="$(_ZpdfRuntimes)/linux-arm64/native/libzpdf.so" Pack="true" PackagePath="runtimes/linux-arm64/native/" Visible="false" />
+        <None Include="$(_ZpdfRuntimes)/osx-arm64/native/libzpdf.dylib" Pack="true" PackagePath="runtimes/osx-arm64/native/" Visible="false" />
+        <None Include="$(_ZpdfRuntimes)/win-x64/native/zpdf.dll" Pack="true" PackagePath="runtimes/win-x64/native/" Visible="false" />
+        <None Include="$(MSBuildThisFileDirectory)../../LICENSE" Pack="true" PackagePath="" Visible="false" />
+    </ItemGroup>
+
+    <ItemGroup>
+        <InternalsVisibleTo Include="Zpdf.Tests" />
+    </ItemGroup>
+
+    <Target Name="RequireZpdfNative" BeforeTargets="Build">
+        <Error Condition="!Exists('$(_ZpdfNativeDir)/libzpdf.dylib') AND !Exists('$(_ZpdfNativeDir)/libzpdf.so') AND !Exists('$(_ZpdfNativeDir)/zpdf.dll')"
+               Text="libzpdf for $(ZpdfNativeRid) is not in $(_ZpdfNativeDir). Run tools/zig build abi (the host's) or tools/zig build native-all (every RID)." />
+    </Target>
+
+    <Target Name="RequireZpdfRuntimes" BeforeTargets="GenerateNuspec">
+        <Error Condition="!Exists('$(_ZpdfRuntimes)/linux-x64/native/libzpdf.so') OR !Exists('$(_ZpdfRuntimes)/linux-arm64/native/libzpdf.so') OR !Exists('$(_ZpdfRuntimes)/osx-arm64/native/libzpdf.dylib') OR !Exists('$(_ZpdfRuntimes)/win-x64/native/zpdf.dll')"
+               Text="A package needs libzpdf for every RID in $(_ZpdfRuntimes). Run tools/zig build native-all." />
+    </Target>
+
+</Project>
