@@ -507,6 +507,8 @@ pub const Document = struct {
         if (self.open != null) return error.PageOpen;
         try checkPdfReal(width_pt);
         try checkPdfReal(height_pt);
+        // A MediaBox with no area is not a page a viewer can show.
+        if (!(width_pt > 0) or !(height_pt > 0)) return error.InvalidNumber;
         self.open = .{
             .id = @fromBackingInt(@intCast(self.page_objects.items.len)),
             .width_pt = width_pt,
@@ -1305,7 +1307,7 @@ const av_200: *const [400]u8 = blk: {
     break :blk @ptrCast(&pairs);
 };
 
-test "beginPage and drawText reject non-finite and huge numbers" {
+test "beginPage and drawText reject non-finite and huge numbers, and beginPage a size with no area" {
     const options = @import("build_options");
     const bytes = try E2e.load(options.test_font_latin);
     defer std.testing.allocator.free(bytes);
@@ -1320,6 +1322,9 @@ test "beginPage and drawText reject non-finite and huge numbers" {
     try std.testing.expectError(error.InvalidNumber, doc.beginPage(std.math.nan(f64), 792));
     try std.testing.expectError(error.InvalidNumber, doc.beginPage(1e15, 792));
     try std.testing.expectError(error.InvalidNumber, doc.beginPage(1e9 + 1e6, 792));
+    try std.testing.expectError(error.InvalidNumber, doc.beginPage(0, 792));
+    try std.testing.expectError(error.InvalidNumber, doc.beginPage(612, -0.0));
+    try std.testing.expectError(error.InvalidNumber, doc.beginPage(-612, 792));
     const page = try doc.beginPage(1e9, 792);
     try std.testing.expectError(error.InvalidNumber, doc.drawText(page, font, std.math.inf(f64), 72, 720, .black, "a", .{}));
     try std.testing.expectError(error.InvalidNumber, doc.drawText(page, font, std.math.nan(f64), 72, 720, .black, "a", .{}));

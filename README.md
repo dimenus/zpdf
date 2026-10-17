@@ -64,6 +64,22 @@ for (var i = 0; i < reader.PageCount; i++)
 }
 ```
 
+Measure and wrap text with the same widths the writer draws. `Wrap` breaks at spaces and around
+CJK, keeps line breaks, and with `breakWords` splits a word that is too long for the line. Lines
+come back as offsets into your string, in a list you can reuse:
+
+<!-- example: wrap -->
+```csharp
+using var helvetica = FontMetrics.Open(StandardFont.Helvetica);
+var cell = "Cost of goods on hand, by location";
+var lines = new List<TextLine>();
+helvetica.Wrap(cell, 10, 100, breakWords: true, TextDirection.FromText, lines);
+foreach (var line in lines)
+{
+    Console.WriteLine($"{cell.Substring(line.Start, line.Length)} ({line.Width:0.##} pt)");
+}
+```
+
 Units are points (1/72 inch), and y goes up from the bottom of the page. `PdfWriter` takes any
 `IBufferWriter<byte>`, and `AddFont` embeds a font file. The source in [dotnet/Zpdf](dotnet/Zpdf)
 documents both.

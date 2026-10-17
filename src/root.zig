@@ -12,6 +12,7 @@ pub const pdf = @import("pdf.zig");
 pub const abi = @import("abi.zig");
 pub const winansi = @import("winansi.zig");
 pub const read = @import("read.zig");
+pub const text_layout = @import("text_layout.zig");
 pub const Document = pdf.Document;
 pub const StandardFont = pdf.StandardFont;
 pub const Color = pdf.Color;
@@ -37,6 +38,7 @@ test {
     _ = text_map;
     _ = pdf;
     _ = read;
+    _ = text_layout;
     _ = @import("read_text.zig");
 }
 

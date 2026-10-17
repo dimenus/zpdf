@@ -62,18 +62,19 @@ const std = @import("std");
 const builtin = @import("builtin");
 const zpdf = @import("root.zig");
 const sfnt = @import("sfnt.zig");
+const text_layout = @import("text_layout.zig");
 const abi_options = @import("abi_options");
 
 const is_wasm = builtin.target.cpu.arch == .wasm32;
 
 /// Changes when an export, a wire record or an error code changes. A caller checks it once,
 /// when it loads the library.
-pub const abi_version: u32 = 2;
+pub const abi_version: u32 = 3;
 
 /// The hash of the ABI that abi_version names (surfaceHash). The test "exports: the ABI surface
 /// is the one abi_version names" fails when they differ: then bump abi_version and set this to
 /// the hash the test prints.
-const abi_surface: u64 = 0xc118c8af0a6689c5;
+const abi_surface: u64 = 0xe56330f4f4905475;
 
 comptime {
     // The records are written with their in-memory bytes; every target zpdf builds for
@@ -96,6 +97,23 @@ pub const ShapeHeader = extern struct {
     pen_x: i32,
     pen_y: i32,
 };
+
+/// zpdf_font_wrap: this, then line_count LineRecords.
+pub const WrapHeader = extern struct {
+    line_count: u32,
+    reserved: u32,
+};
+
+/// One wrapped line: bytes start to start + len of the text, without its trailing spaces or its
+/// line break, and its width in points.
+pub const LineRecord = extern struct {
+    start: u32,
+    len: u32,
+    width: f64,
+};
+
+/// zpdf_font_wrap's flags: break a word wider than the line between characters.
+const wrap_break_words: u32 = 1;
 
 /// In kb's order. The origin is zpdf.Pen's, the rule the PDF uses.
 pub const ShapedGlyph = extern struct {
@@ -354,9 +372,25 @@ pub const Table = struct {
 };
 
 const FontObject = struct {
-    font: zpdf.Font,
+    /// A font file the caller opened, or one of the standard fonts, which has no file: it can be
+    /// measured, wrapped and added to a document, and nothing else (NotEmbedded).
+    font: union(enum) { embedded: zpdf.Font, standard: zpdf.StandardFont },
     /// Made on the first glyph path.
     outlines: ?zpdf.Outlines = null,
+
+    fn embedded(f: *FontObject) error{NotEmbedded}!*zpdf.Font {
+        return switch (f.font) {
+            .embedded => |*e| e,
+            .standard => error.NotEmbedded,
+        };
+    }
+
+    fn layoutFont(f: *FontObject) text_layout.FontRef {
+        return switch (f.font) {
+            .embedded => |*e| .{ .embedded = e },
+            .standard => |s| .{ .standard = s },
+        };
+    }
 };
 
 const DocObject = struct {
@@ -501,8 +535,16 @@ pub const Runtime = struct {
         defer rt.gpa.free(variations);
         const object = try rt.gpa.create(FontObject);
         errdefer rt.gpa.destroy(object);
-        object.* = .{ .font = try zpdf.Font.init(rt.gpa, bytes, index, variations) };
-        errdefer object.font.deinit();
+        object.* = .{ .font = .{ .embedded = try zpdf.Font.init(rt.gpa, bytes, index, variations) } };
+        errdefer object.font.embedded.deinit();
+        return rt.table.acquire(.font, object);
+    }
+
+    pub fn fontOpenStandard(rt: *Runtime, standard: u32) !u32 {
+        const standard_font = std.enums.fromInt(zpdf.StandardFont, standard) orelse return error.InvalidFont;
+        const object = try rt.gpa.create(FontObject);
+        errdefer rt.gpa.destroy(object);
+        object.* = .{ .font = .{ .standard = standard_font } };
         return rt.table.acquire(.font, object);
     }
 
@@ -512,7 +554,10 @@ pub const Runtime = struct {
 
     fn destroyFont(rt: *Runtime, object: *FontObject) void {
         if (object.outlines) |*o| o.deinit();
-        object.font.deinit();
+        switch (object.font) {
+            .embedded => |*e| e.deinit(),
+            .standard => {},
+        }
         rt.gpa.destroy(object);
     }
 
@@ -521,14 +566,14 @@ pub const Runtime = struct {
     }
 
     pub fn fontUnitsPerEm(rt: *Runtime, handle: u32) !u16 {
-        const f = try rt.font(handle);
-        return sfnt.unitsPerEm(f.font.bytes, f.font.index);
+        const f = try (try rt.font(handle)).embedded();
+        return sfnt.unitsPerEm(f.bytes, f.index);
     }
 
     /// AxisRecords, owned by rt.gpa.
     pub fn fontAxes(rt: *Runtime, handle: u32) ![]u8 {
-        const f = try rt.font(handle);
-        const axes = try f.font.axes(rt.gpa);
+        const f = try (try rt.font(handle)).embedded();
+        const axes = try f.axes(rt.gpa);
         defer rt.gpa.free(axes);
         const out = try rt.gpa.alloc(u8, axes.len * @sizeOf(AxisRecord));
         for (axes, 0..) |axis, i| putRecord(out, i * @sizeOf(AxisRecord), AxisRecord{
@@ -543,8 +588,8 @@ pub const Runtime = struct {
 
     /// A ShapeHeader then ShapedGlyphs, owned by rt.gpa.
     pub fn fontShape(rt: *Runtime, handle: u32, text: []const u8, direction: u32) ![]u8 {
-        const f = try rt.font(handle);
-        var shaped = try zpdf.shape(rt.gpa, &f.font, text, .{ .paragraph_direction = try toDirection(direction) });
+        const f = try (try rt.font(handle)).embedded();
+        var shaped = try zpdf.shape(rt.gpa, f, text, .{ .paragraph_direction = try toDirection(direction) });
         defer shaped.deinit(rt.gpa);
         const out = try rt.gpa.alloc(u8, @sizeOf(ShapeHeader) + shaped.glyphs.len * @sizeOf(ShapedGlyph));
         errdefer rt.gpa.free(out);
@@ -568,7 +613,8 @@ pub const Runtime = struct {
     /// Glyph `gid`'s PathRecords, owned by rt.gpa.
     pub fn fontGlyphPath(rt: *Runtime, handle: u32, gid: u32) ![]u8 {
         const f = try rt.font(handle);
-        if (f.outlines == null) f.outlines = try f.font.outlines(rt.gpa);
+        const e = try f.embedded();
+        if (f.outlines == null) f.outlines = try e.outlines(rt.gpa);
         const commands = try f.outlines.?.path(rt.gpa, std.math.cast(u16, gid) orelse return error.InvalidFont);
         defer rt.gpa.free(commands);
         const out = try rt.gpa.alloc(u8, commands.len * @sizeOf(PathRecord));
@@ -623,16 +669,38 @@ pub const Runtime = struct {
         const font_slot = try rt.table.lookup(font_handle, .font);
         const f: *FontObject = @ptrCast(@alignCast(font_slot.object.?));
         try d.font_slots.ensureUnusedCapacity(rt.gpa, 1);
-        const id = try d.doc.addFont(&f.font);
+        const id = switch (f.font) {
+            .embedded => |*e| try d.doc.addFont(e),
+            .standard => |standard| try d.doc.addStandardFont(standard),
+        };
         d.font_slots.appendAssumeCapacity(rt.table.indexOf(font_slot));
         Table.retain(font_slot);
         return @backingInt(id);
     }
 
-    pub fn docAddStandardFont(rt: *Runtime, handle: u32, standard: u32) !u32 {
-        const d = try rt.doc(handle);
-        const standard_font = std.enums.fromInt(zpdf.StandardFont, standard) orelse return error.InvalidFont;
-        return @backingInt(try d.doc.addStandardFont(standard_font));
+    /// The width of `text` at `size` points, as one run (text_layout.measure).
+    pub fn fontMeasure(rt: *Runtime, handle: u32, size: f64, text: []const u8, direction: u32) !f64 {
+        const f = try rt.font(handle);
+        return text_layout.measure(rt.gpa, f.layoutFont(), size, text, .{ .paragraph_direction = try toDirection(direction) });
+    }
+
+    /// A WrapHeader then LineRecords (text_layout.wrap), owned by rt.gpa.
+    pub fn fontWrap(rt: *Runtime, handle: u32, size: f64, text: []const u8, direction: u32, max_width: f64, flags: u32) ![]u8 {
+        const f = try rt.font(handle);
+        if (flags & ~@as(u32, wrap_break_words) != 0) return error.InvalidNumber;
+        const lines = try text_layout.wrap(rt.gpa, f.layoutFont(), size, text, max_width, .{
+            .shape = .{ .paragraph_direction = try toDirection(direction) },
+            .break_words = flags & wrap_break_words != 0,
+        });
+        defer rt.gpa.free(lines);
+        const out = try rt.gpa.alloc(u8, @sizeOf(WrapHeader) + lines.len * @sizeOf(LineRecord));
+        putRecord(out, 0, WrapHeader{ .line_count = @intCast(lines.len), .reserved = 0 });
+        for (lines, 0..) |l, i| putRecord(out, @sizeOf(WrapHeader) + i * @sizeOf(LineRecord), LineRecord{
+            .start = l.start,
+            .len = l.len,
+            .width = l.width,
+        });
+        return out;
     }
 
     pub fn docBeginPage(rt: *Runtime, handle: u32, width: f64, height: f64) !u32 {
@@ -890,6 +958,7 @@ pub const error_codes = [_]struct { anyerror, i32 }{
     .{ error.ContextBusy, -33 },
     .{ error.BuffersOutstanding, -34 },
     .{ error.SinkFailed, -35 },
+    .{ error.NotEmbedded, -36 },
 };
 pub const unknown_code: i32 = -127;
 
@@ -1130,6 +1199,17 @@ pub const exports = struct {
         return 0;
     }
 
+    /// One of the standard fonts as a font handle: standard is zpdf.StandardFont's order (0
+    /// Helvetica ... 11 Courier-BoldOblique). It can be measured, wrapped and added to a document;
+    /// shaping, outlines, axes and units per em need a font file (NotEmbedded).
+    pub fn zpdf_font_open_standard(ctx: ?*Context, standard: u32, out: ?*u32) callconv(.c) i32 {
+        const o = output(u32, out) catch |err| return mapError(err);
+        const c = Context.enter(ctx) catch |err| return mapError(err);
+        defer c.leave();
+        o.* = c.rt.fontOpenStandard(standard) catch |err| return mapError(err);
+        return 0;
+    }
+
     /// A document that uses the font keeps it alive until the document closes.
     pub fn zpdf_font_close(ctx: ?*Context, font: u32) callconv(.c) i32 {
         const c = Context.enter(ctx) catch |err| return mapError(err);
@@ -1143,6 +1223,31 @@ pub const exports = struct {
         const c = Context.enter(ctx) catch |err| return mapError(err);
         defer c.leave();
         o.* = c.rt.fontUnitsPerEm(font) catch |err| return mapError(err);
+        return 0;
+    }
+
+    /// The width of `text` (UTF-8) at `size` points, as one run with no breaks, in points.
+    /// direction as in zpdf_font_shape. A standard font's text must be WinAnsi (NotWinAnsi).
+    pub fn zpdf_font_measure(ctx: ?*Context, font: u32, size: f64, text: ?[*]const u8, len: usize, direction: u32, out: ?*f64) callconv(.c) i32 {
+        const o = output(f64, out) catch |err| return mapError(err);
+        const t = input(text, len) catch |err| return mapError(err);
+        const c = Context.enter(ctx) catch |err| return mapError(err);
+        defer c.leave();
+        o.* = c.rt.fontMeasure(font, size, t, direction) catch |err| return mapError(err);
+        return 0;
+    }
+
+    /// The lines `text` (UTF-8) wraps to at `max_width` points: a WrapHeader, then a LineRecord
+    /// per line. The rules are zpdf.text_layout's: breaks after spaces and around CJK, forced
+    /// breaks at line ends, trailing spaces dropped. flags bit 0 breaks a word wider than the line
+    /// between characters; without it such a word stands alone on a line wider than max_width.
+    pub fn zpdf_font_wrap(ctx: ?*Context, font: u32, size: f64, text: ?[*]const u8, len: usize, direction: u32, max_width: f64, flags: u32, out_ptr: ?*?[*]u8, out_len: ?*usize) callconv(.c) i32 {
+        const o = outputBuffer(out_ptr, out_len) catch |err| return mapError(err);
+        const t = input(text, len) catch |err| return mapError(err);
+        const c = Context.enter(ctx) catch |err| return mapError(err);
+        defer c.leave();
+        c.reserveBuffer() catch |err| return mapError(err);
+        c.give(o, c.rt.fontWrap(font, size, t, direction, max_width, flags) catch |err| return mapError(err));
         return 0;
     }
 
@@ -1207,15 +1312,6 @@ pub const exports = struct {
         const c = Context.enter(ctx) catch |err| return mapError(err);
         defer c.leave();
         o.* = c.rt.docAddFont(doc, font) catch |err| return mapError(err);
-        return 0;
-    }
-
-    /// standard: zpdf.StandardFont's order (0 Helvetica ... 11 Courier-BoldOblique).
-    pub fn zpdf_doc_add_standard_font(ctx: ?*Context, doc: u32, standard: u32, out_font_id: ?*u32) callconv(.c) i32 {
-        const o = output(u32, out_font_id) catch |err| return mapError(err);
-        const c = Context.enter(ctx) catch |err| return mapError(err);
-        defer c.leave();
-        o.* = c.rt.docAddStandardFont(doc, standard) catch |err| return mapError(err);
         return 0;
     }
 
@@ -1594,8 +1690,10 @@ test "exports: a busy context, a null pointer and a buffer the context did not g
     var doc: u32 = 99;
     try std.testing.expectEqual(mapError(error.InvalidPointer), e.zpdf_doc_new(c, 1, null));
     try std.testing.expectEqual(ok, e.zpdf_doc_new(c, 1, &doc));
+    var standard: u32 = 0;
+    try std.testing.expectEqual(ok, e.zpdf_font_open_standard(c, 0, &standard));
     var font_id: u32 = 0;
-    try std.testing.expectEqual(ok, e.zpdf_doc_add_standard_font(c, doc, 0, &font_id));
+    try std.testing.expectEqual(ok, e.zpdf_doc_add_font(c, doc, standard, &font_id));
 
     // Another call running in the context: refused, the output still zeroed.
     var page: u32 = 99;
@@ -1689,6 +1787,83 @@ test "exports: the ABI surface is the one abi_version names" {
         std.debug.print("the C ABI changed (surface 0x{x}): bump abi_version and set abi_surface to that\n", .{now});
         return error.AbiChangedWithoutVersion;
     }
+}
+
+test "exports: measure and wrap give text_layout's answers, for a standard font and a font file" {
+    const e = exports;
+    const ok: i32 = 0;
+    const gpa = std.testing.allocator;
+    const options = @import("build_options");
+    const font_bytes = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, options.test_font_roboto, gpa, .unlimited);
+    defer gpa.free(font_bytes);
+    const c = e.zpdf_context_new().?;
+    defer _ = e.zpdf_context_free(c);
+
+    var helvetica: u32 = 0;
+    try std.testing.expectEqual(ok, e.zpdf_font_open_standard(c, 0, &helvetica));
+    var width: f64 = 0;
+    try std.testing.expectEqual(ok, e.zpdf_font_measure(c, helvetica, 10, "Hello", 5, 0, &width));
+    try std.testing.expectApproxEqAbs(22.78, width, 1e-9);
+
+    // A standard font has no file: what needs one is refused, and nothing comes out.
+    var upem: u32 = 99;
+    try std.testing.expectEqual(mapError(error.NotEmbedded), e.zpdf_font_units_per_em(c, helvetica, &upem));
+    try std.testing.expectEqual(@as(u32, 0), upem);
+    var shaped: ?[*]u8 = null;
+    var shaped_len: usize = 0;
+    try std.testing.expectEqual(mapError(error.NotEmbedded), e.zpdf_font_shape(c, helvetica, "a", 1, 0, &shaped, &shaped_len));
+    try std.testing.expectEqual(mapError(error.InvalidFont), e.zpdf_font_open_standard(c, 12, &upem));
+    try std.testing.expectEqual(mapError(error.NotWinAnsi), e.zpdf_font_measure(c, helvetica, 10, "\u{4E00}", 3, 0, &width));
+
+    var roboto: u32 = 0;
+    try std.testing.expectEqual(ok, e.zpdf_font_open(c, font_bytes.ptr, font_bytes.len, 0, null, 0, &roboto));
+    const text = "one two three four five six\nseven";
+    for ([_]u32{ helvetica, roboto }) |font| {
+        const f = try c.rt.font(font);
+        var out: ?[*]u8 = null;
+        var out_len: usize = 0;
+        try std.testing.expectEqual(ok, e.zpdf_font_wrap(c, font, 12, text, text.len, 0, 60, 1, &out, &out_len));
+        const bytes = out.?[0..out_len];
+        defer _ = e.zpdf_free(c, out, out_len);
+        const want = try text_layout.wrap(gpa, f.layoutFont(), 12, text, 60, .{ .break_words = true });
+        defer gpa.free(want);
+        try std.testing.expect(want.len > 2);
+        const header = readRecord(WrapHeader, bytes, 0);
+        try std.testing.expectEqual(@as(u32, @intCast(want.len)), header.line_count);
+        try std.testing.expectEqual(@sizeOf(WrapHeader) + want.len * @sizeOf(LineRecord), bytes.len);
+        for (want, 0..) |line, i| {
+            const got = readRecord(LineRecord, bytes, @sizeOf(WrapHeader) + i * @sizeOf(LineRecord));
+            try std.testing.expectEqual(line.start, got.start);
+            try std.testing.expectEqual(line.len, got.len);
+            try std.testing.expectEqual(line.width, got.width);
+            var measured: f64 = 0;
+            try std.testing.expectEqual(ok, e.zpdf_font_measure(c, font, 12, text[got.start..].ptr, got.len, 0, &measured));
+            try std.testing.expectApproxEqAbs(got.width, measured, 1e-9);
+        }
+        // Only bit 0 means anything; another bit is a caller this version does not understand.
+        try std.testing.expectEqual(mapError(error.InvalidNumber), e.zpdf_font_wrap(c, font, 12, text, text.len, 0, 60, 2, &out, &out_len));
+    }
+
+    // A document takes either kind through one call, and keeps it after the handle closes.
+    var doc: u32 = 0;
+    try std.testing.expectEqual(ok, e.zpdf_doc_new(c, 0, &doc));
+    var helvetica_id: u32 = 0;
+    var roboto_id: u32 = 0;
+    try std.testing.expectEqual(ok, e.zpdf_doc_add_font(c, doc, helvetica, &helvetica_id));
+    try std.testing.expectEqual(ok, e.zpdf_doc_add_font(c, doc, roboto, &roboto_id));
+    try std.testing.expectEqual(ok, e.zpdf_font_close(c, helvetica));
+    try std.testing.expectEqual(ok, e.zpdf_font_close(c, roboto));
+    var page: u32 = 0;
+    try std.testing.expectEqual(ok, e.zpdf_doc_begin_page(c, doc, 612, 792, &page));
+    try std.testing.expectEqual(ok, e.zpdf_doc_draw_text(c, doc, page, helvetica_id, 12, 72, 720, 0, 0, 0, "Hello", 5, 0));
+    try std.testing.expectEqual(ok, e.zpdf_doc_draw_text(c, doc, page, roboto_id, 12, 72, 700, 0, 0, 0, "Hello", 5, 0));
+    try std.testing.expectEqual(ok, e.zpdf_doc_end_page(c, doc, page));
+    var pdf: ?[*]u8 = null;
+    var pdf_len: usize = 0;
+    try std.testing.expectEqual(ok, e.zpdf_doc_finish(c, doc, &pdf, &pdf_len));
+    defer _ = e.zpdf_free(c, pdf, pdf_len);
+    try std.testing.expect(std.mem.indexOf(u8, pdf.?[0..pdf_len], "/BaseFont /Helvetica") != null);
+    try std.testing.expectEqual(ok, e.zpdf_doc_close(c, doc));
 }
 
 fn readRecord(comptime T: type, bytes: []const u8, at: usize) T {
@@ -2296,7 +2471,7 @@ test "sinks: draw_text_later's form is in the caller's memory when it returns, e
     var caller: TestCallerSink = .{ .gpa = gpa, .size = 1 };
     defer caller.deinit();
     const d = try c.rt.docNewSink(false, caller.sink());
-    const font = try c.rt.docAddStandardFont(d, 0);
+    const font = try c.rt.docAddFont(d, try c.rt.fontOpenStandard(0));
     const page = try c.rt.docBeginPage(d, 612, 792);
     const later = try c.rt.docReserveLater(d, page);
     try c.rt.docEndPage(d, page);
@@ -2317,7 +2492,7 @@ test "exports: a direction other than 0, 1 or 2 is InvalidDirection, for a stand
     const c = try Context.create(gpa);
     defer c.destroy();
     const d = try c.rt.docNew(false);
-    const font = try c.rt.docAddStandardFont(d, 0);
+    const font = try c.rt.docAddFont(d, try c.rt.fontOpenStandard(0));
     const page = try c.rt.docBeginPage(d, 612, 792);
     const later = try c.rt.docReserveLater(d, page);
     for ([_]u32{ 3, 9, std.math.maxInt(u32) }) |bad| {

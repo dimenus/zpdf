@@ -89,6 +89,7 @@ export const ERROR_NAMES = new Map([
   [-33, "ContextBusy"],
   [-34, "BuffersOutstanding"],
   [-35, "SinkFailed"],
+  [-36, "NotEmbedded"],
   [-127, "Unknown"],
 ]);
 
@@ -496,7 +497,12 @@ export class ZpdfDocument {
     if (index < 0) {
       throw new TypeError(`standard font must be one of ${STANDARD_FONTS.join(", ")}`);
     }
-    return this.zpdf._u32("zpdf_doc_add_standard_font", [], () => [this.handle, index]);
+    const font = this.zpdf._u32("zpdf_font_open_standard", [], () => [index]);
+    try {
+      return this.zpdf._u32("zpdf_doc_add_font", [], () => [this.handle, font]);
+    } finally {
+      this.zpdf._status("zpdf_font_close", [], () => [font]);
+    }
   }
 
   // Opens the next page, in points; throws PageOpen while another page is open.

@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Generic;
 using System.IO;
 using System.IO.Pipelines;
 using System.Linq;
@@ -60,6 +61,35 @@ public sealed class ReadmeExamples
 
         Assert.Equal(
             ["page 1: 612 x 792 pt", "  at (72, 720), Helvetica 24 pt: Hello from zpdf"],
+            text.ToString().Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries).ToArray());
+    }
+
+    [Fact]
+    public void The_wrap_example_works_as_shown()
+    {
+        var text = new StringWriter();
+        var console = Console.Out;
+        Console.SetOut(text);
+        try
+        {
+            // readme: wrap
+            using var helvetica = FontMetrics.Open(StandardFont.Helvetica);
+            var cell = "Cost of goods on hand, by location";
+            var lines = new List<TextLine>();
+            helvetica.Wrap(cell, 10, 100, breakWords: true, TextDirection.FromText, lines);
+            foreach (var line in lines)
+            {
+                Console.WriteLine($"{cell.Substring(line.Start, line.Length)} ({line.Width:0.##} pt)");
+            }
+            // readme: end
+        }
+        finally
+        {
+            Console.SetOut(console);
+        }
+
+        Assert.Equal(
+            ["Cost of goods on (75.6 pt)", "hand, by location (75.6 pt)"],
             text.ToString().Split(Environment.NewLine, StringSplitOptions.RemoveEmptyEntries).ToArray());
     }
 }
