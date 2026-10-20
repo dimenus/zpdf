@@ -4,8 +4,11 @@
 //!
 //! The page is the image's size as shown (imageSize), one point per pixel, and the image fills
 //! it, so a renderer at 72 dpi gives back one pixel per image pixel (tools/image-oracle.py).
-//! An image zpdf refuses prints its error name on stderr and exits 1; bad usage or a file that
-//! cannot be read or written: 2.
+//! The PDF streams into the file, and the document uses a real allocator, not the process arena,
+//! so the tool's peak memory is the image file plus what addImage holds: a measure of the
+//! library, not of the tool.
+//! An image zpdf refuses prints its error name on stderr and exits 1, leaving the output empty;
+//! bad usage or a file that cannot be read or written: 2.
 const std = @import("std");
 const zpdf = @import("zpdf");
 
@@ -28,12 +31,20 @@ pub fn main(init: std.process.Init) !u8 {
         std.debug.print("usage: zpdf-image [--no-compress] <image.png|image.jpg> <out.pdf>\n", .{});
         return 2;
     }
-    const bytes = std.Io.Dir.cwd().readFileAlloc(io, paths[0], arena, .limited(1 << 30)) catch |err| {
+    const gpa = std.heap.smp_allocator;
+    const bytes = std.Io.Dir.cwd().readFileAlloc(io, paths[0], gpa, .limited(1 << 30)) catch |err| {
         std.debug.print("zpdf-image: {s}: {t}\n", .{ paths[0], err });
         return 2;
     };
-    var out: std.Io.Writer.Allocating = .init(arena);
-    var doc = try zpdf.Document.begin(arena, &out.writer, .{ .compress = compress });
+    defer gpa.free(bytes);
+    var file = std.Io.Dir.cwd().createFile(io, paths[1], .{}) catch |err| {
+        std.debug.print("zpdf-image: {s}: {t}\n", .{ paths[1], err });
+        return 2;
+    };
+    defer file.close(io);
+    var file_buf: [64 * 1024]u8 = undefined;
+    var fw = file.writer(io, &file_buf);
+    var doc = try zpdf.Document.begin(gpa, &fw.interface, .{ .compress = compress });
     defer doc.deinit();
     const image = doc.addImage(bytes) catch |err| {
         std.debug.print("{t}\n", .{err});
@@ -46,8 +57,8 @@ pub fn main(init: std.process.Init) !u8 {
     try doc.drawImage(page, image, 0, 0, w, h);
     try doc.endPage(page);
     try doc.finish();
-    std.Io.Dir.cwd().writeFile(io, .{ .sub_path = paths[1], .data = out.written() }) catch |err| {
-        std.debug.print("zpdf-image: {s}: {t}\n", .{ paths[1], err });
+    fw.interface.flush() catch {
+        std.debug.print("zpdf-image: {s}: {t}\n", .{ paths[1], fw.err orelse error.WriteFailed });
         return 2;
     };
     return 0;
