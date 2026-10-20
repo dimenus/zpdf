@@ -15,6 +15,9 @@
   through a pipe.
 - libzpdf under valgrind on another Linux machine (x86_64, say): `tools/valgrind-abi-bundle.sh
   x86_64 <dir>`, copy `<dir>` there (`COPYFILE_DISABLE=1 tar`), and run `<dir>/run.sh`.
+- Linux x86_64 and Windows x64 without CI: `tools/test-platforms.sh linux <machine> <pane> windows
+  <machine> <pane>` runs `zig build test` and `dotnet-test` from HEAD on each machine, in a shell pane
+  that `herd-run` (on PATH, or `HERD_RUN`) can reach; it refuses a dirty tree. Run it before main moves.
 - kb_text_shape comes from the fork `dimenus/kb`, branch `fixes`, pinned by commit in `build.zig.zon`.
   A kb change is made and tested in the fork first; then the pin moves here.
 - Before writing or changing code that calls a dependency (kb from `src/kb_shim.c` and `src/root.zig`),
