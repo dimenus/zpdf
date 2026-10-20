@@ -90,6 +90,8 @@ export const ERROR_NAMES = new Map([
   [-34, "BuffersOutstanding"],
   [-35, "SinkFailed"],
   [-36, "NotEmbedded"],
+  [-37, "InvalidImage"],
+  [-38, "UnsupportedImage"],
   [-127, "Unknown"],
 ]);
 
@@ -349,6 +351,18 @@ export class Zpdf {
     });
   }
 
+  // Calls `fn` with `args` plus two u32 out pointers; returns both.
+  _u32Pair(fn, inputs, args) {
+    return this._with(inputs, (ptrs, out) => {
+      const rc = this.#call(fn, ...args(ptrs), out, out + 4);
+      if (rc !== 0) {
+        throw zpdfError(fn, rc);
+      }
+      const view = new DataView(this.#memory());
+      return [view.getUint32(out, true), view.getUint32(out + 4, true)];
+    });
+  }
+
   _status(fn, inputs, args) {
     this._with(inputs, (ptrs) => {
       const rc = this.#call(fn, ...args(ptrs));
@@ -548,6 +562,20 @@ export class ZpdfDocument {
   }
 
   // (x, y) is the rectangle's bottom-left corner.
+  // A JPEG or PNG (src/image.zig says which), written into the document now. Returns
+  // { id, width, height }: the size in pixels as shown, after its Exif orientation.
+  addImage(bytes) {
+    const image = toBytes(bytes, "image");
+    const id = this.zpdf._u32("zpdf_doc_add_image", [image], ([p]) => [this.handle, p, image.length]);
+    const [width, height] = this.zpdf._u32Pair("zpdf_doc_image_size", [], () => [this.handle, id]);
+    return { id, width, height };
+  }
+
+  // Draws an image from addImage stretched over the rectangle whose bottom-left is (x, y).
+  drawImage(page, image, x, y, width, height) {
+    this.zpdf._status("zpdf_doc_draw_image", [], () => [this.handle, page, image.id, x, y, width, height]);
+  }
+
   fillRect(page, x, y, width, height, color) {
     this.zpdf._status("zpdf_doc_fill_rect", [], () => [this.handle, page, x, y, width, height, ...rgb(color)]);
   }

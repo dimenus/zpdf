@@ -38,6 +38,7 @@ rm -rf "$out"
   -I "$out/include" -L "$out/lib" -lzpdf -lpthread -o "$out/abi-test"
 cp "${fonts[0]}" "$out/font.ttf"
 cp tests/read/objstm.pdf "$out/read.pdf"
+cp tests/images/exif/orient-6.jpg "$out/image.jpg"
 rm -rf "$out/include" "$out/csharp"
 
 cat > "$out/run.sh" <<EOF
@@ -54,7 +55,7 @@ status=0
   apt-get update -qq >/dev/null && apt-get install -y -qq valgrind >/dev/null 2>&1
   test -x ./abi-test || { echo "FATAL: the container cannot see the bundle through the mount"; exit 3; }
   LD_LIBRARY_PATH=lib valgrind --quiet --error-exitcode=97 --leak-check=full \\
-    --errors-for-leak-kinds=definite ./abi-test font.ttf read.pdf
+    --errors-for-leak-kinds=definite ./abi-test font.ttf read.pdf image.jpg
 ' 2>&1 | tee "\$log" || status=\$?
 if ! grep -qx 'abi-test: ok' "\$log"; then
   echo "FATAL: abi-test did not finish (exit \$status); read above." >&2

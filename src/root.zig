@@ -13,6 +13,7 @@ pub const abi = @import("abi.zig");
 pub const winansi = @import("winansi.zig");
 pub const read = @import("read.zig");
 pub const text_layout = @import("text_layout.zig");
+pub const image = @import("image.zig");
 pub const Document = pdf.Document;
 pub const StandardFont = pdf.StandardFont;
 pub const Color = pdf.Color;
@@ -29,6 +30,7 @@ pub const Outlines = instancer.Outlines;
 pub const PathCommand = instancer.PathCommand;
 pub const FontId = pdf.FontId;
 pub const PageId = pdf.PageId;
+pub const ImageId = pdf.ImageId;
 
 test {
     _ = abi;
@@ -39,6 +41,7 @@ test {
     _ = pdf;
     _ = read;
     _ = text_layout;
+    _ = image;
     _ = @import("read_text.zig");
 }
 

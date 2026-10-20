@@ -19,9 +19,9 @@ namespace Zpdf;
 /// <para>
 /// zpdf asks the writer for memory (<c>GetMemory</c>, pinned for the call), writes the PDF's bytes
 /// straight into it, and gives it back with <c>Advance</c>. The calls that write are
-/// <see cref="Create"/> (the header), <see cref="EndPage"/>, <see cref="DrawTextLater"/> and
-/// <see cref="Finish"/>; each has passed on everything it wrote when it returns, and none of them
-/// allocates managed memory for the PDF.
+/// <see cref="Create"/> (the header), <see cref="AddImage"/>, <see cref="EndPage"/>,
+/// <see cref="DrawTextLater"/> and <see cref="Finish"/>; each has passed on everything it wrote when
+/// it returns, and none of them allocates managed memory for the PDF.
 /// </para>
 /// <para>
 /// Async: when any call returns, zpdf holds none of the writer's memory, so a <see cref="PipeWriter"/>
@@ -151,6 +151,31 @@ public sealed unsafe partial class PdfWriter : IDisposable
     /// <summary>(<paramref name="x"/>, <paramref name="y"/>) is the rectangle's bottom-left corner.</summary>
     public void StrokeRect(PageId page, double x, double y, double width, double height, double lineWidth, PdfColor color) =>
         Call(ZpdfAbi.zpdf_doc_stroke_rect(Enter(), _document, page.Value, x, y, width, height, lineWidth, color.Red, color.Green, color.Blue));
+
+    /// <summary>Adds a JPEG or PNG image and writes it into the output now, as <see cref="EndPage"/>
+    /// does, so the document keeps its size and not its pixels: an image drawn on many pages is in
+    /// the PDF once, and one that is never drawn is in it too. zpdf reads the bytes only during the
+    /// call. A file zpdf refuses (zpdf's src/image.zig lists what) throws
+    /// <see cref="ZpdfException"/> InvalidImage, UnsupportedImage or TooLarge and adds nothing.</summary>
+    public PdfImage AddImage(ReadOnlySpan<byte> image)
+    {
+        var context = Enter();
+        uint id;
+        uint width;
+        uint height;
+        fixed (byte* bytes = image)
+        {
+            Call(ZpdfAbi.zpdf_doc_add_image(context, _document, bytes, (nuint)image.Length, &id));
+        }
+        Call(ZpdfAbi.zpdf_doc_image_size(context, _document, id, &width, &height));
+        return new PdfImage(id, width, height);
+    }
+
+    /// <summary>Draws <paramref name="image"/> stretched to fill the rectangle whose bottom-left
+    /// corner is (<paramref name="x"/>, <paramref name="y"/>), turned as its Exif orientation says.
+    /// Keep <see cref="PdfImage.Width"/> to <see cref="PdfImage.Height"/> to keep its shape.</summary>
+    public void DrawImage(PageId page, PdfImage image, double x, double y, double width, double height) =>
+        Call(ZpdfAbi.zpdf_doc_draw_image(Enter(), _document, page.Value, image.Value, x, y, width, height));
 
     /// <summary>A place on the page for text drawn later, such as "Page 3 of 12". Every place must
     /// be drawn before <see cref="Finish"/>.</summary>
@@ -324,6 +349,24 @@ public readonly record struct LaterId
     internal LaterId(uint value) => Value = value;
 
     internal uint Value { get; }
+}
+
+/// <summary>An image added to one <see cref="PdfWriter"/>, with its size in pixels as it is shown
+/// (after its Exif orientation).</summary>
+public readonly record struct PdfImage
+{
+    internal PdfImage(uint value, uint width, uint height)
+    {
+        Value = value;
+        Width = width;
+        Height = height;
+    }
+
+    internal uint Value { get; }
+
+    public uint Width { get; }
+
+    public uint Height { get; }
 }
 
 /// <summary>DeviceRGB, each component from 0 to 1.</summary>

@@ -28,8 +28,8 @@
 //! holds neither the document nor a page's bytes for long. zpdf calls the sink's write only
 //! during a zpdf call on that document's context, on the calling thread, and never after
 //! zpdf_doc_close. write gets at most 64 KiB per call. zpdf_doc_new_sink (the header),
-//! zpdf_doc_end_page, zpdf_doc_draw_text_later and zpdf_doc_finish pass on all that is written
-//! before they return, so each can fail with SinkFailed. A caller-buffer sink is
+//! zpdf_doc_add_image, zpdf_doc_end_page, zpdf_doc_draw_text_later and zpdf_doc_finish pass on all
+//! that is written before they return, so each can fail with SinkFailed. A caller-buffer sink is
 //! asked for memory instead (get_buffer) and given back what zpdf wrote into it (commit), so the
 //! PDF goes straight into the caller's memory; when any zpdf call on its document returns, zpdf
 //! holds none of that memory, so a caller may flush or reuse it between calls (a PipeWriter's
@@ -69,12 +69,12 @@ const is_wasm = builtin.target.cpu.arch == .wasm32;
 
 /// Changes when an export, a wire record or an error code changes. A caller checks it once,
 /// when it loads the library.
-pub const abi_version: u32 = 4;
+pub const abi_version: u32 = 5;
 
 /// The hash of the ABI that abi_version names (surfaceHash). The test "exports: the ABI surface
 /// is the one abi_version names" fails when they differ: then bump abi_version and set this to
 /// the hash the test prints.
-const abi_surface: u64 = 0xad695a285864e58;
+const abi_surface: u64 = 0x4559c9c3ffe66c10;
 
 comptime {
     // The records are written with their in-memory bytes; every target zpdf builds for
@@ -754,6 +754,26 @@ pub const Runtime = struct {
         if (d.out != .buffer) d.doc.flushOutput() catch |err| return d.writeError(err);
     }
 
+    /// Adds and writes the image (zpdf.Document.addImage); with a sink, its bytes have reached the
+    /// sink when this returns.
+    pub fn docAddImage(rt: *Runtime, handle: u32, bytes: []const u8) !u32 {
+        const d = try rt.doc(handle);
+        const id = d.doc.addImage(bytes) catch |err| return d.writeError(err);
+        if (d.out != .buffer) d.doc.flushOutput() catch |err| return d.writeError(err);
+        return @backingInt(id);
+    }
+
+    pub fn docImageSize(rt: *Runtime, handle: u32, image: u32) !struct { width: u32, height: u32 } {
+        const d = try rt.doc(handle);
+        const size = try d.doc.imageSize(@fromBackingInt(image));
+        return .{ .width = size.width, .height = size.height };
+    }
+
+    pub fn docDrawImage(rt: *Runtime, handle: u32, page: u32, image: u32, x: f64, y: f64, width: f64, height: f64) !void {
+        const d = try rt.doc(handle);
+        try d.doc.drawImage(@fromBackingInt(@intCast(page)), @fromBackingInt(image), x, y, width, height);
+    }
+
     pub fn docDrawLine(rt: *Runtime, handle: u32, page: u32, x1: f64, y1: f64, x2: f64, y2: f64, width: f64, color: zpdf.Color) !void {
         const d = try rt.doc(handle);
         try d.doc.drawLine(@fromBackingInt(@intCast(page)), x1, y1, x2, y2, width, color);
@@ -986,6 +1006,8 @@ pub const error_codes = [_]struct { anyerror, i32 }{
     .{ error.BuffersOutstanding, -34 },
     .{ error.SinkFailed, -35 },
     .{ error.NotEmbedded, -36 },
+    .{ error.InvalidImage, -37 },
+    .{ error.UnsupportedImage, -38 },
 };
 pub const unknown_code: i32 = -127;
 
@@ -1428,6 +1450,39 @@ pub const exports = struct {
         const c = Context.enter(ctx) catch |err| return mapError(err);
         defer c.leave();
         c.rt.docDrawTextLater(doc, later_id, font_id, size, x, y, rgb(r, g, b), t, direction) catch |err| return mapError(err);
+        return 0;
+    }
+
+    /// Adds a JPEG or PNG image to the document and writes it now (zpdf.Document.addImage; the
+    /// bytes are read only during the call). The id draws it on any page of this document. A file
+    /// zpdf refuses is InvalidImage, UnsupportedImage or TooLarge, and adds nothing.
+    pub fn zpdf_doc_add_image(ctx: ?*Context, doc: u32, bytes: ?[*]const u8, len: usize, out_image_id: ?*u32) callconv(.c) i32 {
+        const o = output(u32, out_image_id) catch |err| return mapError(err);
+        const b = input(bytes, len) catch |err| return mapError(err);
+        const c = Context.enter(ctx) catch |err| return mapError(err);
+        defer c.leave();
+        o.* = c.rt.docAddImage(doc, b) catch |err| return mapError(err);
+        return 0;
+    }
+
+    /// The image's size in pixels as it is shown, after its Exif orientation.
+    pub fn zpdf_doc_image_size(ctx: ?*Context, doc: u32, image_id: u32, out_width: ?*u32, out_height: ?*u32) callconv(.c) i32 {
+        const w = output(u32, out_width) catch |err| return mapError(err);
+        const h = output(u32, out_height) catch |err| return mapError(err);
+        const c = Context.enter(ctx) catch |err| return mapError(err);
+        defer c.leave();
+        const size = c.rt.docImageSize(doc, image_id) catch |err| return mapError(err);
+        w.* = size.width;
+        h.* = size.height;
+        return 0;
+    }
+
+    /// Draws the image stretched over the rectangle with bottom-left (x, y), turned as its Exif
+    /// orientation says.
+    pub fn zpdf_doc_draw_image(ctx: ?*Context, doc: u32, page_id: u32, image_id: u32, x: f64, y: f64, width: f64, height: f64) callconv(.c) i32 {
+        const c = Context.enter(ctx) catch |err| return mapError(err);
+        defer c.leave();
+        c.rt.docDrawImage(doc, page_id, image_id, x, y, width, height) catch |err| return mapError(err);
         return 0;
     }
 

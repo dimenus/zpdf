@@ -52,6 +52,8 @@ internal enum ZpdfError
     BuffersOutstanding = -34,
     SinkFailed = -35,
     NotEmbedded = -36,
+    InvalidImage = -37,
+    UnsupportedImage = -38,
     Unknown = -127,
 }
 
@@ -200,7 +202,7 @@ internal unsafe struct GlyphRecord
 
 internal static unsafe partial class ZpdfAbi
 {
-    public const uint AbiVersion = 4;
+    public const uint AbiVersion = 5;
     public const string LibraryName = "zpdf";
 
     // abi_version. A caller checks it once, when it loads the library.
@@ -338,6 +340,21 @@ internal static unsafe partial class ZpdfAbi
     // Draws the text of a place from zpdf_doc_reserve_later, once; its page can have ended.
     [LibraryImport(LibraryName, EntryPoint = "zpdf_doc_draw_text_later")]
     public static partial int zpdf_doc_draw_text_later(ZpdfContext* ctx, uint doc, uint later_id, uint font_id, double size, double x, double y, double r, double g, double b, byte* text, nuint len, uint direction);
+
+    // Adds a JPEG or PNG image to the document and writes it now (zpdf.Document.addImage; the
+    // bytes are read only during the call). The id draws it on any page of this document. A file
+    // zpdf refuses is InvalidImage, UnsupportedImage or TooLarge, and adds nothing.
+    [LibraryImport(LibraryName, EntryPoint = "zpdf_doc_add_image")]
+    public static partial int zpdf_doc_add_image(ZpdfContext* ctx, uint doc, byte* bytes, nuint len, uint* out_image_id);
+
+    // The image's size in pixels as it is shown, after its Exif orientation.
+    [LibraryImport(LibraryName, EntryPoint = "zpdf_doc_image_size")]
+    public static partial int zpdf_doc_image_size(ZpdfContext* ctx, uint doc, uint image_id, uint* out_width, uint* out_height);
+
+    // Draws the image stretched over the rectangle with bottom-left (x, y), turned as its Exif
+    // orientation says.
+    [LibraryImport(LibraryName, EntryPoint = "zpdf_doc_draw_image")]
+    public static partial int zpdf_doc_draw_image(ZpdfContext* ctx, uint doc, uint page_id, uint image_id, double x, double y, double width, double height);
 
     [LibraryImport(LibraryName, EntryPoint = "zpdf_doc_draw_line")]
     public static partial int zpdf_doc_draw_line(ZpdfContext* ctx, uint doc, uint page_id, double x1, double y1, double x2, double y2, double width, double r, double g, double b);

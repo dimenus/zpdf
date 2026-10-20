@@ -1,9 +1,9 @@
 // libzpdf as a C caller has it: the generated zpdf.h and the shared library.
 //
-//     abi-test <font.ttf> <a PDF with two or more pages>
+//     abi-test <font.ttf> <a PDF with two or more pages> <a PNG or JPEG shown 32 x 16>
 //
-// Several threads, each with its own context, write a PDF with an embedded font and a standard
-// font, read it back, and read the given PDF. Each checks what it reads and that its context
+// Several threads, each with its own context, write a PDF with an embedded font, a standard
+// font and an image, read it back, and read the given PDF. Each checks what it reads and that its context
 // ends with no live bytes. Prints "abi-test: ok" when every check passed.
 
 #include <pthread.h>
@@ -25,6 +25,8 @@ static unsigned char *font_bytes;
 static size_t font_len;
 static unsigned char *pdf_bytes;
 static size_t pdf_len;
+static unsigned char *image_bytes;
+static size_t image_len;
 
 static void fail(const char *what, int32_t rc) {
     const char *name = zpdf_error_name(rc);
@@ -140,15 +142,22 @@ static int32_t lend_commit(void *user, size_t len) {
     return mem_write(&l->out, l->scratch, len);
 }
 
-// One page: the line in the embedded font, "Helvetica", a rectangle, and a place for later text.
-// Returns the later place and Helvetica's id.
+// One page: the line in the embedded font, "Helvetica", a rectangle, the image, and a place for
+// later text. Returns the later place and Helvetica's id.
 static void draw_page(zpdf_context *ctx, uint32_t doc, uint32_t font, const char *line, uint32_t *later, uint32_t *helvetica) {
-    uint32_t embedded = 0, standard = 0, page = 0;
+    uint32_t embedded = 0, standard = 0, page = 0, image = 0, width = 0, height = 0;
     CHECK(zpdf_doc_add_font(ctx, doc, font, &embedded));
     CHECK(zpdf_font_open_standard(ctx, 0, &standard));
     CHECK(zpdf_doc_add_font(ctx, doc, standard, helvetica));
     CHECK(zpdf_font_close(ctx, standard));
+    // A refused image adds nothing: the documents this makes still match byte for byte.
+    EXPECT(zpdf_doc_add_image(ctx, doc, (const uint8_t *)"GIF89a", 6, &image) == ZPDF_ERROR_UNSUPPORTED_IMAGE && image == 0);
+    CHECK(zpdf_doc_add_image(ctx, doc, image_bytes, image_len, &image));
+    CHECK(zpdf_doc_image_size(ctx, doc, image, &width, &height));
+    EXPECT(width == 32 && height == 16);
+    EXPECT(zpdf_doc_image_size(ctx, doc, image + 1, &width, &height) == ZPDF_ERROR_INVALID_IMAGE && width == 0);
     CHECK(zpdf_doc_begin_page(ctx, doc, 612, 792, &page));
+    CHECK(zpdf_doc_draw_image(ctx, doc, page, image, 300, 600, 64, 32));
     CHECK(zpdf_doc_draw_text(ctx, doc, page, embedded, 24, 72, 720, 0, 0, 0, (const uint8_t *)line, strlen(line), 0));
     CHECK(zpdf_doc_draw_text(ctx, doc, page, *helvetica, 12, 72, 690, 0, 0.5, 0.5, (const uint8_t *)"Helvetica", 9, 0));
     CHECK(zpdf_doc_fill_rect(ctx, doc, page, 72, 600, 100, 50, 0.9, 0.9, 0.9));
@@ -271,20 +280,22 @@ static void *work(void *arg) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 3) {
-        fprintf(stderr, "usage: abi-test <font.ttf> <a PDF with two or more pages>\n");
+    if (argc != 4) {
+        fprintf(stderr, "usage: abi-test <font.ttf> <a PDF with two or more pages> <a PNG or JPEG shown 32 x 16>\n");
         return 2;
     }
     EXPECT(zpdf_abi_version() == ZPDF_ABI_VERSION);
     EXPECT(strcmp(zpdf_error_name(ZPDF_ERROR_INVALID_FONT), "InvalidFont") == 0);
     font_bytes = read_file(argv[1], &font_len);
     pdf_bytes = read_file(argv[2], &pdf_len);
+    image_bytes = read_file(argv[3], &image_len);
 
     pthread_t threads[THREADS];
     for (size_t i = 0; i < THREADS; i++) EXPECT(pthread_create(&threads[i], NULL, work, (void *)i) == 0);
     for (size_t i = 0; i < THREADS; i++) EXPECT(pthread_join(threads[i], NULL) == 0);
     free(font_bytes);
     free(pdf_bytes);
+    free(image_bytes);
 #ifdef _WIN32
     // Text-mode stdout writes "\r\n" for "\n", and the build compares the bytes.
     _setmode(_fileno(stdout), _O_BINARY);

@@ -11,6 +11,9 @@ Writing:
   subsets, and the text stays copyable and searchable.
 - The 14 standard PDF fonts, when you don't want to embed anything.
 - Lines, rectangles, and text you fill in later, like "Page 3 of 12".
+- JPEG and PNG images. A JPEG goes in as it is; a PNG is decoded and checked, and its transparency
+  is kept. A photo's Exif orientation is applied. Each image is in the file once, however many
+  pages draw it.
 - Pages go out as they end. Memory follows one page, not the whole document.
 
 Reading:

@@ -6,12 +6,15 @@ const sfnt = @import("sfnt.zig");
 const instancer = @import("instancer.zig");
 const text_map = @import("text_map.zig");
 const winansi = @import("winansi.zig");
+const image = @import("image.zig");
 const ManagedList = std.array_list.Managed;
 
 pub const FontId = enum(u32) { _ };
 pub const PageId = enum(u32) { _ };
 /// A place reserved on a page by reserveLater, drawn by drawTextLater.
 pub const LaterId = enum(u32) { _ };
+/// An image added by addImage, drawn by drawImage.
+pub const ImageId = enum(u32) { _ };
 
 /// A DeviceRGB colour, each component from 0 to 1. Every drawing call takes one;
 /// a component outside 0..1, or not finite, is error.InvalidColor.
@@ -38,6 +41,8 @@ const DrawOp = union(enum) {
     rect: struct { x: f64, y: f64, width: f64, height: f64, paint: Paint, color: Color },
     /// A reserveLater: paints the form XObject with this object number.
     later: u32,
+    /// A drawImage: paints images[index], whose object is `object`, through `matrix` (cm).
+    image: struct { index: u32, object: u32, matrix: [6]f64 },
 };
 
 const Paint = union(enum) {
@@ -117,6 +122,14 @@ const Later = struct {
     written: bool = false,
 };
 
+/// What an added image leaves in the document: its pixels are already written.
+const DocImage = struct {
+    object: u32,
+    shown_width: u32,
+    shown_height: u32,
+    orientation: image.Orientation,
+};
+
 const DocFont = union(enum) {
     embedded: EmbeddedFont,
     standard: StandardFont,
@@ -165,8 +178,10 @@ fn cacheKey(allocator: std.mem.Allocator, utf8: []const u8, options: zpdf.ShapeO
 ///   var doc = try Document.begin(gpa, writer, .{ .compress = true });  // writes the header
 ///   defer doc.deinit();
 ///   const font = try doc.addFont(&loaded_font);        // or addStandardFont(.helvetica)
+///   const logo = try doc.addImage(png_or_jpeg_bytes);   // written now; drawn by id
 ///   const page = try doc.beginPage(612, 792);           // one page open at a time
 ///   try doc.drawText(page, font, 24, 72, 720, .black, "office", .{});
+///   try doc.drawImage(page, logo, 72, 600, 144, 72);    // bottom-left, then size, in points
 ///   try doc.endPage(page);                              // writes the page, frees its drawing
 ///   try doc.finish();                                   // fonts, page tree, catalog, xref
 /// `writer` must stay valid until finish; finish flushes zpdf's buffer into it, and the caller
@@ -179,6 +194,8 @@ fn cacheKey(allocator: std.mem.Allocator, utf8: []const u8, options: zpdf.ShapeO
 /// error.DocumentFinished.
 /// Document.cache_budget's starting value; see cache_arena.
 pub const default_cache_budget: usize = 1 << 20;
+/// Document.max_image_bytes's starting value: a 4096 x 4096 RGBA PNG.
+pub const default_max_image_bytes: usize = 64 << 20;
 
 pub const Document = struct {
     /// Lists that grow, and the per-font state that a failed drawText rolls
@@ -217,6 +234,11 @@ pub const Document = struct {
     laters: std.ArrayList(Later) = .empty,
     /// How many of `laters` drawTextLater has not written yet; finish needs 0.
     laters_open: u32 = 0,
+    /// Every addImage, by ImageId.
+    images: std.ArrayList(DocImage) = .empty,
+    /// The most memory one addImage decodes a PNG into (image.decode's max_bytes); a larger one
+    /// is error.TooLarge. A JPEG is not decoded and is not limited.
+    max_image_bytes: usize = default_max_image_bytes,
     objects: ObjectWriter,
     /// The next free object number. 1 is the catalog and 2 the page tree,
     /// written by finish.
@@ -230,7 +252,7 @@ pub const Document = struct {
         if (options.compress) {
             const d = try gpa.create(Deflate);
             // Compress.init asserts its sink has room for at least 9 bytes.
-            d.out = std.Io.Writer.Allocating.initCapacity(gpa, 64 * 1024) catch |err| {
+            d.out = std.Io.Writer.Allocating.initCapacity(gpa, Deflate.kept_capacity) catch |err| {
                 gpa.destroy(d);
                 return err;
             };
@@ -263,6 +285,7 @@ pub const Document = struct {
         self.font_objects.deinit(self.gpa);
         self.page_objects.deinit(self.gpa);
         self.laters.deinit(self.gpa);
+        self.images.deinit(self.gpa);
         self.objects.offsets.deinit(self.gpa);
         if (self.objects.deflate) |d| {
             d.out.deinit();
@@ -294,17 +317,18 @@ pub const Document = struct {
     }
 
     /// The /Resources entry for `ops`, ending with ' ': each font they draw with, and each
-    /// reserveLater form they paint. A font gets its object numbers here, on first use.
+    /// reserveLater form and image they paint, once however often it is drawn. A font gets its
+    /// object numbers here, on first use.
     fn writeResources(self: *Document, scratch: std.mem.Allocator, out: *std.Io.Writer, ops: []const DrawOp) !void {
         const seen = try scratch.alloc(bool, self.fonts.items.len);
         @memset(seen, false);
         try out.writeAll("/Resources << /Font << ");
-        var forms = false;
+        var xobjects = false;
         for (ops) |*draw_op| {
             const op = switch (draw_op.*) {
                 .text => |*text_op| text_op,
-                .later => {
-                    forms = true;
+                .later, .image => {
+                    xobjects = true;
                     continue;
                 },
                 .line, .rect => continue,
@@ -327,10 +351,17 @@ pub const Document = struct {
             try out.print("/F{d} {d} 0 R ", .{ fi + 1, base });
         }
         try out.writeAll(">> ");
-        if (forms) {
+        if (xobjects) {
+            const seen_images = try scratch.alloc(bool, self.images.items.len);
+            @memset(seen_images, false);
             try out.writeAll("/XObject << ");
             for (ops) |op| switch (op) {
                 .later => |object| try out.print("/X{d} {d} 0 R ", .{ object, object }),
+                .image => |im| {
+                    if (seen_images[im.index]) continue;
+                    seen_images[im.index] = true;
+                    try out.print("/X{d} {d} 0 R ", .{ im.object, im.object });
+                },
                 .text, .line, .rect => {},
             };
             try out.writeAll(">> ");
@@ -796,6 +827,74 @@ pub const Document = struct {
         try self.appendOp(.{ .rect = .{ .x = x, .y = y, .width = width, .height = height, .paint = .{ .stroke = line_width_pt }, .color = color } });
     }
 
+    /// Adds a JPEG or PNG image (image.zig says which files it takes and what it refuses) and
+    /// writes it now, so the document keeps its size and object number and not its pixels: an
+    /// image drawn on every page is in the file once. An image that is never drawn is still in
+    /// the file. `bytes` are read only during the call. Can be called while a page is open. A
+    /// refused image changes nothing; a failed write fails the document, as endPage's does.
+    pub fn addImage(self: *Document, bytes: []const u8) !ImageId {
+        try self.checkWriting();
+        try self.images.ensureUnusedCapacity(self.gpa, 1);
+        // An arena of its own, not write_scratch: a reset arena keeps its capacity, and a decoded
+        // image would stay held until the document ends (stream and free).
+        var arena: std.heap.ArenaAllocator = .init(self.gpa);
+        defer arena.deinit();
+        const img = try image.decode(arena.allocator(), bytes, self.max_image_bytes);
+        const object = self.next_object;
+        self.next_object += if (img.alpha != null) 2 else 1;
+        self.writeImage(arena.allocator(), object, img) catch |err| {
+            self.state = .failed;
+            return err;
+        };
+        self.objects.trim();
+        const shown = img.shownSize();
+        self.images.appendAssumeCapacity(.{ .object = object, .shown_width = shown[0], .shown_height = shown[1], .orientation = img.orientation });
+        return @fromBackingInt(@intCast(self.images.items.len - 1));
+    }
+
+    /// The image's size in pixels as it is shown, after its Exif orientation: what drawImage's
+    /// width and height keep the aspect ratio of. error.InvalidImage for an id this document did
+    /// not give.
+    pub fn imageSize(self: *const Document, image_id: ImageId) !struct { width: u32, height: u32 } {
+        const index = @backingInt(image_id);
+        if (index >= self.images.items.len) return error.InvalidImage;
+        const im = self.images.items[index];
+        return .{ .width = im.shown_width, .height = im.shown_height };
+    }
+
+    /// Draws `image_id` stretched to fill the rectangle whose bottom-left corner is (x, y), in
+    /// points, PDF space, turned as its Exif orientation says. A `width` or `height` below
+    /// 0.0001 is error.InvalidNumber (drawLine's reason). error.InvalidImage for an id this
+    /// document did not give. A failed call draws nothing.
+    pub fn drawImage(self: *Document, page_id: PageId, image_id: ImageId, x: f64, y: f64, width: f64, height: f64) !void {
+        try self.checkPage(page_id);
+        const index = @backingInt(image_id);
+        if (index >= self.images.items.len) return error.InvalidImage;
+        try checkPdfReal(x);
+        try checkPdfReal(y);
+        try checkLineWidth(width);
+        try checkLineWidth(height);
+        const im = self.images.items[index];
+        const matrix = im.orientation.matrix(x, y, width, height);
+        for (matrix) |v| try checkPdfReal(v);
+        try self.appendOp(.{ .image = .{ .index = index, .object = im.object, .matrix = matrix } });
+    }
+
+    /// addImage's write: the image XObject, and its soft mask as the next object.
+    fn writeImage(self: *Document, scratch: std.mem.Allocator, object: u32, img: image.Image) !void {
+        var dict: std.Io.Writer.Allocating = .init(scratch);
+        writeImageDict(&dict.writer, img, object) catch return error.OutOfMemory;
+        switch (img.encoding) {
+            .dct => try self.objects.encodedStream(self.gpa, object, dict.written(), "/DCTDecode", img.data),
+            .samples => try self.objects.stream(self.gpa, object, dict.written(), img.data, null),
+        }
+        const alpha = img.alpha orelse return;
+        const mask = try std.fmt.allocPrint(scratch, "/Type /XObject /Subtype /Image /Width {d} /Height {d} /ColorSpace /DeviceGray /BitsPerComponent {d} ", .{
+            img.width, img.height, img.alpha_bits,
+        });
+        try self.objects.stream(self.gpa, object + 1, mask, alpha, null);
+    }
+
     fn appendOp(self: *Document, op: DrawOp) !void {
         const arena = self.page_allocator orelse self.page_arena.allocator();
         try self.open.?.ops.append(arena, op);
@@ -885,6 +984,10 @@ const Deflate = struct {
     encoder: std.compress.flate.Compress,
     /// One stream's compressed bytes; /Length must be written before them.
     out: std.Io.Writer.Allocating,
+
+    /// What `out` may keep between streams. A page's content and a font subset fit; an image can
+    /// be far larger, and ObjectWriter.trim lets that go.
+    const kept_capacity = 64 * 1024;
 };
 
 /// A std hasher that only counts, so `std.Io.Writer.Hashed` passes bytes
@@ -935,6 +1038,8 @@ const ObjectWriter = struct {
             // The encoder's only sink is `d.out`, which fails only when it
             // cannot grow.
             d.out.clearRetainingCapacity();
+            // Compress.init asserts its sink has room for at least 9 bytes; after trim it has none.
+            d.out.ensureTotalCapacity(16) catch return error.OutOfMemory;
             d.encoder = std.compress.flate.Compress.init(&d.out.writer, &d.window, .zlib, .default) catch return error.OutOfMemory;
             d.encoder.writer.writeAll(data) catch return error.OutOfMemory;
             d.encoder.finish() catch return error.OutOfMemory;
@@ -949,7 +1054,57 @@ const ObjectWriter = struct {
         try w.writeAll("\nendstream\n");
         try self.end();
     }
+
+    /// Frees the compressed-stream buffer when one stream grew it past Deflate.kept_capacity, so
+    /// a large image's compressed bytes are not held until the document ends.
+    fn trim(self: *ObjectWriter) void {
+        const d = self.deflate orelse return;
+        if (d.out.writer.buffer.len <= Deflate.kept_capacity) return;
+        const gpa = d.out.allocator;
+        d.out.deinit();
+        d.out = .init(gpa);
+    }
+
+    /// A stream whose data is already encoded with `filter` (a JPEG's "/DCTDecode"): written as
+    /// it is, whether or not the document compresses. `dict` as stream's.
+    fn encodedStream(self: *ObjectWriter, gpa: std.mem.Allocator, number: u32, dict: []const u8, filter: []const u8, data: []const u8) !void {
+        const w = try self.begin(gpa, number);
+        try w.print("<< {s}/Length {d} /Filter {s} >>\nstream\n", .{ dict, data.len, filter });
+        try w.writeAll(data);
+        try w.writeAll("\nendstream\n");
+        try self.end();
+    }
 };
+
+/// An image XObject's dictionary entries before /Length, each ending in ' ' (ISO 32000-1 8.9.5).
+/// `object` is the image's own number; its soft mask, when it has one, is the next.
+fn writeImageDict(w: *std.Io.Writer, img: image.Image, object: u32) !void {
+    try w.print("/Type /XObject /Subtype /Image /Width {d} /Height {d} /ColorSpace ", .{ img.width, img.height });
+    switch (img.color) {
+        .gray => try w.writeAll("/DeviceGray"),
+        .rgb => try w.writeAll("/DeviceRGB"),
+        .cmyk_inverted => try w.writeAll("/DeviceCMYK"),
+        .indexed => |palette| {
+            try w.print("[/Indexed /DeviceRGB {d} <", .{palette.len / 3 - 1});
+            for (palette) |byte| try w.print("{x:0>2}", .{byte});
+            try w.writeAll(">]");
+        },
+    }
+    try w.print(" /BitsPerComponent {d} ", .{img.bits});
+    // PDF readers draw the samples as they are; this maps 0 to full ink, as JPEG viewers read a
+    // CMYK JPEG (image.zig's module doc).
+    if (img.color == .cmyk_inverted) try w.writeAll("/Decode [1 0 1 0 1 0 1 0] ");
+    if (img.alpha != null) try w.print("/SMask {d} 0 R ", .{object + 1});
+    if (img.color_key) |key| {
+        // One range per component; a range of one value masks exactly that colour.
+        try w.writeAll("/Mask [");
+        for (key.values[0..key.len], 0..) |v, i| {
+            if (i != 0) try w.writeByte(' ');
+            try w.print("{d} {d}", .{ v, v });
+        }
+        try w.writeAll("] ");
+    }
+}
 
 /// What the font objects of one embedded font say about it: its FontFile2
 /// bytes, PostScript name and FontDescriptor metrics.
@@ -1025,6 +1180,12 @@ fn writeDrawOp(scratch: std.mem.Allocator, out: *std.Io.Writer, state: *Graphics
             return out.writeAll(" l S\n");
         },
         .later => |object| return out.print("/X{d} Do\n", .{object}),
+        // q/Q keeps the cm to this image; nothing inside changes the state GraphicsState tracks.
+        .image => |im| {
+            try out.writeAll("q\n");
+            try writeReals(out, &im.matrix);
+            return out.print(" cm\n/X{d} Do\nQ\n", .{im.object});
+        },
         .rect => |r| {
             switch (r.paint) {
                 .fill => try state.setFill(out, r.color),
@@ -1058,8 +1219,8 @@ fn writeDrawOp(scratch: std.mem.Allocator, out: *std.Io.Writer, state: *Graphics
 /// The colours and line width the content stream has set so far. An operator is
 /// written only when a drawing call needs a different value, so a page drawn all in
 /// black writes none. It starts at the PDF's initial graphics state (ISO 32000-1
-/// 8.4.1): black fill and stroke, line width 1. Nothing uses q/Q, so the state
-/// runs through the whole content stream.
+/// 8.4.1): black fill and stroke, line width 1. Only an image uses q/Q, and it sets
+/// none of these inside, so the state runs through the whole content stream.
 const GraphicsState = struct {
     /// null: not known, so the next call writes it. A form XObject starts so, because
     /// it inherits whatever state the page has where it is painted (ISO 32000-1 8.10.1).
@@ -1380,6 +1541,129 @@ test "lines, rectangles and colours are written in call order, each state change
             "0.25 0.25 0.25 rg\n0 0 0 0 re f\n",
         try parsed.streamData(4),
     );
+}
+
+test "addImage writes the image at once; each page names it once and paints it through its matrix" {
+    const gpa = std.testing.allocator;
+    var td_doc: TestDoc = undefined;
+    try td_doc.init(gpa, false);
+    defer td_doc.deinit();
+    const doc = &td_doc.doc;
+    const png = try loadTestImage(gpa, "pngsuite/basn6a08.png");
+    defer gpa.free(png);
+    const png_image = try doc.addImage(png);
+    // Objects 3 (the image) and 4 (its soft mask) are written before any page exists.
+    try std.testing.expect(doc.objects.offsets.items[2] != 0 and doc.objects.offsets.items[3] != 0);
+    try std.testing.expectEqual(32, (try doc.imageSize(png_image)).width);
+    const first = try doc.beginPage(612, 792);
+    try doc.drawImage(first, png_image, 10, 20, 64, 32);
+    try doc.drawImage(first, png_image, 100, 200, 32, 32);
+    try doc.endPage(first);
+    const second = try doc.beginPage(612, 792);
+    try doc.drawImage(second, png_image, 0, 0, 1.5, 2.25);
+    try doc.endPage(second);
+    try doc.finish();
+    var parsed = try E2e.parse(gpa, td_doc.aw.written());
+    defer parsed.deinit(gpa);
+    try std.testing.expect(std.mem.indexOf(u8, try parsed.objectBody(3), "/SMask 4 0 R ") != null);
+    try std.testing.expectEqual(1, std.mem.count(u8, try parsed.objectBody(5), "/X3 3 0 R"));
+    try std.testing.expectEqualStrings("q\n64 0 0 32 10 20 cm\n/X3 Do\nQ\nq\n32 0 0 32 100 200 cm\n/X3 Do\nQ\n", try parsed.streamData(6));
+    try std.testing.expectEqualStrings("q\n1.5 0 0 2.25 0 0 cm\n/X3 Do\nQ\n", try parsed.streamData(8));
+}
+
+test "addImage keeps none of an image's memory once it returns" {
+    const gpa = std.testing.allocator;
+    // 1024 x 1024 RGBA with alpha 128 everywhere: 4 MiB of pixels, split into a colour plane and
+    // a soft mask, each compressed.
+    const side = 1024;
+    const rows = try gpa.alloc(u8, side * (1 + side * 4));
+    defer gpa.free(rows);
+    for (0..side) |y| {
+        const row = rows[y * (1 + side * 4) ..][0 .. 1 + side * 4];
+        row[0] = 0;
+        for (0..side) |x| row[1 + x * 4 ..][0..4].* = .{ @truncate(x), @truncate(y), @truncate(x ^ y), 128 };
+    }
+    var file_arena: std.heap.ArenaAllocator = .init(gpa);
+    defer file_arena.deinit();
+    const png = try image.testPng(file_arena.allocator(), .{ .width = side, .height = side, .depth = 8, .color_type = 6, .interlaced = false }, &.{.{ "IDAT", try image.testZlib(file_arena.allocator(), rows) }});
+
+    var counting: @import("abi.zig").Counting = .{ .child = gpa };
+    var discard: std.Io.Writer.Discarding = .init(&.{});
+    var doc = try Document.begin(counting.allocator(), &discard.writer, .{ .compress = true });
+    defer doc.deinit();
+    const before = counting.live;
+    counting.peak = before;
+    _ = try doc.addImage(png);
+    // It did the work: the decoded image and its planes were held during the call.
+    try std.testing.expect(counting.peak - before > 8 << 20);
+    // And let it all go: the image's record and its xref offsets are what stays.
+    try std.testing.expect(counting.live < before + 1024);
+}
+
+test "a CMYK JPEG is written as it is, with the /Decode that reads it inverted as viewers do" {
+    const gpa = std.testing.allocator;
+    var td_doc: TestDoc = undefined;
+    try td_doc.init(gpa, true);
+    defer td_doc.deinit();
+    const cmyk = try loadTestImage(gpa, "jpeg/cmyk.jpg");
+    defer gpa.free(cmyk);
+    const gray = try loadTestImage(gpa, "jpeg/gray.jpg");
+    defer gpa.free(gray);
+    _ = try td_doc.doc.addImage(cmyk);
+    _ = try td_doc.doc.addImage(gray);
+    const pdf = try td_doc.finishOwned(gpa);
+    defer gpa.free(pdf);
+    var parsed = try E2e.parse(gpa, pdf);
+    defer parsed.deinit(gpa);
+    const cmyk_dict = try parsed.objectBody(3);
+    try std.testing.expect(std.mem.indexOf(u8, cmyk_dict, "/ColorSpace /DeviceCMYK /BitsPerComponent 8 /Decode [1 0 1 0 1 0 1 0] ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, cmyk_dict, "/Filter /DCTDecode") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pdf, cmyk) != null);
+    try std.testing.expect(std.mem.indexOf(u8, try parsed.objectBody(4), "/Decode") == null);
+}
+
+test "a refused addImage or drawImage writes nothing and changes nothing" {
+    const gpa = std.testing.allocator;
+    const png = try loadTestImage(gpa, "pngsuite/basn6a08.png");
+    defer gpa.free(png);
+    var plain: TestDoc = undefined;
+    try plain.init(gpa, true);
+    defer plain.deinit();
+    const one = try plain.doc.addImage(png);
+    const plain_mirrored = try loadTestImage(gpa, "exif/orient-2.png");
+    defer gpa.free(plain_mirrored);
+    const plain_page = try plain.doc.beginPage(100, 100);
+    _ = try plain.doc.addImage(plain_mirrored);
+    try plain.doc.drawImage(plain_page, one, 0, 0, 10, 10);
+    const want = try plain.finishOwned(gpa);
+    defer gpa.free(want);
+
+    var td_doc: TestDoc = undefined;
+    try td_doc.init(gpa, true);
+    defer td_doc.deinit();
+    const doc = &td_doc.doc;
+    try std.testing.expectError(error.UnsupportedImage, doc.addImage("GIF89a"));
+    try std.testing.expectError(error.InvalidImage, doc.addImage(png[0 .. png.len - 20]));
+    try std.testing.expectError(error.TooLarge, blk: {
+        doc.max_image_bytes = 100;
+        defer doc.max_image_bytes = default_max_image_bytes;
+        break :blk doc.addImage(png);
+    });
+    const png_image = try doc.addImage(png);
+    try std.testing.expectError(error.InvalidImage, doc.imageSize(@fromBackingInt(1)));
+    const page = try doc.beginPage(100, 100);
+    try std.testing.expectError(error.InvalidImage, doc.drawImage(page, @fromBackingInt(1), 0, 0, 10, 10));
+    try std.testing.expectError(error.InvalidNumber, doc.drawImage(page, png_image, 0, 0, 0, 10));
+    try std.testing.expectError(error.InvalidNumber, doc.drawImage(page, png_image, 0, 0, 10, std.math.nan(f64)));
+    // A mirrored image's matrix prints x + width: each number is in range, and that one is not.
+    const mirrored_png = try loadTestImage(gpa, "exif/orient-2.png");
+    defer gpa.free(mirrored_png);
+    const mirrored = try doc.addImage(mirrored_png);
+    try std.testing.expectError(error.InvalidNumber, doc.drawImage(page, mirrored, max_pdf_real, 0, 10, 10));
+    try doc.drawImage(page, png_image, 0, 0, 10, 10);
+    const got = try td_doc.finishOwned(gpa);
+    defer gpa.free(got);
+    try std.testing.expectEqualSlices(u8, want, got);
 }
 
 test "reserveLater and drawTextLater write Page N of M as forms the pages paint" {
@@ -2570,6 +2854,8 @@ test "every allocation failure in building and writing a document is OutOfMemory
     // the arena fully usable. So a run that succeeds after a failure is still checked for the
     // same bytes, but no longer required to occur.
     const one_word = try checkWriteAllocationFailures(&fonts, buildOneWordDoc, false);
+    const images = try checkWriteAllocationFailures(&fonts, buildImageDoc, true);
+    try std.testing.expect(images.failed > 10);
     const two_page = try checkWriteAllocationFailures(&fonts, buildTwoPageDoc, false);
     const long_page = try checkWriteAllocationFailures(&fonts, buildLongPageDoc, true);
     try std.testing.expect(one_word.failed > 20);
@@ -2586,6 +2872,30 @@ fn buildLongPageDoc(doc: *Document, fonts: *[3]zpdf.Font) !void {
     try doc.endPage(first);
     const second = try doc.beginPage(612, 792);
     try doc.drawText(second, font, 10, 36, 770, .black, "end", .{});
+}
+
+/// An RGBA PNG (an image and its soft mask), a JPEG, both drawn on one page, the PNG twice.
+fn buildImageDoc(doc: *Document, fonts: *[3]zpdf.Font) !void {
+    _ = fonts;
+    const gpa = std.testing.allocator;
+    const png = try loadTestImage(gpa, "pngsuite/basn6a08.png");
+    defer gpa.free(png);
+    const jpeg = try loadTestImage(gpa, "exif/orient-6.jpg");
+    defer gpa.free(jpeg);
+    const a = try doc.addImage(png);
+    const b = try doc.addImage(jpeg);
+    const page = try doc.beginPage(612, 792);
+    try doc.drawImage(page, a, 10, 10, 32, 32);
+    try doc.drawImage(page, b, 50, 10, 32, 16);
+    try doc.drawImage(page, a, 90, 10, 64, 64);
+}
+
+/// A file under tests/images, owned by `gpa`.
+fn loadTestImage(gpa: std.mem.Allocator, sub_path: []const u8) ![]u8 {
+    const options = @import("build_options");
+    var dir = try std.Io.Dir.cwd().openDir(std.testing.io, options.image_fixtures, .{});
+    defer dir.close(std.testing.io);
+    return dir.readFileAlloc(std.testing.io, sub_path, gpa, .limited(1 << 20));
 }
 
 fn buildOneWordDoc(doc: *Document, fonts: *[3]zpdf.Font) !void {
