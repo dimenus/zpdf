@@ -60,12 +60,13 @@ def main():
                 continue
             out = p.stdout + p.stderr
             lines = out.splitlines()
-            # A failing test: Zig's test runner, xunit's "<test> [FAIL]" (dotnet-test), bun's
+            # A failing test: Zig's test runner (a failure, a crash, or a leak, which it reports
+            # under the leaking test's name while counting the test as passed), xunit's "<test> [FAIL]" (dotnet-test), bun's
             # "(fail) <test>" (web-test), a check program that ran and failed ("run exe
             # check-exports failure" in the build summary), or tools/image-oracle.py's
             # "FAIL <image>: ..." (image-test). A mutant can fail one of these
             # and also break a build elsewhere; the check names the kill.
-            named = next((l.strip() for l in lines if re.match(r"error: '.*' (failed|terminated)", l)
+            named = next((l.strip() for l in lines if re.match(r"error: '.*' (failed|terminated|leaked)", l)
                           or l.rstrip().endswith("[FAIL]") or re.search(r"run exe \S+ failure$", l.rstrip())
                           or l.startswith("FAIL ") or l.startswith("(fail) ")), "")
             if p.returncode == 0:
