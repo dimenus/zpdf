@@ -194,7 +194,7 @@ fn cacheKey(allocator: std.mem.Allocator, utf8: []const u8, options: zpdf.ShapeO
 /// error.DocumentFinished.
 /// Document.cache_budget's starting value; see cache_arena.
 pub const default_cache_budget: usize = 1 << 20;
-/// Document.max_image_bytes's starting value: a 4096 x 4096 RGBA PNG.
+/// Document.max_image_bytes's starting value. image.decodePng says what counts against it.
 pub const default_max_image_bytes: usize = 64 << 20;
 
 pub const Document = struct {
@@ -236,8 +236,8 @@ pub const Document = struct {
     laters_open: u32 = 0,
     /// Every addImage, by ImageId.
     images: std.ArrayList(DocImage) = .empty,
-    /// The most memory one addImage decodes a PNG into (image.decode's max_bytes); a larger one
-    /// is error.TooLarge. A JPEG is not decoded and is not limited.
+    /// The most memory one addImage may hold while it decodes a PNG (image.decode's max_bytes);
+    /// a PNG that needs more is error.TooLarge. A JPEG is not decoded and is not limited.
     max_image_bytes: usize = default_max_image_bytes,
     objects: ObjectWriter,
     /// The next free object number. 1 is the catalog and 2 the page tree,
@@ -835,11 +835,13 @@ pub const Document = struct {
     pub fn addImage(self: *Document, bytes: []const u8) !ImageId {
         try self.checkWriting();
         try self.images.ensureUnusedCapacity(self.gpa, 1);
-        // An arena of its own, not write_scratch: a reset arena keeps its capacity, and a decoded
-        // image would stay held until the document ends (stream and free).
+        // Decoded with gpa and freed on return, not in write_scratch: a reset arena keeps its
+        // capacity, and a decoded image would stay held until the document ends (stream and
+        // free). The arena holds only the dictionaries' text.
+        var img = try image.decode(self.gpa, bytes, self.max_image_bytes);
+        defer img.deinit(self.gpa);
         var arena: std.heap.ArenaAllocator = .init(self.gpa);
         defer arena.deinit();
-        const img = try image.decode(arena.allocator(), bytes, self.max_image_bytes);
         const object = self.next_object;
         self.next_object += if (img.alpha != null) 2 else 1;
         self.writeImage(arena.allocator(), object, img) catch |err| {
@@ -1594,8 +1596,11 @@ test "addImage keeps none of an image's memory once it returns" {
     const before = counting.live;
     counting.peak = before;
     _ = try doc.addImage(png);
-    // It did the work: the decoded image and its planes were held during the call.
-    try std.testing.expect(counting.peak - before > 8 << 20);
+    // It did the work: the inflated rows, 4 MiB and a filter byte per row, were held.
+    try std.testing.expect(counting.peak - before > 4 << 20);
+    // In place: the rows, the 1 MiB alpha plane, the zlib window and the compressed streams. A
+    // second full copy of the image (3 MiB of colour or more) would pass 8 MiB.
+    try std.testing.expect(counting.peak - before < 8 << 20);
     // And let it all go: the image's record and its xref offsets are what stays.
     try std.testing.expect(counting.live < before + 1024);
 }

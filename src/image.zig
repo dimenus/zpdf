@@ -2,7 +2,8 @@
 //! XObject (ISO 32000-1 8.9). pdf.zig writes the objects; this file knows no PDF syntax.
 //!
 //! How to use it:
-//!   const img = try image.decode(arena, bytes, max_bytes);  // everything lives in `arena`
+//!   var img = try image.decode(gpa, bytes, max_bytes);
+//!   defer img.deinit(gpa);
 //!   // img.width x img.height samples of img.color at img.bits, img.data rows from the top,
 //!   // each row padded to a whole byte; img.alpha, when set, is a DeviceGray soft mask.
 //!
@@ -30,7 +31,8 @@
 //! - error.UnsupportedImage: a file that is neither PNG nor JPEG; a JPEG that is lossless,
 //!   hierarchical, arithmetic-coded, 12-bit, with 2 components or more than 4, or sized by a DNL
 //!   marker; a PNG with a critical chunk the PNG standard does not define.
-//! - error.TooLarge: a PNG whose decoded samples would pass `max_bytes`.
+//! - error.TooLarge: a PNG whose decoding would hold more than `max_bytes` (decodePng says what
+//!   it counts).
 //!
 //! Images are untrusted input: every length and offset is checked against the file, and the
 //! decoded size is checked before anything that size is allocated.
@@ -122,6 +124,15 @@ pub const Image = struct {
     /// null when every pixel is opaque.
     alpha: ?[]const u8 = null,
     alpha_bits: u8 = 8,
+    /// The buffer `data` lies in, when decode allocated it (a PNG); a JPEG's data is its file.
+    allocation: []u8 = &.{},
+
+    /// Frees what decode allocated.
+    pub fn deinit(self: *Image, gpa: Allocator) void {
+        gpa.free(self.allocation);
+        if (self.alpha) |a| gpa.free(a);
+        self.* = undefined;
+    }
 
     /// The size as shown, after the orientation.
     pub fn shownSize(self: Image) [2]u32 {
@@ -129,9 +140,10 @@ pub const Image = struct {
     }
 };
 
-/// `bytes` must stay valid while the result is used: a JPEG's data is a slice of it.
-pub fn decode(arena: Allocator, bytes: []const u8, max_bytes: usize) Error!Image {
-    if (std.mem.startsWith(u8, bytes, png_signature)) return decodePng(arena, bytes, max_bytes);
+/// `bytes` must stay valid while the result is used: a JPEG's data and a PNG's palette are slices
+/// of it. The result's buffers are allocated with `gpa`; Image.deinit frees them.
+pub fn decode(gpa: Allocator, bytes: []const u8, max_bytes: usize) Error!Image {
+    if (std.mem.startsWith(u8, bytes, png_signature)) return decodePng(gpa, bytes, max_bytes);
     if (std.mem.startsWith(u8, bytes, "\xFF\xD8\xFF")) return parseJpeg(bytes);
     return error.UnsupportedImage;
 }
@@ -269,16 +281,27 @@ pub const Header = struct {
 
 /// The PNG standard (third edition), section 5 (chunks), 7 and 9 (filters), 8 (Adam7), 10
 /// (zlib), 11 (the chunks it defines).
-fn decodePng(arena: Allocator, bytes: []const u8, max_bytes: usize) Error!Image {
+///
+/// Memory: the IDAT data is used where it lies when it is one chunk, and copied once, at its exact
+/// size, when it is several. It is inflated into a buffer of the exact size, then unfiltered and
+/// packed into image rows in that same buffer; an interlaced image needs a second buffer for its
+/// passes. An alpha channel is split out into its own plane, and the colour samples are packed in
+/// place. So an RGBA image holds about 1.25 times its samples, not three copies.
+fn decodePng(gpa: Allocator, bytes: []const u8, max_bytes: usize) Error!Image {
     var pos: usize = png_signature.len;
     var header: ?Header = null;
     var palette: ?[]const u8 = null;
     var trns: ?[]const u8 = null;
     var orientation: ?Orientation = null;
-    var idat: std.ArrayList(u8) = .empty;
     var idat_state: enum { before, in, after } = .before;
+    // The IDAT chunks: where the first starts, how many, their data's total length, the last's data.
+    var idat_start: usize = 0;
+    var idat_chunks: usize = 0;
+    var idat_len: u64 = 0;
+    var idat_last: []const u8 = &.{};
     while (true) {
         if (bytes.len - pos < 12) return error.InvalidImage;
+        const start = pos;
         const len = std.mem.readInt(u32, bytes[pos..][0..4], .big);
         if (len > std.math.maxInt(i32) or bytes.len - pos - 12 < len) return error.InvalidImage;
         const kind = bytes[pos + 4 ..][0..4];
@@ -318,8 +341,11 @@ fn decodePng(arena: Allocator, bytes: []const u8, max_bytes: usize) Error!Image 
             orientation = try exifOrientation(data);
         } else if (std.mem.eql(u8, kind, "IDAT")) {
             if (idat_state == .after) return error.InvalidImage;
+            if (idat_state == .before) idat_start = start;
             idat_state = .in;
-            try idat.appendSlice(arena, data);
+            idat_chunks += 1;
+            idat_len += len;
+            idat_last = data;
         } else if (std.mem.eql(u8, kind, "IEND")) {
             if (len != 0) return error.InvalidImage;
             break;
@@ -332,27 +358,51 @@ fn decodePng(arena: Allocator, bytes: []const u8, max_bytes: usize) Error!Image 
     if (idat_state == .before) return error.InvalidImage;
     if (h.color_type == 3 and palette == null) return error.InvalidImage;
 
-    // Everything decoding holds at once, in u64 so no product can wrap (usize is 32 bits on
-    // wasm32): the inflated rows with their filter bytes, the image, and the planes built from
-    // it. A palette's alpha is a byte per pixel, eight times a 1-bit image; an alpha channel
-    // splits the image into a colour plane and an alpha plane, as large as the image together.
+    // The most decoding holds at once, in u64 so no product can wrap (usize is 32 bits on
+    // wasm32): the IDAT copy (none for one chunk), the inflated rows with their filter bytes, an
+    // interlaced image's own buffer, and an alpha plane. It counts the IDAT copy as held to the
+    // end, though it is freed once inflated, so it is an upper bound.
     const size = std.math.mul(u64, h.rowBytes(h.width), h.height) catch return error.TooLarge;
     const pixel_count = @as(u64, h.width) * h.height;
-    const planes: u64 = switch (h.color_type) {
+    const alpha_len: u64 = switch (h.color_type) {
         3 => if (trns != null) pixel_count else 0,
-        4, 6 => size,
+        4, 6 => std.math.mul(u64, pixel_count, h.depth / 8) catch return error.TooLarge,
         else => 0,
     };
     const filtered_len = try filteredLength(h);
-    const total = std.math.add(u64, filtered_len, size) catch return error.TooLarge;
-    const held = std.math.add(u64, total, planes) catch return error.TooLarge;
+    var held: u64 = if (idat_chunks > 1) idat_len else 0;
+    for ([_]u64{ filtered_len, if (h.interlaced) size else 0, alpha_len }) |part| {
+        held = std.math.add(u64, held, part) catch return error.TooLarge;
+    }
     if (held > max_bytes) return error.TooLarge;
     const stride: usize = @intCast(h.rowBytes(h.width));
 
-    const filtered = try inflateExactly(arena, idat.items, @intCast(filtered_len));
-    const pixels = try arena.alloc(u8, @intCast(size));
+    // Inflate, then let go of the IDAT copy before anything else is allocated.
+    const filtered = try gpa.alloc(u8, @intCast(filtered_len));
+    var filtered_owned = true;
+    defer if (filtered_owned) gpa.free(filtered);
+    {
+        const copy: []u8 = if (idat_chunks > 1) try gpa.alloc(u8, @intCast(idat_len)) else &.{};
+        defer gpa.free(copy);
+        if (idat_chunks > 1) {
+            // The IDAT chunks are consecutive, from idat_start; their CRCs are already checked.
+            var at = idat_start;
+            var n: usize = 0;
+            while (n < copy.len) {
+                const len = std.mem.readInt(u32, bytes[at..][0..4], .big);
+                @memcpy(copy[n..][0..len], bytes[at + 8 ..][0..len]);
+                n += len;
+                at += 12 + len;
+            }
+        }
+        try inflateExactly(gpa, if (idat_chunks > 1) copy else idat_last, filtered);
+    }
+
+    // `allocation` is what the Image owns: the inflated buffer, or an interlaced image's own.
+    var allocation: []u8 = undefined;
     if (h.interlaced) {
-        @memset(pixels, 0);
+        allocation = try gpa.alloc(u8, @intCast(size));
+        @memset(allocation, 0);
         var at: usize = 0;
         for (adam7) |pass| {
             const pw = passSize(h.width, pass.x0, pass.dx);
@@ -360,14 +410,22 @@ fn decodePng(arena: Allocator, bytes: []const u8, max_bytes: usize) Error!Image 
             if (pw == 0 or ph == 0) continue;
             const prb: usize = @intCast(h.rowBytes(pw));
             const len = (prb + 1) * ph;
-            try unfilter(filtered[at..][0..len], prb, h);
-            scatterPass(pixels, stride, filtered[at..][0..len], prb, h, pass, pw, ph);
+            unfilter(filtered[at..][0..len], prb, h) catch |err| {
+                gpa.free(allocation);
+                return err;
+            };
+            scatterPass(allocation, stride, filtered[at..][0..len], prb, h, pass, pw, ph);
             at += len;
         }
     } else {
         try unfilter(filtered, stride, h);
-        for (0..h.height) |row| @memcpy(pixels[row * stride ..][0..stride], filtered[row * (stride + 1) + 1 ..][0..stride]);
+        // Row r moves from r * (stride + 1) + 1 to r * stride: always down, so in place.
+        for (0..h.height) |row| std.mem.copyForwards(u8, filtered[row * stride ..][0..stride], filtered[row * (stride + 1) + 1 ..][0..stride]);
+        allocation = filtered;
+        filtered_owned = false;
     }
+    errdefer gpa.free(allocation);
+    const pixels = allocation[0..@intCast(size)];
 
     var result: Image = .{
         .width = h.width,
@@ -382,6 +440,7 @@ fn decodePng(arena: Allocator, bytes: []const u8, max_bytes: usize) Error!Image 
         .bits = h.depth,
         .data = pixels,
         .encoding = .samples,
+        .allocation = allocation,
     };
     switch (h.color_type) {
         0, 2 => if (trns) |t| {
@@ -397,37 +456,43 @@ fn decodePng(arena: Allocator, bytes: []const u8, max_bytes: usize) Error!Image 
         },
         3 => {
             const entries = palette.?.len / 3;
-            const alpha = try arena.alloc(u8, @as(usize, h.width) * h.height);
+            const t = trns orelse &.{};
+            // Only a tRNS can make a pixel other than opaque, so without one there is no plane.
+            const alpha: []u8 = if (trns != null) try gpa.alloc(u8, @intCast(pixel_count)) else &.{};
             var opaque_all = true;
             for (0..h.height) |row| {
                 for (0..h.width) |col| {
                     const index = sampleAt(pixels[row * stride ..][0..stride], col, h.depth);
-                    if (index >= entries) return error.InvalidImage;
-                    const t = trns orelse &.{};
+                    if (index >= entries) {
+                        gpa.free(alpha);
+                        return error.InvalidImage;
+                    }
+                    if (trns == null) continue;
                     const a: u8 = if (index < t.len) t[index] else 255;
                     alpha[row * h.width + col] = a;
                     opaque_all = opaque_all and a == 255;
                 }
             }
-            if (!opaque_all) result.alpha = alpha;
+            if (opaque_all) gpa.free(alpha) else result.alpha = alpha;
         },
         4, 6 => {
             const color_n: usize = h.channels() - 1;
             const sample_bytes: usize = h.depth / 8;
             const n_pixels: usize = @intCast(pixel_count);
-            const color = try arena.alloc(u8, n_pixels * color_n * sample_bytes);
-            const alpha = try arena.alloc(u8, n_pixels * sample_bytes);
+            const alpha = try gpa.alloc(u8, n_pixels * sample_bytes);
             var opaque_all = true;
             const pixel_bytes = (color_n + 1) * sample_bytes;
+            const color_bytes = color_n * sample_bytes;
             for (0..n_pixels) |i| {
-                const p = pixels[i * pixel_bytes ..][0..pixel_bytes];
-                @memcpy(color[i * color_n * sample_bytes ..][0 .. color_n * sample_bytes], p[0 .. color_n * sample_bytes]);
-                const a = p[color_n * sample_bytes ..];
+                const a = pixels[i * pixel_bytes + color_bytes ..][0..sample_bytes];
                 @memcpy(alpha[i * sample_bytes ..][0..sample_bytes], a);
                 for (a) |byte| opaque_all = opaque_all and byte == 0xFF;
+                // Pixel i's colour moves from i * pixel_bytes to i * color_bytes: down, and no
+                // further than its own alpha, which was read first.
+                std.mem.copyForwards(u8, pixels[i * color_bytes ..][0..color_bytes], pixels[i * pixel_bytes ..][0..color_bytes]);
             }
-            result.data = color;
-            if (!opaque_all) {
+            result.data = pixels[0 .. n_pixels * color_bytes];
+            if (opaque_all) gpa.free(alpha) else {
                 result.alpha = alpha;
                 result.alpha_bits = h.depth;
             }
@@ -470,17 +535,19 @@ fn filteredLength(h: Header) Error!u64 {
     return total;
 }
 
-/// Exactly `len` bytes, and the zlib stream must end there with a good checksum.
-fn inflateExactly(arena: Allocator, data: []const u8, len: usize) Error![]u8 {
+/// Fills `out` exactly, and the zlib stream must end there with a good checksum.
+fn inflateExactly(gpa: Allocator, data: []const u8, out: []u8) Error!void {
     var in: std.Io.Reader = .fixed(data);
-    const window = try arena.alloc(u8, std.compress.flate.max_window_len);
+    const window = try gpa.alloc(u8, std.compress.flate.max_window_len);
+    defer gpa.free(window);
     var d: std.compress.flate.Decompress = .init(&in, .zlib, window);
-    const out = d.reader.allocRemaining(arena, .limited(len + 1)) catch |err| return switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong, error.ReadFailed => error.InvalidImage,
-    };
-    if (out.len != len) return error.InvalidImage;
-    return out;
+    d.reader.readSliceAll(out) catch return error.InvalidImage;
+    // Any byte left is data the image has no room for. Reading to the end also reads the
+    // footer, but std's Decompress only stores its Adler-32 (container_metadata) and never
+    // compares it, so that is done here.
+    const rest = d.reader.discardRemaining() catch return error.InvalidImage;
+    if (rest != 0) return error.InvalidImage;
+    if (std.hash.Adler32.hash(out) != d.container_metadata.zlib.adler) return error.InvalidImage;
 }
 
 /// Undoes the filters of `len / (row_bytes + 1)` rows, in place (PNG 7.3 and 9).
@@ -664,14 +731,14 @@ test "PNG refusals: bad CRC, short and long data, a palette index past the palet
     try testing.expectError(error.InvalidImage, decode(arena, try testPng(arena, gray, &.{.{ "IDAT", try testZlib(arena, &.{ 0, 10 }) }}), 1 << 20));
     try testing.expectError(error.InvalidImage, decode(arena, try testPng(arena, gray, &.{.{ "IDAT", try testZlib(arena, &.{ 0, 10, 20, 30 }) }}), 1 << 20));
     try testing.expectError(error.InvalidImage, decode(arena, try testPng(arena, gray, &.{.{ "IDAT", try testZlib(arena, &.{ 5, 10, 20 }) }}), 1 << 20));
-    // The decoded rows (3 bytes) and the image (2 bytes) are held together.
-    try testing.expectError(error.TooLarge, decode(arena, good, 4));
-    _ = try decode(arena, good, 5);
-    // A 1-bit palette with tRNS: 2 bytes of rows, 1 of image, and an alpha byte per pixel (8).
+    // The inflated rows (3 bytes) hold the image too: it is packed into them.
+    try testing.expectError(error.TooLarge, decode(arena, good, 2));
+    _ = try decode(arena, good, 3);
+    // A 1-bit palette with tRNS: 2 bytes of rows, and an alpha byte per pixel (8).
     const bits: Header = .{ .width = 8, .height = 1, .depth = 1, .color_type = 3, .interlaced = false };
     const two = try testPng(arena, bits, &.{ .{ "PLTE", "\xff\x00\x00\x00\xff\x00" }, .{ "tRNS", "\x80" }, .{ "IDAT", try testZlib(arena, &.{ 0, 0x55 }) } });
-    try testing.expectError(error.TooLarge, decode(arena, two, 10));
-    const masked = try decode(arena, two, 11);
+    try testing.expectError(error.TooLarge, decode(arena, two, 9));
+    const masked = try decode(arena, two, 10);
     try testing.expectEqualSlices(u8, &.{ 128, 255, 128, 255, 128, 255, 128, 255 }, masked.alpha.?);
 
     const indexed: Header = .{ .width = 2, .height = 1, .depth = 8, .color_type = 3, .interlaced = false };
@@ -714,6 +781,56 @@ test "JPEG frames: 1, 3 and 4 components are taken, 2 and 5 refused, and lossles
     try testing.expectError(error.UnsupportedImage, decode(testing.allocator, Frame.jpeg(&buf, 0xC0, 2), 0));
     try testing.expectError(error.UnsupportedImage, decode(testing.allocator, Frame.jpeg(&buf, 0xC0, 5), 0));
     try testing.expectError(error.UnsupportedImage, decode(testing.allocator, Frame.jpeg(&buf, 0xC3, 3), 0));
+}
+
+test "IDAT split over chunks decodes as one; a bad zlib checksum or data after the image is refused" {
+    const gpa = testing.allocator;
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const rgb: Header = .{ .width = 3, .height = 2, .depth = 8, .color_type = 2, .interlaced = false };
+    const rows = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9 } ++ [_]u8{ 1, 10, 20, 30, 1, 1, 1, 2, 2, 2 };
+    const z = try testZlib(arena, &rows);
+    // Decoded with the real allocator, so a buffer decode forgets to free fails the test.
+    var one = try decode(gpa, try testPng(arena, rgb, &.{.{ "IDAT", z }}), 1 << 20);
+    defer one.deinit(gpa);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 30, 11, 21, 31, 13, 23, 33 }, one.data);
+    const split_png = try testPng(arena, rgb, &.{ .{ "IDAT", z[0..3] }, .{ "IDAT", z[3..7] }, .{ "IDAT", z[7..] } });
+    var split = try decode(gpa, split_png, 1 << 20);
+    defer split.deinit(gpa);
+    try testing.expectEqualSlices(u8, one.data, split.data);
+    // The budget: one chunk is inflated where it lies (20 bytes of rows); several are copied
+    // first, so their compressed length counts too.
+    try testing.expectError(error.TooLarge, decode(gpa, try testPng(arena, rgb, &.{.{ "IDAT", z }}), 19));
+    var at_budget = try decode(gpa, try testPng(arena, rgb, &.{.{ "IDAT", z }}), 20);
+    at_budget.deinit(gpa);
+    try testing.expectError(error.TooLarge, decode(gpa, split_png, 20 + z.len - 1));
+    var split_at_budget = try decode(gpa, split_png, 20 + z.len);
+    split_at_budget.deinit(gpa);
+
+    const bad_adler = try arena.dupe(u8, z);
+    bad_adler[bad_adler.len - 1] ^= 1;
+    try testing.expectError(error.InvalidImage, decode(gpa, try testPng(arena, rgb, &.{.{ "IDAT", bad_adler }}), 1 << 20));
+    // One byte past the image, with the footer's checksum made right for the image alone, so
+    // only the length check can refuse it.
+    const longer = try testZlib(arena, &(rows ++ [_]u8{7}));
+    std.mem.writeInt(u32, longer[longer.len - 4 ..][0..4], std.hash.Adler32.hash(&rows), .big);
+    try testing.expectError(error.InvalidImage, decode(gpa, try testPng(arena, rgb, &.{.{ "IDAT", longer }}), 1 << 20));
+    // A refusal after the rows are decoded (a palette index past the palette) frees them too.
+    const indexed: Header = .{ .width = 2, .height = 1, .depth = 8, .color_type = 3, .interlaced = false };
+    try testing.expectError(error.InvalidImage, decode(gpa, try testPng(arena, indexed, &.{ .{ "PLTE", "\xff\x00\x00" }, .{ "tRNS", "\x80" }, .{ "IDAT", try testZlib(arena, &.{ 0, 0, 1 }) } }), 1 << 20));
+    // An RGBA image's colour is packed where the pixels were, its alpha split out.
+    const rgba: Header = .{ .width = 2, .height = 1, .depth = 16, .color_type = 6, .interlaced = false };
+    const px = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    var split_alpha = try decode(gpa, try testPng(arena, rgba, &.{.{ "IDAT", try testZlib(arena, &px) }}), 1 << 20);
+    defer split_alpha.deinit(gpa);
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3, 4, 5, 6, 9, 10, 11, 12, 13, 14 }, split_alpha.data);
+    try testing.expectEqualSlices(u8, &.{ 7, 8, 15, 16 }, split_alpha.alpha.?);
+    // Fully opaque: no mask, and the alpha plane it was split into is freed.
+    const opaque_px = [_]u8{ 0, 1, 2, 3, 4, 5, 6, 0xFF, 0xFF, 9, 10, 11, 12, 13, 14, 0xFF, 0xFF };
+    var no_mask = try decode(gpa, try testPng(arena, rgba, &.{.{ "IDAT", try testZlib(arena, &opaque_px) }}), 1 << 20);
+    defer no_mask.deinit(gpa);
+    try testing.expectEqual(null, no_mask.alpha);
 }
 
 test "Exif orientation: both byte orders, no tag, and a value outside 1 to 8" {
@@ -761,17 +878,20 @@ test "PngSuite: every valid file decodes, every x* file is refused" {
         defer arena_state.deinit();
         const arena = arena_state.allocator();
         const bytes = try dir.readFileAlloc(testing.io, entry.name, arena, .limited(1 << 20));
-        const result = decode(arena, bytes, 1 << 24);
+        // The test allocator, not the arena: a buffer decode forgets to free fails the test.
+        var result = decode(testing.allocator, bytes, 1 << 24);
         if (entry.name[0] == 'x') {
-            if (result) |_| {
+            if (result) |*img| {
+                img.deinit(testing.allocator);
                 std.debug.print("{s}: decoded, but PngSuite says it is broken\n", .{entry.name});
                 return error.TestUnexpectedResult;
             } else |_| refused += 1;
         } else {
-            _ = result catch |err| {
+            var img = result catch |err| {
                 std.debug.print("{s}: {t}\n", .{ entry.name, err });
                 return err;
             };
+            img.deinit(testing.allocator);
             decoded += 1;
         }
     }
@@ -884,7 +1004,12 @@ test "damaged images give an image or an error, never a crash or a hang" {
                         break :blk try withIdat(arena, bytes, try testZlib(arena, rows));
                     },
                 };
-                if (decode(arena, copy, 1 << 24)) |_| decoded += 1 else |_| refused += 1;
+                // The test allocator, so every error path is also checked for leaks.
+                if (decode(gpa, copy, 1 << 24)) |img| {
+                    var kept = img;
+                    kept.deinit(gpa);
+                    decoded += 1;
+                } else |_| refused += 1;
             }
         }
     }
