@@ -28,6 +28,11 @@
 - Fonts are untrusted input. `uv run tools/font-sweep.py <font dirs>` runs a Debug zpdf-text over every
   file and lists each crash and hang by its first source frame; use `--exe` with a ReleaseFast build too,
   because some kb defects crash only there. Corpus: the harfbuzz package's `test/` folder.
+- Images are untrusted input too. `zig build image-test` (needs uv and mutool) draws every file in
+  `tests/images` with zpdf-image, renders it with MuPDF, and compares the pixels with pypng and
+  Pillow, and each PNG's samples exactly (`tools/image-oracle.py`). Run it on any change to
+  `src/image.zig` or to how `src/pdf.zig` writes images. `uv run tools/image-fixtures.py` rebuilds
+  `tests/images/exif` and `tests/images/jpeg`.
 - Mutation testing a new test: `uv run tools/mutate.py <mutants.json>` (its docstring has the
   format). Every kill must name the failing test; it exits 1 when a mutant survives.
 - Speed of a change: `uv run tools/bench-ab.py` (hyperfine; needs hyperfine, mutool, Homebrew mupdf-tools)

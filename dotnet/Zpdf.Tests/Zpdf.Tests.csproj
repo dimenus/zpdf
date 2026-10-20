@@ -29,6 +29,8 @@
         <!-- The reader fixtures: one 3-page file from zpdf, and qpdf's rewrites of it
              (tools/read-fixtures.sh). -->
         <None Include="..\..\tests\read\*.pdf" Link="Fixtures\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
+        <!-- Images for the writer's tests, from Pillow (tools/image-fixtures.py). -->
+        <None Include="..\..\tests\images\exif\orient-6.png;..\..\tests\images\jpeg\*.jpg" Link="Fixtures\%(Filename)%(Extension)" CopyToOutputDirectory="PreserveNewest" />
         <!-- A TrueType font for the writer's tests (harfbuzz's Roboto-Regular, from build.zig.zon). -->
         <None Include="$([System.IO.Path]::GetFullPath('$(ZpdfTestFont)', '$(MSBuildStartupDirectory)'))" Link="Fixtures\TestFont.ttf" CopyToOutputDirectory="PreserveNewest" Condition="'$(ZpdfTestFont)' != ''" />
     </ItemGroup>

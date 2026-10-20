@@ -520,6 +520,107 @@ test("lines, rectangles and coloured text render in their colours where they wer
   expect(page_errors).toEqual([]);
 });
 
+// tests/images/exif/orient-6.png is stored a quarter turn off, with the Exif tag that turns it
+// upright: a 32 x 16 picture with a red block at its top left and a blue bar along its bottom
+// (tools/image-fixtures.py). pdf.js must show it upright where it was drawn.
+test("a PNG with an Exif orientation renders upright where it was drawn; junk is refused", async () => {
+  const png = Array.from(new Uint8Array(await Bun.file(new URL("../../tests/images/exif/orient-6.png", import.meta.url)).arrayBuffer()));
+  const got = await page.evaluate(async (png) => {
+    const { Zpdf } = await import("/zpdf.js");
+    const z = window.zpdfPage;
+    const zpdf = await Zpdf.create(z.wasmModule);
+    const doc = zpdf.newDocument();
+    const image = doc.addImage(new Uint8Array(png));
+    let junk = null;
+    try {
+      doc.addImage(new Uint8Array([1, 2, 3]));
+    } catch (error) {
+      junk = error.code;
+    }
+    const p = doc.beginPage(612, 792);
+    // Shown 32 x 16, drawn 4 times larger with its bottom-left at (100, 600).
+    doc.drawImage(p, image, 100, 600, 128, 64);
+    doc.endPage(p);
+    const pdf = doc.finish();
+    doc.close();
+    const canvas = document.createElement("canvas");
+    await z.renderPdf(pdf, canvas, 1);
+    const data = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+    const at = (x, y) => Array.from(data.subarray(((792 - y) * canvas.width + x) * 4, ((792 - y) * canvas.width + x) * 4 + 3));
+    return { size: [image.width, image.height], junk, topLeft: at(116, 648), topRight: at(212, 648), bottom: at(164, 608), outside: at(95, 630) };
+  }, png);
+  const red = ([r, g, b]) => r > 200 && g < 60 && b < 60;
+  const blue = ([r, g, b]) => b > 150 && r < 60 && g < 60;
+  expect(got.size).toEqual([32, 16]);
+  expect(got.junk).toBe("UnsupportedImage");
+  expect([red(got.topLeft), red(got.topRight), blue(got.bottom), got.outside]).toEqual([true, false, true, [255, 255, 255]]);
+  expect(page_errors).toEqual([]);
+});
+
+// JPEG viewers read every CMYK JPEG's samples as inverted, and PDF readers draw /DCTDecode samples
+// as they are, so zpdf writes an inverting /Decode (src/image.zig). pdf.js's render of each CMYK
+// file must be the picture Chrome's own JPEG decoder shows, not its negative. The colours differ
+// with each CMYK to RGB conversion, so the check is that their brightness correlates by 0.5 or
+// more; a negative correlates strongly negatively (tools/image-oracle.py has the same check).
+test("a CMYK JPEG renders as Chrome's own decoder shows it, not as its negative", async () => {
+  const names = ["cmyk.jpg", "cmyk-noadobe.jpg", "cmyk-plain.jpg"];
+  const files = await Promise.all(names.map(async (name) =>
+    Array.from(new Uint8Array(await Bun.file(new URL(`../../tests/images/jpeg/${name}`, import.meta.url)).arrayBuffer()))));
+  const got = await page.evaluate(async (files) => {
+    const { Zpdf } = await import("/zpdf.js");
+    const z = window.zpdfPage;
+    const zpdf = await Zpdf.create(z.wasmModule);
+    const brightness = (canvas) => {
+      const d = canvas.getContext("2d").getImageData(0, 0, canvas.width, canvas.height).data;
+      const out = [];
+      for (let i = 0; i < d.length; i += 4) out.push((d[i] + d[i + 1] + d[i + 2]) / 3);
+      return out;
+    };
+    const correlation = (a, b) => {
+      const mean = (v) => v.reduce((s, x) => s + x, 0) / v.length;
+      const ma = mean(a);
+      const mb = mean(b);
+      let ab = 0;
+      let aa = 0;
+      let bb = 0;
+      for (let i = 0; i < a.length; i++) {
+        ab += (a[i] - ma) * (b[i] - mb);
+        aa += (a[i] - ma) ** 2;
+        bb += (b[i] - mb) ** 2;
+      }
+      return ab / Math.sqrt(aa * bb);
+    };
+    const results = [];
+    for (const bytes of files) {
+      const jpeg = new Uint8Array(bytes);
+      const doc = zpdf.newDocument();
+      const image = doc.addImage(jpeg);
+      const p = doc.beginPage(64, 32);
+      doc.drawImage(p, image, 0, 0, 64, 32);
+      doc.endPage(p);
+      const pdf = doc.finish();
+      doc.close();
+      const rendered = document.createElement("canvas");
+      await z.renderPdf(pdf, rendered, 1);
+      const img = new Image();
+      img.src = URL.createObjectURL(new Blob([jpeg], { type: "image/jpeg" }));
+      await img.decode();
+      const decoded = document.createElement("canvas");
+      decoded.width = 64;
+      decoded.height = 32;
+      decoded.getContext("2d").drawImage(img, 0, 0, 64, 32);
+      results.push([image.width, image.height, Math.round(correlation(brightness(rendered), brightness(decoded)) * 1000) / 1000]);
+    }
+    return results;
+  }, files);
+  console.log("CMYK correlations:", JSON.stringify(got));
+  for (const [width, height, r] of got) {
+    expect([width, height]).toEqual([32, 16]);
+    expect(r).toBeGreaterThanOrEqual(0.5);
+  }
+  expect(page_errors).toEqual([]);
+});
+
 // pdf.js reads the text back: a reserved place shows on its page, with the page count that was
 // only known after the last page.
 test("reserveLater places drawn after the last page read as Page N of M on each page", async () => {

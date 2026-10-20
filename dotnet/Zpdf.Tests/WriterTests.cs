@@ -319,6 +319,71 @@ public sealed class WriterTests
         Assert.EndsWith("+Roboto-Regular", run.Font);
     }
 
+    private static byte[] Fixture(string name) =>
+        File.ReadAllBytes(Path.Combine(AppContext.BaseDirectory, "Fixtures", name));
+
+    [Fact]
+    public void An_image_is_written_when_AddImage_returns_and_is_in_the_PDF_once_for_two_pages()
+    {
+        var output = new ArrayBufferWriter<byte>();
+        using (var writer = PdfWriter.Create(output, compress: false))
+        {
+            var before = output.WrittenCount;
+            // Stored 16 x 32 with Exif orientation 6 (turned a quarter clockwise to be shown).
+            var image = writer.AddImage(Fixture("orient-6.png"));
+            Assert.True(output.WrittenCount > before, "AddImage wrote nothing into the output before it returned");
+            Assert.False(writer.Lent);
+            Assert.Equal((32u, 16u), (image.Width, image.Height));
+            for (var p = 0; p < 2; p++)
+            {
+                var page = writer.BeginPage(200, 100);
+                writer.DrawImage(page, image, 10, 10, image.Width * 4, image.Height * 4);
+                writer.EndPage(page);
+            }
+            writer.Finish();
+        }
+
+        var pdf = System.Text.Encoding.Latin1.GetString(output.WrittenSpan);
+        Assert.Equal(1, CountOf(pdf, "/Subtype /Image"));
+        Assert.Equal(2, CountOf(pdf, " cm\n/X"));
+        using var reader = PdfReader.Open(output.WrittenSpan);
+        Assert.Equal(2, reader.PageCount);
+        Assert.Empty(reader.ReadText(1).Runs);
+    }
+
+    [Fact]
+    public void A_refused_image_throws_its_error_and_the_document_goes_on()
+    {
+        var output = new ArrayBufferWriter<byte>();
+        using (var writer = PdfWriter.Create(output, compress: true))
+        {
+            var before = output.WrittenCount;
+            Assert.Equal("UnsupportedImage", Assert.Throws<ZpdfException>(() => writer.AddImage("GIF89a"u8)).ErrorName);
+            var truncated = Fixture("gray.jpg").AsSpan(0, 100).ToArray();
+            Assert.Equal("InvalidImage", Assert.Throws<ZpdfException>(() => writer.AddImage(truncated)).ErrorName);
+            Assert.Equal(before, output.WrittenCount);
+            var image = writer.AddImage(Fixture("gray.jpg"));
+            var page = writer.BeginPage(100, 100);
+            Assert.Equal("InvalidNumber", Assert.Throws<ZpdfException>(() => writer.DrawImage(page, image, 0, 0, 0, 10)).ErrorName);
+            writer.DrawImage(page, image, 0, 0, 32, 16);
+            writer.EndPage(page);
+            writer.Finish();
+        }
+
+        using var reader = PdfReader.Open(output.WrittenSpan);
+        Assert.Equal(1, reader.PageCount);
+    }
+
+    private static int CountOf(string text, string part)
+    {
+        var count = 0;
+        for (var at = text.IndexOf(part, StringComparison.Ordinal); at >= 0; at = text.IndexOf(part, at + 1, StringComparison.Ordinal))
+        {
+            count++;
+        }
+        return count;
+    }
+
     // The PDF names of the 14 standard fonts' text faces (ISO 32000-1, 9.6.2.2), in StandardFont's
     // order: if zpdf's numbering and this enum ever disagree, a name read back differs.
     [Theory]

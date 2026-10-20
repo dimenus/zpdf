@@ -92,6 +92,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOptionPath("bidi_cases", b.path("tests/bidi/cases.tsv"));
     build_options.addOptionPathDirectory("golden_dir", b.path("tests/golden"));
     build_options.addOptionPathDirectory("read_fixtures", b.path("tests/read"));
+    build_options.addOptionPathDirectory("pngsuite_dir", b.path("tests/images/pngsuite"));
+    build_options.addOptionPathDirectory("image_fixtures", b.path("tests/images"));
     build_options.addOptionPathDirectory("cid_dir", b.path("src/cid"));
     build_options.addOptionPath("winansi_table", b.path("tests/winansi/table.tsv"));
     build_options.addOptionPath("test_font_anchor", harfbuzz.path("test/api/fonts/SourceSansVariable-Roman.anchor.ttf"));
@@ -143,6 +145,18 @@ pub fn build(b: *std.Build) void {
         .name = "zpdf-read",
         .root_module = read_exe_mod,
     }));
+
+    const image_exe_mod = b.createModule(.{
+        .root_source_file = b.path("src/zpdf-image.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    image_exe_mod.addImport("zpdf", mod);
+    const image_exe = b.addExecutable(.{
+        .name = "zpdf-image",
+        .root_module = image_exe_mod,
+    });
+    b.installArtifact(image_exe);
 
     // `zig build test -- --test-filter X` does not reach the test runner, so a
     // filtered run must go through this option instead.
@@ -213,6 +227,14 @@ pub fn build(b: *std.Build) void {
     web_test.step.dependOn(&web_install.step);
     b.step("web-test", "Build zpdf.wasm and test it in headless Chromium (web/)").dependOn(&web_test.step);
 
+    // Every test image drawn by zpdf-image, rendered by MuPDF and compared with pypng and Pillow
+    // (tools/image-oracle.py). Needs uv and mutool on PATH.
+    const image_test = b.addSystemCommand(&.{ "uv", "run", "tools/image-oracle.py", "--exe" });
+    image_test.addFileArg(image_exe.getEmittedBin());
+    image_test.setCwd(b.path("."));
+    image_test.has_side_effects = true;
+    b.step("image-test", "Draw every test image with zpdf, render it with MuPDF, and compare it with pypng and Pillow").dependOn(&image_test.step);
+
     b.installArtifact(native);
     const abi_step = b.step("abi", "Install libzpdf, include/zpdf.h and csharp/Zpdf.Abi.g.cs");
     abi_step.dependOn(&b.addInstallArtifact(native, .{}).step);
@@ -251,6 +273,7 @@ pub fn build(b: *std.Build) void {
     const abi_test = b.addRunArtifact(b.addExecutable(.{ .name = "abi-test", .root_module = abi_test_mod }));
     abi_test.addFileArg(harfbuzz.path("test/subset/data/fonts/Roboto-Regular.ttf"));
     abi_test.addFileArg(b.path("tests/read/objstm.pdf"));
+    abi_test.addFileArg(b.path("tests/images/exif/orient-6.jpg"));
     abi_test.expectStdOutEqual("abi-test: ok\n");
     test_step.dependOn(&abi_test.step);
 

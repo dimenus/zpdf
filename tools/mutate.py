@@ -6,7 +6,7 @@
     uv run tools/mutate.py <mutants.json> [index ...]
 
 mutants.json is a list of [path, old, new, step]: `old` must occur exactly once in `path`; it is
-replaced by `new`, `zig build <step>` runs (step "test", "web-test" or "dotnet-test"), and the file is restored,
+replaced by `new`, `zig build <step>` runs (step "test", "web-test", "image-test" or "dotnet-test"), and the file is restored,
 also when the run is interrupted. Write mutants that compile: a mutant that does not is reported
 as COMPILE ERROR and proves nothing.
 
@@ -60,11 +60,14 @@ def main():
                 continue
             out = p.stdout + p.stderr
             lines = out.splitlines()
-            # A failing test: Zig's test runner, xunit's "<test> [FAIL]" (dotnet-test), or a check
-            # program that ran and failed ("run exe check-exports failure" in the build summary). A
-            # mutant can fail one of these and also break a build elsewhere; the check names the kill.
+            # A failing test: Zig's test runner, xunit's "<test> [FAIL]" (dotnet-test), bun's
+            # "(fail) <test>" (web-test), a check program that ran and failed ("run exe
+            # check-exports failure" in the build summary), or tools/image-oracle.py's
+            # "FAIL <image>: ..." (image-test). A mutant can fail one of these
+            # and also break a build elsewhere; the check names the kill.
             named = next((l.strip() for l in lines if re.match(r"error: '.*' (failed|terminated)", l)
-                          or l.rstrip().endswith("[FAIL]") or re.search(r"run exe \S+ failure$", l.rstrip())), "")
+                          or l.rstrip().endswith("[FAIL]") or re.search(r"run exe \S+ failure$", l.rstrip())
+                          or l.startswith("FAIL ") or l.startswith("(fail) ")), "")
             if p.returncode == 0:
                 verdict, why = "SURVIVED", ""
             elif named:
