@@ -45,6 +45,7 @@ test {
     _ = image;
     _ = block_cache;
     _ = @import("read_text.zig");
+    _ = @import("crypt.zig");
 }
 
 pub const Direction = enum(u32) {

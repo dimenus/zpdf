@@ -36,8 +36,9 @@ public sealed unsafe class PdfReader : IDisposable
         PageCount = pageCount;
     }
 
-    /// <summary>Opens <paramref name="pdf"/>. Throws <see cref="ZpdfException"/> for a file zpdf
-    /// cannot read: <c>Encrypted</c>, <c>Malformed</c> and others.</summary>
+    /// <summary>Opens <paramref name="pdf"/>. An encrypted file opens when it needs no password,
+    /// as most do. Throws <see cref="ZpdfException"/> for a file zpdf cannot read:
+    /// <c>PasswordRequired</c>, <c>UnsupportedEncryption</c>, <c>Malformed</c> and others.</summary>
     public static PdfReader Open(ReadOnlySpan<byte> pdf)
     {
         var context = ContextHandle.Create();

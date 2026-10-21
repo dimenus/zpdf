@@ -18,7 +18,9 @@ Writing:
 
 Reading:
 - Page count, page boxes and rotation, and the text each page draws as positioned runs, one page
-  at a time. Encrypted files are refused.
+  at a time. Encrypted files open when they need no password, as most do (RC4 and AES, every
+  revision of the standard security handler). One that needs a password is refused, except in
+  Zig, where the reader takes one.
 
 It's early (0.x). The C ABI has a version number, and it changes whenever the ABI does.
 

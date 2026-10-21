@@ -71,12 +71,12 @@ const is_wasm = builtin.target.cpu.arch == .wasm32;
 
 /// Changes when an export, a wire record or an error code changes. A caller checks it once,
 /// when it loads the library.
-pub const abi_version: u32 = 5;
+pub const abi_version: u32 = 6;
 
 /// The hash of the ABI that abi_version names (surfaceHash). The test "exports: the ABI surface
 /// is the one abi_version names" fails when they differ: then bump abi_version and set this to
 /// the hash the test prints.
-const abi_surface: u64 = 0x4559c9c3ffe66c10;
+const abi_surface: u64 = 0xc01e9426ace41576;
 
 comptime {
     // The records are written with their in-memory bytes; every target zpdf builds for
@@ -950,7 +950,7 @@ pub const error_codes = [_]struct { anyerror, i32 }{
     .{ error.LaterDrawn, -24 },
     .{ error.LaterNotDrawn, -25 },
     .{ error.Malformed, -26 },
-    .{ error.Encrypted, -27 },
+    .{ error.PasswordRequired, -27 },
     .{ error.UnsupportedFilter, -28 },
     .{ error.UnsupportedFont, -29 },
     .{ error.TooDeep, -30 },
@@ -962,6 +962,7 @@ pub const error_codes = [_]struct { anyerror, i32 }{
     .{ error.NotEmbedded, -36 },
     .{ error.InvalidImage, -37 },
     .{ error.UnsupportedImage, -38 },
+    .{ error.UnsupportedEncryption, -39 },
 };
 pub const unknown_code: i32 = -127;
 
@@ -1515,8 +1516,10 @@ pub const exports = struct {
         return 0;
     }
 
-    /// Opens a PDF to read (zpdf.read.Reader, default limits). The bytes are copied. Refuses
-    /// an encrypted file (Encrypted) and a file it cannot parse (Malformed and the others).
+    /// Opens a PDF to read (zpdf.read.Reader, default limits). The bytes are copied. An encrypted
+    /// file opens when its user password is empty, as most are; one that needs a password is
+    /// PasswordRequired, one with an encryption zpdf does not read UnsupportedEncryption, and a
+    /// file it cannot parse Malformed and the others.
     pub fn zpdf_reader_open(ctx: ?*Context, bytes: ?[*]const u8, len: usize, out: ?*u32) callconv(.c) i32 {
         const o = output(u32, out) catch |err| return mapError(err);
         const pdf = input(bytes, len) catch |err| return mapError(err);

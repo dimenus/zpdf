@@ -24,6 +24,10 @@ public sealed class ReaderTests
     [InlineData("base.pdf")]
     [InlineData("objstm.pdf")]
     [InlineData("linear.pdf")]
+    // Encrypted with an empty user password: RC4 40-bit, AES-128 with object streams, AES-256.
+    [InlineData("encrypted/rc4-40.pdf")]
+    [InlineData("encrypted/aes-128.pdf")]
+    [InlineData("encrypted/aes-256.pdf")]
     public void Each_file_shape_reads_the_pages_and_text_the_fixture_drew(string file)
     {
         using var reader = PdfReader.Open(Fixture(file));
@@ -78,7 +82,7 @@ public sealed class ReaderTests
     [Fact]
     public void A_file_zpdf_cannot_read_throws_with_zpdfs_name_for_it()
     {
-        Assert.Equal("Encrypted", Assert.Throws<ZpdfException>(() => PdfReader.Open(Fixture("encrypted.pdf"))).ErrorName);
+        Assert.Equal("PasswordRequired", Assert.Throws<ZpdfException>(() => PdfReader.Open(Fixture("encrypted.pdf"))).ErrorName);
         Assert.Equal("Malformed", Assert.Throws<ZpdfException>(() => PdfReader.Open("not a pdf"u8)).ErrorName);
     }
 

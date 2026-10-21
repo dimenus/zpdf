@@ -5,7 +5,7 @@ namespace Zpdf;
 /// <summary>A zpdf call failed.</summary>
 /// <remarks>
 /// <see cref="ErrorName"/> is zpdf's name for the failure, such as <c>Malformed</c>,
-/// <c>Encrypted</c>, <c>UnsupportedFilter</c> or <c>InvalidPage</c>; <see cref="Code"/> is its
+/// <c>PasswordRequired</c>, <c>UnsupportedFilter</c> or <c>InvalidPage</c>; <see cref="Code"/> is its
 /// number in zpdf's C ABI.
 /// </remarks>
 public sealed class ZpdfException : Exception

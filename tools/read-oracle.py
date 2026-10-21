@@ -199,7 +199,7 @@ def check(path, verbose):
     mu, mu_damaged = mutool_pages(path)
     pm, pm_err = pdfminer_pages(path)
     if "error" in z:
-        allowed = z["error"] == "Encrypted" or (z["error"] == "Malformed" and mu_damaged)
+        allowed = z["error"] in ("PasswordRequired", "UnsupportedEncryption") or (z["error"] == "Malformed" and mu_damaged)
         res[f"refused {z['error']}" + (" (by design or damaged)" if allowed else " FAIL")] += 1
         return res, notes
     if pm_err:
