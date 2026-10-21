@@ -17,7 +17,8 @@
 # large blocks.
 #
 # The canary. Before the suite, tools/valgrind-canary.zig, built the same way, reads uninitialised
-# memory on the heap and on the stack on purpose, and the run fails unless valgrind reports both.
+# memory on purpose: on the heap, on the stack, in a large block libzpdf's block cache hands out
+# again, and in a block a libzpdf context allocates. The run fails unless valgrind reports all four.
 # Without it a build in which valgrind cannot see uninitialised memory passes clean: Zig's
 # self-hosted x86_64 backend was one, and the heap read went unreported (2026-10-21).
 #
@@ -91,16 +92,16 @@ fi
 log="$(mktemp -t zpdf-valgrind.XXXXXX)"
 trap 'rm -f "$log"' EXIT
 
-echo "== canary: valgrind must report the planted heap and stack reads"
+echo "== canary: valgrind must report the planted heap, stack, reused-block and context reads"
 run_valgrind --suppressions=tools/valgrind.supp "./$canary" > "$log" 2>&1 || true
-for fn in canaryHeapRead canaryStackRead; do
+for fn in canaryHeapRead canaryStackRead canaryReusedBlockRead canaryContextRead; do
   if ! grep -A1 'depends on uninitialised' "$log" | grep -q "$fn"; then
     cat "$log" >&2
     echo "FATAL: valgrind did not report the uninitialised read in $fn, so a clean run below would prove nothing." >&2
     exit 1
   fi
 done
-echo "canary: both reads reported"
+echo "canary: all four reads reported"
 
 echo "== valgrind (memcheck, error-exitcode=97)"
 vg_status=0
@@ -136,13 +137,13 @@ if [ "$vg_status" -ne 0 ]; then
   exit 1
 fi
 
-# libzpdf as it ships (ReleaseSafe, a shared library on glibc, its malloc replaced by valgrind's),
-# called by tests/abi/abi-test.c from several threads, through the same bundle another machine runs
-# (tools/valgrind-abi-bundle.sh). The test binary above cannot stand in for it: it is a static
-# Debug build, compiled differently, on one thread. A report that only this run made is in the git
-# log (2026-10-16, read_text's run start). The bundle runs in a Debian container, because valgrind
-# needs debug symbols for the system's glibc; on a Linux machine with no usable Docker it is not run,
-# and the last line says so.
+# libzpdf as it ships (ReleaseSafe, a shared library with no libc), called by tests/abi/abi-test.c
+# from several threads, on glibc and on musl, through the same bundle another machine runs
+# (tools/valgrind-abi-bundle.sh, which has its own canary). The test binary above cannot stand in
+# for it: it is a static Debug build, compiled differently, on one thread. A report that only this
+# run made is in the git log (2026-10-16, read_text's run start). The bundle runs in containers,
+# because valgrind needs debug symbols for the container's ld.so; on a Linux machine with no usable
+# Docker it is not run, and the last line says so.
 if [ "$mode" = docker ] || docker info >/dev/null 2>&1; then
   "$here/tools/valgrind-abi-bundle.sh" "$arch" "$here/$out/abi"
   "$here/$out/abi/run.sh"

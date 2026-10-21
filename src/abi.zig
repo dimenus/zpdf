@@ -63,6 +63,8 @@ const builtin = @import("builtin");
 const zpdf = @import("root.zig");
 const sfnt = @import("sfnt.zig");
 const text_layout = @import("text_layout.zig");
+const BlockCache = @import("block_cache.zig").BlockCache;
+const Counting = @import("counting.zig").Counting;
 const abi_options = @import("abi_options");
 
 const is_wasm = builtin.target.cpu.arch == .wasm32;
@@ -224,57 +226,6 @@ comptime {
 fn putRecord(out: []u8, at: usize, record: anytype) void {
     @memcpy(out[at..][0..@sizeOf(@TypeOf(record))], std.mem.asBytes(&record));
 }
-
-/// Counts the bytes an allocator has handed out and not taken back, so a test can
-/// see that closing everything returns to where it started. Counts the requested
-/// length; a resize or remap that succeeds moves the count by the difference.
-pub const Counting = struct {
-    child: std.mem.Allocator,
-    live: usize = 0,
-    /// The most `live` has been since it was last set; a test sets it to `live` to measure one
-    /// step's own peak.
-    peak: usize = 0,
-
-    fn grew(self: *Counting) void {
-        self.peak = @max(self.peak, self.live);
-    }
-
-    pub fn allocator(self: *Counting) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
-
-    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const self: *Counting = @ptrCast(@alignCast(ctx));
-        const p = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
-        self.live += len;
-        self.grew();
-        return p;
-    }
-
-    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        const self: *Counting = @ptrCast(@alignCast(ctx));
-        if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
-        self.live = self.live - memory.len + new_len;
-        self.grew();
-        return true;
-    }
-
-    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const self: *Counting = @ptrCast(@alignCast(ctx));
-        const p = self.child.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
-        self.live = self.live - memory.len + new_len;
-        self.grew();
-        return p;
-    }
-
-    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        const self: *Counting = @ptrCast(@alignCast(ctx));
-        self.child.rawFree(memory, alignment, ret_addr);
-        self.live -= memory.len;
-    }
-};
 
 const slot_bits = 10;
 const slot_count = 1 << slot_bits;
@@ -875,9 +826,12 @@ pub const Runtime = struct {
     pub fn readerPageText(rt: *Runtime, handle: u32, index: u32) ![]u8 {
         const r = try rt.reader(handle);
         if (index >= r.reader.pageCount()) return error.InvalidPage;
-        var text = try r.reader.pageText(rt.gpa, index);
-        defer text.deinit();
-        return encodePageText(rt.gpa, &text);
+        // Encoded straight from the reader's work memory: copying the runs into a PageText first
+        // took many allocations of 64 KiB or more a page, each a system call under an allocator
+        // that maps large blocks directly (std.heap.smp_allocator).
+        const page_runs = try r.reader.pageRuns(index);
+        defer r.reader.endPageRuns();
+        return encodePageText(rt.gpa, page_runs.runs, page_runs.unplaced_actual_text);
     }
 
     /// Closes every open handle (documents first, so their fonts are released).
@@ -900,15 +854,15 @@ pub const Runtime = struct {
 
 /// The wire form of zpdf_reader_page_text (TextHeader says it), owned by `gpa`. Each font name
 /// is in the strings area once.
-pub fn encodePageText(gpa: std.mem.Allocator, text: *const zpdf.read.PageText) ![]u8 {
+pub fn encodePageText(gpa: std.mem.Allocator, runs: []const zpdf.read.TextRun, unplaced_actual_text: u32) ![]u8 {
     var scratch: std.heap.ArenaAllocator = .init(gpa);
     defer scratch.deinit();
     const arena = scratch.allocator();
     var strings: std.ArrayList(u8) = .empty;
     var font_at: std.StringHashMapUnmanaged(u32) = .empty;
-    const run_at = try arena.alloc(struct { text: u32, font: u32 }, text.runs.len);
+    const run_at = try arena.alloc(struct { text: u32, font: u32 }, runs.len);
     var glyph_count: usize = 0;
-    for (text.runs, run_at) |run, *at| {
+    for (runs, run_at) |run, *at| {
         at.text = std.math.cast(u32, strings.items.len) orelse return error.TooLarge;
         try strings.appendSlice(arena, run.text);
         const font_entry = try font_at.getOrPut(arena, run.font);
@@ -920,18 +874,18 @@ pub fn encodePageText(gpa: std.mem.Allocator, text: *const zpdf.read.PageText) !
         glyph_count += run.glyphs.len;
     }
     const header: TextHeader = .{
-        .run_count = std.math.cast(u32, text.runs.len) orelse return error.TooLarge,
+        .run_count = std.math.cast(u32, runs.len) orelse return error.TooLarge,
         .glyph_count = std.math.cast(u32, glyph_count) orelse return error.TooLarge,
-        .unplaced_actual_text = text.unplaced_actual_text,
+        .unplaced_actual_text = unplaced_actual_text,
         .strings_len = std.math.cast(u32, strings.items.len) orelse return error.TooLarge,
     };
     const runs_start = @sizeOf(TextHeader);
-    const glyphs_start = runs_start + text.runs.len * @sizeOf(RunRecord);
+    const glyphs_start = runs_start + runs.len * @sizeOf(RunRecord);
     const strings_start = glyphs_start + glyph_count * @sizeOf(GlyphRecord);
     const out = try gpa.alloc(u8, strings_start + strings.items.len);
     putRecord(out, 0, header);
     var glyph: u32 = 0;
-    for (text.runs, run_at, 0..) |run, at, i| {
+    for (runs, run_at, 0..) |run, at, i| {
         putRecord(out, runs_start + i * @sizeOf(RunRecord), RunRecord{
             .x = run.x,
             .y = run.y,
@@ -1033,12 +987,19 @@ pub const Context = struct {
     busy: Busy,
     /// Allocates the context and its buffer records; not counted in live_bytes.
     base: std.mem.Allocator,
+    /// Native builds: freed large blocks kept for reuse, under `counting`, so live_bytes counts
+    /// only what is in use (block_cache.zig says why). wasm's allocator keeps them itself.
+    blocks: BlockCache,
     counting: Counting,
     rt: Runtime,
     /// Each buffer the caller holds, pointer to length.
     buffers: std.AutoHashMapUnmanaged(usize, usize),
 
     const magic_value: u32 = 0x4644505a;
+
+    /// The most freed large-block bytes a context keeps for reuse: several pages' output and work
+    /// blocks, with what is above given back.
+    const max_cached_block_bytes = 8 << 20;
 
     /// An atomic flag; a plain one where there is one thread (wasm32 has no atomics).
     const Busy = if (builtin.single_threaded) struct {
@@ -1062,7 +1023,8 @@ pub const Context = struct {
 
     pub fn create(base: std.mem.Allocator) !*Context {
         const c = try base.create(Context);
-        c.* = .{ .magic = magic_value, .busy = .{}, .base = base, .counting = .{ .child = base }, .rt = undefined, .buffers = .empty };
+        c.* = .{ .magic = magic_value, .busy = .{}, .base = base, .blocks = .init(base, max_cached_block_bytes), .counting = .{ .child = base }, .rt = undefined, .buffers = .empty };
+        if (!is_wasm) c.counting.child = c.blocks.allocator();
         c.rt = .{ .gpa = c.counting.allocator() };
         return c;
     }
@@ -1070,6 +1032,7 @@ pub const Context = struct {
     /// Closes every handle and frees the context. Buffers still out are not freed.
     pub fn destroy(c: *Context) void {
         c.rt.deinit();
+        c.blocks.deinit();
         c.buffers.deinit(c.base);
         c.magic = 0;
         c.base.destroy(c);
@@ -1163,8 +1126,14 @@ pub fn capturePanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
     @trap();
 }
 
-/// Where a new context's memory comes from.
-const base_allocator = if (is_wasm) std.heap.wasm_allocator else std.heap.c_allocator;
+/// Where a new context's memory comes from: the system's malloc where libzpdf links libc, and
+/// smp_allocator on Linux, where it links none (build.zig, nativeModule).
+const base_allocator = if (is_wasm)
+    std.heap.wasm_allocator
+else if (builtin.link_libc)
+    std.heap.c_allocator
+else
+    std.heap.smp_allocator;
 
 /// The exports both builds have. tools/gen-abi.zig writes zpdf.h and the C# declarations from
 /// these: each doc comment goes with its function.
@@ -2137,9 +2106,7 @@ test "encodePageText: an unknown width is NaN, flags and counts are kept, a font
         .{ .text = "ab", .x = 1, .y = 2, .size = 10, .width = null, .font = "F", .unmapped = 1, .glyphs = &glyphs_a, .actual_text = false },
         .{ .text = "c", .x = 5, .y = 6, .size = 12, .width = 7, .font = "F", .unmapped = 0, .glyphs = &glyphs_b, .actual_text = true },
     };
-    var text: zpdf.read.PageText = .{ .arena = .init(gpa), .runs = &runs, .unplaced_actual_text = 2 };
-    defer text.deinit();
-    const wire = try encodePageText(gpa, &text);
+    const wire = try encodePageText(gpa, &runs, 2);
     defer gpa.free(wire);
     const header = readRecord(TextHeader, wire, 0);
     try std.testing.expectEqual(TextHeader{ .run_count = 2, .glyph_count = 3, .unplaced_actual_text = 2, .strings_len = 4 }, header);
@@ -2239,6 +2206,9 @@ test "stream and free: a page's tokens are freed operator by operator" {
     // runs, so the page's peak grows by about its content (decoded once), not by its operands.
     // An array allocates its elements (a number or a keyword token allocates nothing, so `cm`
     // operators would not show this): 8 elements take several times the 22 bytes of content.
+    // The stream is unfiltered, so it is read where it lies in the file and only the tokens use
+    // work memory. The line of text at the end must come back: the parser ran through every
+    // operator, so a flat peak is the tokens being freed, not a page that was not read.
     const gpa = std.testing.allocator;
     var peaks: [2]usize = undefined;
     var sizes: [2]usize = undefined;
@@ -2246,26 +2216,103 @@ test "stream and free: a page's tokens are freed operator by operator" {
         var content: std.ArrayList(u8) = .empty;
         defer content.deinit(gpa);
         for (0..k) |_| try content.appendSlice(gpa, "[1 2 3 4 5 6 7 8] 0 d\n");
+        try content.appendSlice(gpa, "BT /F1 12 Tf 72 720 Td (the end) Tj ET\n");
         const stream = try std.fmt.allocPrint(gpa, "<< /Length {d} >>\nstream\n{s}\nendstream", .{ content.items.len, content.items });
         defer gpa.free(stream);
         const pdf = try zpdf.read.test_util.build(gpa, &.{
             "<< /Type /Catalog /Pages 2 0 R >>",
             "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
-            "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+            "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
             stream,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
         }, "");
         defer gpa.free(pdf);
         const c = try Context.create(gpa);
         defer c.destroy();
         const r = try c.rt.readerOpen(pdf);
-        c.counting.peak = c.counting.live;
+        // From the memory live before the page, not after it: the reader keeps up to
+        // max_retained_work of page work for the next page, so "after" is not "before".
+        const before = c.counting.live;
+        c.counting.peak = before;
         const wire = try c.rt.readerPageText(r, 0);
-        c.rt.gpa.free(wire);
-        peaks[n] = c.counting.peak - c.counting.live;
+        defer c.rt.gpa.free(wire);
+        try std.testing.expect(std.mem.indexOf(u8, wire, "the end") != null);
+        peaks[n] = c.counting.peak - before;
         sizes[n] = content.items.len;
     }
-    try std.testing.expect(peaks[1] > peaks[0]);
-    try std.testing.expect(peaks[1] - peaks[0] <= 4 * (sizes[1] - sizes[0]));
+    // Kept operands would grow the peak by several times the content; freed, it stays flat.
+    try std.testing.expect(peaks[1] <= peaks[0] + 4 * (sizes[1] - sizes[0]));
+}
+
+test "stream and free: after the first page, zpdf_reader_page_text asks the base allocator for no large block" {
+    // Pages of 600 runs, 6600 glyphs: their work and their text are each well over 64 KiB, and
+    // the work stays under max_retained_work (a page that needs more gets one more block a page,
+    // by design). The page text is encoded straight from the reader's work memory, and the output
+    // buffer the caller frees goes back to the context's block cache, so a caller that frees each
+    // page before the next makes no large request of the base allocator after the first page.
+    // Copying the runs into a PageText first took many such requests a page, and a fresh output
+    // buffer one more: an mmap each under std.heap.smp_allocator.
+    const gpa = std.testing.allocator;
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(gpa);
+    for (0..600) |i| try raw.print(gpa, "BT /F1 9 Tf 1 0 0 1 36 {d} Tm (Hello {d:0>5}) Tj ET\n", .{ 20 + i, i });
+    const stream = try std.fmt.allocPrint(gpa, "<< /Length {d} >>\nstream\n{s}\nendstream", .{ raw.items.len, raw.items });
+    defer gpa.free(stream);
+    const pdf = try zpdf.read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 6 0 R] /Count 4 /MediaBox [0 0 612 792] >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources << /Font << /F1 8 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources << /Font << /F1 8 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources << /Font << /F1 8 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 7 0 R /Resources << /Font << /F1 8 0 R >> >> >>",
+        stream,
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+    }, "");
+    defer gpa.free(pdf);
+    const Large = struct {
+        child: std.mem.Allocator,
+        count: usize = 0,
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (len >= 64 * 1024) self.count += 1;
+            return self.child.rawAlloc(len, a, ra);
+        }
+        // Not counted: growing in place under std.heap.smp_allocator either stays inside its
+        // pages or fails, with no system call (PageAllocator.realloc, may_move = false).
+        fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            return self.child.rawResize(m, a, n, ra);
+        }
+        fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (n > m.len and n >= 64 * 1024) self.count += 1;
+            return self.child.rawRemap(m, a, n, ra);
+        }
+        fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.child.rawFree(m, a, ra);
+        }
+    };
+    var large: Large = .{ .child = gpa };
+    const c = try Context.create(large.allocator());
+    defer c.destroy();
+    const r = try c.rt.readerOpen(pdf);
+    for (0..4) |i| {
+        if (i == 1) {
+            // The first page did need large blocks, so a zero below is the reuse.
+            try std.testing.expect(large.count > 1);
+            large.count = 0;
+        }
+        const wire = try c.rt.readerPageText(r, @intCast(i));
+        defer c.rt.gpa.free(wire);
+        try std.testing.expect(wire.len >= 64 * 1024);
+        try std.testing.expect(std.mem.indexOf(u8, wire, "Hello 00599") != null);
+    }
+    try std.testing.expectEqual(@as(usize, 0), large.count);
+    try c.rt.readerClose(r);
 }
 
 /// A test sink: keeps what it is given, fails after `fail_after` bytes, and can call zpdf from

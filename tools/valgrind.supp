@@ -1,7 +1,8 @@
-# Valgrind suppressions for tools/test-valgrind.sh. Each one names the exact
-# frames it hides and why the report is not a defect.
+# Valgrind suppressions for tools/test-valgrind.sh and the libzpdf bundle
+# (tools/valgrind-abi-bundle.sh). Each one names the exact frames it hides and why
+# the report is not a defect.
 
-# std 0.16 lib/std/compress/flate/Compress.zig, huffman.buildValues: for every
+# std 0.17 lib/std/compress/flate/Compress.zig, huffman.buildValues: for every
 # symbol it reads base[bits]. A symbol with bit length 0 has frequency 0 and
 # base[0] is never set, so its code is undefined; such a symbol is never
 # written. std says so there: "For `b == 0` this is fine since v is specified

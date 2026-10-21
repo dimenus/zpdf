@@ -44,6 +44,13 @@ pub const Options = struct {
     max_operations: u32 = 1 << 24,
     /// The most glyphs one pageText returns.
     max_page_glyphs: u32 = 1 << 22,
+    /// The bytes of page work (a page's decoded content streams, its glyph and text lists) the
+    /// reader keeps when a page ends, so the next page reuses them instead of asking its allocator
+    /// again. A page that needs more still gets it; what is above this is given back when it ends.
+    /// The reader's memory still follows one page: it holds at most this much beyond the page being
+    /// read. Without it, each page grew its working memory from nothing, which costs a system call
+    /// per large block under an allocator that maps them directly (std.heap.smp_allocator).
+    max_retained_work: usize = 1 << 20,
 };
 
 pub const Ref = struct { num: u32, gen: u16 };
@@ -116,6 +123,8 @@ const XrefEntry = union(enum) {
 
 pub const Reader = struct {
     arena_state: *std.heap.ArenaAllocator,
+    /// pageText's working memory, reset after each page down to options.max_retained_work.
+    work_state: *std.heap.ArenaAllocator,
     bytes: []const u8,
     options: Options,
     xref: std.AutoHashMapUnmanaged(u32, XrefEntry) = .empty,
@@ -136,7 +145,12 @@ pub const Reader = struct {
     pub fn open(gpa: Allocator, bytes: []const u8, options: Options) Error!Reader {
         const arena_state = try gpa.create(std.heap.ArenaAllocator);
         arena_state.* = .init(gpa);
-        var self: Reader = .{ .arena_state = arena_state, .bytes = bytes, .options = options };
+        const work_state = gpa.create(std.heap.ArenaAllocator) catch |err| {
+            gpa.destroy(arena_state);
+            return err;
+        };
+        work_state.* = .init(gpa);
+        var self: Reader = .{ .arena_state = arena_state, .work_state = work_state, .bytes = bytes, .options = options };
         errdefer self.deinit();
         try self.readXref();
         if (self.trailer.get("Encrypt") != null) return error.Encrypted;
@@ -148,6 +162,8 @@ pub const Reader = struct {
         const gpa = self.arena_state.child_allocator;
         self.arena_state.deinit();
         gpa.destroy(self.arena_state);
+        self.work_state.deinit();
+        gpa.destroy(self.work_state);
         self.* = undefined;
     }
 
@@ -164,6 +180,19 @@ pub const Reader = struct {
     /// its memory: call its deinit. Fonts are parsed once and kept by the reader.
     pub fn pageText(self: *Reader, gpa: Allocator, index: usize) Error!PageText {
         return read_text.pageText(self, gpa, index);
+    }
+
+    /// pageText without the copy: the runs, their text, glyphs and font names are in the
+    /// reader's work memory, valid until endPageRuns, the next pageRuns or pageText call, or
+    /// deinit. For a caller that encodes them at once (the C ABI). Call endPageRuns when done: it
+    /// gives the work memory back down to options.max_retained_work. The next page call does
+    /// that first anyway, so the reader never holds more than one page's work.
+    pub fn pageRuns(self: *Reader, index: usize) Error!read_text.PageRuns {
+        return read_text.pageRuns(self, index);
+    }
+
+    pub fn endPageRuns(self: *Reader) void {
+        read_text.endPageRuns(self);
     }
 
     pub fn pageCount(self: *const Reader) usize {
@@ -739,15 +768,21 @@ pub const Reader = struct {
     /// stream may be split anywhere between tokens, 7.8.2). Owned by the caller: free it with
     /// `allocator`. null when the page has no /Contents (a blank page).
     pub fn pageContents(self: *Reader, allocator: Allocator, p: Page) Error!?[]u8 {
-        // The content streams are read once, for this page: parsed into this arena and not
-        // cached, so reading every page does not grow the reader.
         var scratch: std.heap.ArenaAllocator = .init(self.arena_state.child_allocator);
         defer scratch.deinit();
-        const a = scratch.allocator();
+        const content = (try self.pageContentsIn(scratch.allocator(), p)) orelse return null;
+        return try allocator.dupe(u8, content);
+    }
+
+    /// pageContents, parsed, decoded and returned in the arena `a`; it may be a slice of the
+    /// file. The content streams are read once, for this page: parsed into `a` and not cached, so
+    /// reading every page does not grow the reader. read_text passes the reader's work arena,
+    /// which keeps its memory for the next page.
+    pub fn pageContentsIn(self: *Reader, a: Allocator, p: Page) Error!?[]const u8 {
         const contents = try self.resolveIn(p.dict.get("Contents") orelse return null, a);
         switch (contents) {
             .null => return null,
-            .stream => |s| return try allocator.dupe(u8, try self.decodeInto(a, s)),
+            .stream => |s| return try self.decodeInto(a, s),
             .array => |parts| {
                 var out: std.ArrayList(u8) = .empty;
                 for (parts) |part| {
@@ -758,7 +793,7 @@ pub const Reader = struct {
                     try out.appendSlice(a, try self.decodeInto(a, s));
                     try out.append(a, '\n');
                 }
-                return try allocator.dupe(u8, out.items);
+                return out.items;
             },
             else => return error.Malformed,
         }
