@@ -175,6 +175,11 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("tools/valgrind-canary.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{.{ .name = "block_cache", .module = b.createModule(.{
+                .root_source_file = b.path("src/block_cache.zig"),
+                .target = target,
+                .optimize = optimize,
+            }) }},
         }),
         .use_llvm = true,
     });

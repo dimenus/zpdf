@@ -17,7 +17,8 @@
 # large blocks.
 #
 # The canary. Before the suite, tools/valgrind-canary.zig, built the same way, reads uninitialised
-# memory on the heap and on the stack on purpose, and the run fails unless valgrind reports both.
+# memory on purpose: on the heap, on the stack, and in a large block libzpdf's block cache hands out
+# again. The run fails unless valgrind reports all three.
 # Without it a build in which valgrind cannot see uninitialised memory passes clean: Zig's
 # self-hosted x86_64 backend was one, and the heap read went unreported (2026-10-21).
 #
@@ -91,16 +92,16 @@ fi
 log="$(mktemp -t zpdf-valgrind.XXXXXX)"
 trap 'rm -f "$log"' EXIT
 
-echo "== canary: valgrind must report the planted heap and stack reads"
+echo "== canary: valgrind must report the planted heap, stack and reused-block reads"
 run_valgrind --suppressions=tools/valgrind.supp "./$canary" > "$log" 2>&1 || true
-for fn in canaryHeapRead canaryStackRead; do
+for fn in canaryHeapRead canaryStackRead canaryReusedBlockRead; do
   if ! grep -A1 'depends on uninitialised' "$log" | grep -q "$fn"; then
     cat "$log" >&2
     echo "FATAL: valgrind did not report the uninitialised read in $fn, so a clean run below would prove nothing." >&2
     exit 1
   fi
 done
-echo "canary: both reads reported"
+echo "canary: all three reads reported"
 
 echo "== valgrind (memcheck, error-exitcode=97)"
 vg_status=0

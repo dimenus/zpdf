@@ -14,6 +14,7 @@ pub const winansi = @import("winansi.zig");
 pub const read = @import("read.zig");
 pub const text_layout = @import("text_layout.zig");
 pub const image = @import("image.zig");
+pub const block_cache = @import("block_cache.zig");
 pub const Document = pdf.Document;
 pub const StandardFont = pdf.StandardFont;
 pub const Color = pdf.Color;
@@ -42,6 +43,7 @@ test {
     _ = read;
     _ = text_layout;
     _ = image;
+    _ = block_cache;
     _ = @import("read_text.zig");
 }
 

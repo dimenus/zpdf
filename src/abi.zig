@@ -63,6 +63,7 @@ const builtin = @import("builtin");
 const zpdf = @import("root.zig");
 const sfnt = @import("sfnt.zig");
 const text_layout = @import("text_layout.zig");
+const BlockCache = @import("block_cache.zig").BlockCache;
 const abi_options = @import("abi_options");
 
 const is_wasm = builtin.target.cpu.arch == .wasm32;
@@ -1036,12 +1037,19 @@ pub const Context = struct {
     busy: Busy,
     /// Allocates the context and its buffer records; not counted in live_bytes.
     base: std.mem.Allocator,
+    /// Native builds: freed large blocks kept for reuse, under `counting`, so live_bytes counts
+    /// only what is in use (block_cache.zig says why). wasm's allocator keeps them itself.
+    blocks: BlockCache,
     counting: Counting,
     rt: Runtime,
     /// Each buffer the caller holds, pointer to length.
     buffers: std.AutoHashMapUnmanaged(usize, usize),
 
     const magic_value: u32 = 0x4644505a;
+
+    /// The most freed large-block bytes a context keeps for reuse: several pages' output and work
+    /// blocks, with what is above given back.
+    const max_cached_block_bytes = 8 << 20;
 
     /// An atomic flag; a plain one where there is one thread (wasm32 has no atomics).
     const Busy = if (builtin.single_threaded) struct {
@@ -1065,7 +1073,8 @@ pub const Context = struct {
 
     pub fn create(base: std.mem.Allocator) !*Context {
         const c = try base.create(Context);
-        c.* = .{ .magic = magic_value, .busy = .{}, .base = base, .counting = .{ .child = base }, .rt = undefined, .buffers = .empty };
+        c.* = .{ .magic = magic_value, .busy = .{}, .base = base, .blocks = .init(base, max_cached_block_bytes), .counting = .{ .child = base }, .rt = undefined, .buffers = .empty };
+        if (!is_wasm) c.counting.child = c.blocks.allocator();
         c.rt = .{ .gpa = c.counting.allocator() };
         return c;
     }
@@ -1073,6 +1082,7 @@ pub const Context = struct {
     /// Closes every handle and frees the context. Buffers still out are not freed.
     pub fn destroy(c: *Context) void {
         c.rt.deinit();
+        c.blocks.deinit();
         c.buffers.deinit(c.base);
         c.magic = 0;
         c.base.destroy(c);
@@ -2278,12 +2288,14 @@ test "stream and free: a page's tokens are freed operator by operator" {
     try std.testing.expect(peaks[1] <= peaks[0] + 4 * (sizes[1] - sizes[0]));
 }
 
-test "stream and free: zpdf_reader_page_text asks for one large block a page, its output" {
+test "stream and free: after the first page, zpdf_reader_page_text asks the base allocator for no large block" {
     // Pages of 600 runs, 6600 glyphs: their work and their text are each well over 64 KiB, and
     // the work stays under max_retained_work (a page that needs more gets one more block a page,
-    // by design). The page text is encoded straight from the reader's work memory, so after the
-    // first page the only large block is the wire buffer the caller gets. Copying the runs into a
-    // PageText first took many such blocks a page, an mmap each under std.heap.smp_allocator.
+    // by design). The page text is encoded straight from the reader's work memory, and the output
+    // buffer the caller frees goes back to the context's block cache, so a caller that frees each
+    // page before the next makes no large request of the base allocator after the first page.
+    // Copying the runs into a PageText first took many such requests a page, and a fresh output
+    // buffer one more: an mmap each under std.heap.smp_allocator.
     const gpa = std.testing.allocator;
     var raw: std.ArrayList(u8) = .empty;
     defer raw.deinit(gpa);
@@ -2334,7 +2346,7 @@ test "stream and free: zpdf_reader_page_text asks for one large block a page, it
     const r = try c.rt.readerOpen(pdf);
     for (0..4) |i| {
         if (i == 1) {
-            // The first page needed more than its output, so the count below is the reuse.
+            // The first page did need large blocks, so a zero below is the reuse.
             try std.testing.expect(large.count > 1);
             large.count = 0;
         }
@@ -2343,7 +2355,7 @@ test "stream and free: zpdf_reader_page_text asks for one large block a page, it
         try std.testing.expect(wire.len >= 64 * 1024);
         try std.testing.expect(std.mem.indexOf(u8, wire, "Hello 00599") != null);
     }
-    try std.testing.expectEqual(@as(usize, 3), large.count);
+    try std.testing.expectEqual(@as(usize, 0), large.count);
     try c.rt.readerClose(r);
 }
 
