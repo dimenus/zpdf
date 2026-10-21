@@ -879,11 +879,11 @@ const GState = struct {
 
 const Interp = struct {
     r: *Reader,
-    /// The PageText's arena: only what the result keeps, copied at its size by `finish`, and
-    /// each font's name.
+    /// Where the runs' text and each font's name go. pageRuns passes the reader's work arena
+    /// for both this and `scratch`; pageText copies the runs out of it.
     out: Allocator,
-    /// The page's work: decoded streams, stacks, the runs as they are built. Freed when
-    /// pageText returns, so a PageText does not keep its page's work alive.
+    /// The page's work: decoded streams, stacks, the runs as they are built. Reset by the next
+    /// page or endPageRuns, so a PageText does not keep its page's work alive.
     scratch: Allocator,
     /// What each `run` makes its per-operator token arena from.
     gpa: Allocator,
@@ -1374,27 +1374,50 @@ fn skipInlineImage(lx: *read.Lexer, arena: Allocator, max_depth: u32) Error!void
     if (!(ei == .keyword and std.mem.eql(u8, ei.keyword, "EI"))) return error.Malformed;
 }
 
-/// Reader.pageText's work.
-pub fn pageText(r: *Reader, gpa: Allocator, index: usize) Error!PageText {
-    var result: PageText = .{ .arena = .init(gpa), .runs = &.{}, .unplaced_actual_text = 0 };
-    errdefer result.arena.deinit();
-    // The reader's work arena: what this page grows it to is kept for the next, up to
-    // max_retained_work (Options says why). Nothing returned points into it.
-    const work = r.work_state;
-    defer _ = work.reset(.{ .retain_with_limit = r.options.max_retained_work });
+/// A page's runs as Reader.pageRuns leaves them, in the reader's work memory.
+pub const PageRuns = struct {
+    runs: []const TextRun,
+    unplaced_actual_text: u32,
+};
+
+/// Reader.pageRuns's work.
+pub fn pageRuns(r: *Reader, index: usize) Error!PageRuns {
+    // A previous page's runs, if its caller did not end them, go first: the reader holds at most
+    // one page's work.
+    endPageRuns(r);
+    errdefer endPageRuns(r);
+    const work = r.work_state.allocator();
     const page = r.page(index);
-    var interp: Interp = .{ .r = r, .out = result.arena.allocator(), .scratch = work.allocator(), .gpa = gpa };
-    if (try r.pageContentsIn(interp.scratch, page)) |content| try interp.run(content, page.resources, 0);
-    // Each run's text and glyphs, out of the work arena at their size.
-    const out = interp.out;
-    const runs = try out.alloc(TextRun, interp.runs.items.len);
-    for (runs, interp.runs.items) |*o, run| {
+    var interp: Interp = .{ .r = r, .out = work, .scratch = work, .gpa = r.arena_state.child_allocator };
+    if (try r.pageContentsIn(work, page)) |content| try interp.run(content, page.resources, 0);
+    return .{ .runs = interp.runs.items, .unplaced_actual_text = interp.unplaced_actual_text };
+}
+
+/// Reader.endPageRuns's work: the work arena reset down to max_retained_work (Options says why).
+pub fn endPageRuns(r: *Reader) void {
+    _ = r.work_state.reset(.{ .retain_with_limit = r.options.max_retained_work });
+}
+
+/// Reader.pageText's work: pageRuns, copied out at their size into the result's arena.
+pub fn pageText(r: *Reader, gpa: Allocator, index: usize) Error!PageText {
+    const page_runs = try pageRuns(r, index);
+    defer endPageRuns(r);
+    var result: PageText = .{ .arena = .init(gpa), .runs = &.{}, .unplaced_actual_text = page_runs.unplaced_actual_text };
+    errdefer result.arena.deinit();
+    const out = result.arena.allocator();
+    const runs = try out.alloc(TextRun, page_runs.runs.len);
+    // All of a font's runs share one name slice (Interp.font_names), so it is copied once.
+    var names: std.AutoHashMapUnmanaged([*]const u8, []const u8) = .empty;
+    const work = r.work_state.allocator();
+    for (runs, page_runs.runs) |*o, run| {
         o.* = run;
         o.text = try out.dupe(u8, run.text);
         o.glyphs = try out.dupe(Glyph, run.glyphs);
+        const name = try names.getOrPut(work, run.font.ptr);
+        if (!name.found_existing) name.value_ptr.* = try out.dupe(u8, run.font);
+        o.font = name.value_ptr.*;
     }
     result.runs = runs;
-    result.unplaced_actual_text = interp.unplaced_actual_text;
     return result;
 }
 
@@ -2067,6 +2090,22 @@ test "the reader keeps at most max_retained_work of page work between pages" {
     }
 }
 
+test "pageRuns twice without endPageRuns holds one page's work, not two" {
+    const gpa = testing.allocator;
+    const pdf = try heavyPagesPdf(gpa, 2);
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    const first = try r.pageRuns(0);
+    try testing.expectEqualStrings("Hello", first.runs[0].text);
+    const one = r.work_state.queryCapacity();
+    // No endPageRuns: the next page ends the first itself.
+    const second = try r.pageRuns(1);
+    try testing.expectEqualStrings("Hello", second.runs[0].text);
+    try testing.expect(r.work_state.queryCapacity() < one + one / 2);
+    r.endPageRuns();
+}
+
 test "pages after the first ask the allocator for no large block" {
     // Each page needs more than 64 KiB of work. Before the reader kept its work arena, every page
     // grew a new one through several such blocks, a system call each under an allocator that maps
@@ -2082,9 +2121,10 @@ test "pages after the first ask the allocator for no large block" {
             if (len >= 64 * 1024) self.count += 1;
             return self.child.rawAlloc(len, a, ra);
         }
+        // Not counted: growing in place under std.heap.smp_allocator either stays inside its
+        // pages or fails, with no system call (PageAllocator.realloc, may_move = false).
         fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
             const self: *@This() = @ptrCast(@alignCast(ctx));
-            if (n > m.len and n >= 64 * 1024) self.count += 1;
             return self.child.rawResize(m, a, n, ra);
         }
         fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {

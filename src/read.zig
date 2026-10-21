@@ -182,6 +182,19 @@ pub const Reader = struct {
         return read_text.pageText(self, gpa, index);
     }
 
+    /// pageText without the copy: the runs, their text, glyphs and font names are in the
+    /// reader's work memory, valid until endPageRuns, the next pageRuns or pageText call, or
+    /// deinit. For a caller that encodes them at once (the C ABI). Call endPageRuns when done: it
+    /// gives the work memory back down to options.max_retained_work. The next page call does
+    /// that first anyway, so the reader never holds more than one page's work.
+    pub fn pageRuns(self: *Reader, index: usize) Error!read_text.PageRuns {
+        return read_text.pageRuns(self, index);
+    }
+
+    pub fn endPageRuns(self: *Reader) void {
+        read_text.endPageRuns(self);
+    }
+
     pub fn pageCount(self: *const Reader) usize {
         return self.pages.items.len;
     }
