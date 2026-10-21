@@ -65,6 +65,19 @@ def zpdf(path):
         return {"crash": f"exit {p.returncode}, no JSON", "stderr": p.stderr[-500:]}
 
 
+def xml_safe(text):
+    """mutool writes characters XML 1.0 forbids (control characters, surrogates) as numeric
+    references, which ElementTree refuses. Each becomes U+FFFD, so the text check still sees a
+    character there and reports a difference, instead of the file being skipped."""
+
+    def fix(m):
+        cp = int(m.group(1)[1:], 16) if m.group(1)[0] in "xX" else int(m.group(1))
+        ok = cp in (0x9, 0xA, 0xD) or 0x20 <= cp <= 0xD7FF or 0xE000 <= cp <= 0xFFFD or 0x10000 <= cp <= 0x10FFFF
+        return m.group(0) if ok else "&#xFFFD;"
+
+    return re.sub(r"&#([xX][0-9a-fA-F]+|[0-9]+);", fix, text)
+
+
 def mutool_pages(path):
     """(pages of (char, x, y) in device space, whether mutool reported damage), or (None, ...)
     when mutool cannot read the file."""
@@ -73,7 +86,7 @@ def mutool_pages(path):
     damaged = b"repair" in p.stderr or b"broken" in p.stderr
     if p.returncode != 0:
         return None, damaged
-    root = ET.fromstring(p.stdout.decode("utf-8", "replace"))
+    root = ET.fromstring(xml_safe(p.stdout.decode("utf-8", "replace")))
     pages = []
     for page in root.iter("page"):
         chars = []
