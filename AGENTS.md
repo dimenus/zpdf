@@ -10,13 +10,15 @@
 - `zig build test` includes `zig build golden`: zpdf-text's PDFs for `tests/golden/cases.tsv` must match
   `tests/golden/sha256.txt`. A failure prints each changed PDF's path. Never regenerate that file; a change
   you mean to make is a hand edit of its lines, explained in the commit.
-- On any change that touches memory, also run `tools/test-valgrind.sh` (Docker; uninitialised reads in
-  Zig and in kb's C). It must print `valgrind clean (N tests, and libzpdf under abi-test)`; do not read its status
-  through a pipe.
+- On any change that touches memory, also run `tools/test-valgrind.sh` (uninitialised reads in Zig and
+  in kb's C; Docker on macOS, the machine's own valgrind on Linux). It must print `valgrind clean (N
+  tests, and libzpdf under abi-test)`; on Linux with no usable Docker the line says the abi-test part
+  did NOT run. A canary must be reported first, or it fails. Do not read its status through a pipe.
 - libzpdf under valgrind on another Linux machine (x86_64, say): `tools/valgrind-abi-bundle.sh
   x86_64 <dir>`, copy `<dir>` there (`COPYFILE_DISABLE=1 tar`), and run `<dir>/run.sh`.
 - Linux x86_64 and Windows x64 without CI: `tools/test-platforms.sh linux <machine> <pane> windows
-  <machine> <pane>` runs `zig build test` and `dotnet-test` from HEAD on each machine, in a shell pane
+  <machine> <pane>` runs `zig build test` and `dotnet-test` (and, on Linux, `tools/test-valgrind.sh`)
+  from HEAD on each machine, in a shell pane
   that `herd-run` (on PATH, or `HERD_RUN`) can reach; it refuses a dirty tree. Run it before main moves.
 - kb_text_shape comes from the fork `dimenus/kb`, branch `fixes`, pinned by commit in `build.zig.zon`.
   A kb change is made and tested in the fork first; then the pin moves here.

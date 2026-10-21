@@ -163,13 +163,29 @@ pub fn build(b: *std.Build) void {
     const test_filters = b.option([]const []const u8, "test-filter", "Run only tests whose name contains this (repeatable)") orelse &.{};
     checkTestRoots(b);
     const tests = b.addTest(.{ .root_module = test_mod, .filters = test_filters });
-    // The test binary, installed but not run, so tools/test-valgrind.sh can
-    // cross-compile it (-Dtarget=aarch64-linux-musl) and run it on Linux.
-    const test_artifacts = b.step("test-artifacts", "Install the test binary to <prefix>/test without running it");
-    test_artifacts.dependOn(&b.addInstallArtifact(tests, .{ .dest_dir = .{ .override = .{ .custom = "test" } } }).step);
+    // The test binary, installed but not run, so tools/test-valgrind.sh can cross-compile it
+    // (-Dtarget=<arch>-linux-musl) and run it under valgrind on Linux. Always through LLVM: Zig's
+    // self-hosted x86_64 backend, the Debug default there, emits no valgrind marking for undefined
+    // memory, so valgrind saw no uninitialised heap read in its binary, while the same code built by
+    // LLVM was reported (2026-10-21). The valgrind canary is built the same way and run first.
+    const valgrind_tests = b.addTest(.{ .root_module = test_mod, .filters = test_filters, .use_llvm = true });
+    const valgrind_canary = b.addExecutable(.{
+        .name = "valgrind-canary",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/valgrind-canary.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+        .use_llvm = true,
+    });
+    const test_artifacts = b.step("test-artifacts", "Install the valgrind test binary and its canary to <prefix>/test without running them");
+    test_artifacts.dependOn(&b.addInstallArtifact(valgrind_tests, .{ .dest_dir = .{ .override = .{ .custom = "test" } } }).step);
+    test_artifacts.dependOn(&b.addInstallArtifact(valgrind_canary, .{ .dest_dir = .{ .override = .{ .custom = "test" } } }).step);
 
     const test_step = b.step("test", "Run unit tests, check formatting, and build for wasm32");
     test_step.dependOn(&b.addRunArtifact(tests).step);
+    // Compiled here too, so it cannot rot between valgrind runs.
+    test_step.dependOn(&valgrind_canary.step);
     test_step.dependOn(&text_exe.step);
 
     // bench-ab:begin (tools/bench-ab.py copies this block into an older tree that lacks it)
