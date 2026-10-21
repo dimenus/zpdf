@@ -1378,11 +1378,13 @@ fn skipInlineImage(lx: *read.Lexer, arena: Allocator, max_depth: u32) Error!void
 pub fn pageText(r: *Reader, gpa: Allocator, index: usize) Error!PageText {
     var result: PageText = .{ .arena = .init(gpa), .runs = &.{}, .unplaced_actual_text = 0 };
     errdefer result.arena.deinit();
-    var work: std.heap.ArenaAllocator = .init(gpa);
-    defer work.deinit();
+    // The reader's work arena: what this page grows it to is kept for the next, up to
+    // max_retained_work (Options says why). Nothing returned points into it.
+    const work = r.work_state;
+    defer _ = work.reset(.{ .retain_with_limit = r.options.max_retained_work });
     const page = r.page(index);
     var interp: Interp = .{ .r = r, .out = result.arena.allocator(), .scratch = work.allocator(), .gpa = gpa };
-    if (try r.pageContents(interp.scratch, page)) |content| try interp.run(content, page.resources, 0);
+    if (try r.pageContentsIn(interp.scratch, page)) |content| try interp.run(content, page.resources, 0);
     // Each run's text and glyphs, out of the work arena at their size.
     const out = interp.out;
     const runs = try out.alloc(TextRun, interp.runs.items.len);
@@ -2005,4 +2007,111 @@ test "CidTable: every CID reads as the source CMap does, in all five collections
         try testing.expect(mapped > 10_000);
         try testing.expectEqual(@as(?[]const u21, null), table.lookup(0x10000, &got_buf));
     }
+}
+
+/// Tests: a PDF of `pages` pages, each the 5000 dash-pattern operators of "a PageText holds its
+/// result" (about 110 KB of content) and one short line. The content is /ASCIIHexDecode, so each
+/// page decodes it into its work memory: an unfiltered stream is read where it lies in the file and
+/// would need no work memory for its content at all.
+fn heavyPagesPdf(gpa: Allocator, pages: usize) ![]u8 {
+    var raw: std.ArrayList(u8) = .empty;
+    defer raw.deinit(gpa);
+    for (0..5000) |_| try raw.appendSlice(gpa, "[1 2 3 4 5 6 7 8] 0 d\n");
+    try raw.appendSlice(gpa, "BT /F1 12 Tf 72 720 Td (Hello) Tj ET\n");
+    var content: std.ArrayList(u8) = .empty;
+    defer content.deinit(gpa);
+    for (raw.items) |byte| try content.print(gpa, "{x:0>2}", .{byte});
+    try content.append(gpa, '>');
+    var bodies: std.ArrayList([]const u8) = .empty;
+    defer {
+        for (bodies.items[2..]) |b| gpa.free(b);
+        bodies.deinit(gpa);
+    }
+    try bodies.append(gpa, "<< /Type /Catalog /Pages 2 0 R >>");
+    var kids: std.Io.Writer.Allocating = .init(gpa);
+    defer kids.deinit();
+    for (0..pages) |i| try kids.writer.print("{d} 0 R ", .{4 + 2 * i});
+    try bodies.append(gpa, "");
+    try bodies.append(gpa, try std.fmt.allocPrint(gpa, "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>", .{}));
+    for (0..pages) |i| {
+        try bodies.append(gpa, try std.fmt.allocPrint(gpa, "<< /Type /Page /Parent 2 0 R /Contents {d} 0 R /Resources << /Font << /F1 3 0 R >> >> >>", .{5 + 2 * i}));
+        try bodies.append(gpa, try std.fmt.allocPrint(gpa, "<< /Length {d} /Filter /ASCIIHexDecode >>\nstream\n{s}\nendstream", .{ content.items.len, content.items }));
+    }
+    const tree = try std.fmt.allocPrint(gpa, "<< /Type /Pages /Kids [{s}] /Count {d} /MediaBox [0 0 612 792] >>", .{ kids.written(), pages });
+    defer gpa.free(tree);
+    bodies.items[1] = tree;
+    return read.test_util.build(gpa, bodies.items, "");
+}
+
+test "the reader keeps at most max_retained_work of page work between pages" {
+    const gpa = testing.allocator;
+    const pdf = try heavyPagesPdf(gpa, 1);
+    defer gpa.free(pdf);
+    // The default keeps the page's work for the next page: more than a small block, so the
+    // limits below are tested against real kept memory, and no more than the limit.
+    {
+        var r = try Reader.open(gpa, pdf, .{});
+        defer r.deinit();
+        var pt = try r.pageText(gpa, 0);
+        pt.deinit();
+        const kept = r.work_state.queryCapacity();
+        try testing.expect(kept > 64 * 1024);
+        try testing.expect(kept <= (read.Options{}).max_retained_work);
+    }
+    for ([_]usize{ 0, 16 * 1024 }) |limit| {
+        var r = try Reader.open(gpa, pdf, .{ .max_retained_work = limit });
+        defer r.deinit();
+        var pt = try r.pageText(gpa, 0);
+        pt.deinit();
+        try testing.expect(r.work_state.queryCapacity() <= limit);
+    }
+}
+
+test "pages after the first ask the allocator for no large block" {
+    // Each page needs more than 64 KiB of work. Before the reader kept its work arena, every page
+    // grew a new one through several such blocks, a system call each under an allocator that maps
+    // them directly (std.heap.smp_allocator), and reading was measurably slower under it.
+    const Large = struct {
+        child: Allocator,
+        count: usize = 0,
+        fn allocator(self: *@This()) Allocator {
+            return .{ .ptr = self, .vtable = &.{ .alloc = alloc, .resize = resize, .remap = remap, .free = free } };
+        }
+        fn alloc(ctx: *anyopaque, len: usize, a: std.mem.Alignment, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (len >= 64 * 1024) self.count += 1;
+            return self.child.rawAlloc(len, a, ra);
+        }
+        fn resize(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) bool {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (n > m.len and n >= 64 * 1024) self.count += 1;
+            return self.child.rawResize(m, a, n, ra);
+        }
+        fn remap(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, n: usize, ra: usize) ?[*]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            if (n > m.len and n >= 64 * 1024) self.count += 1;
+            return self.child.rawRemap(m, a, n, ra);
+        }
+        fn free(ctx: *anyopaque, m: []u8, a: std.mem.Alignment, ra: usize) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.child.rawFree(m, a, ra);
+        }
+    };
+    const gpa = testing.allocator;
+    const pdf = try heavyPagesPdf(gpa, 6);
+    defer gpa.free(pdf);
+    var large: Large = .{ .child = gpa };
+    var r = try Reader.open(large.allocator(), pdf, .{});
+    defer r.deinit();
+    var first = try r.pageText(large.allocator(), 0);
+    first.deinit();
+    // The first page did need large blocks, so a zero below is the reuse, not a small page.
+    try testing.expect(large.count > 0);
+    large.count = 0;
+    for (1..6) |i| {
+        var pt = try r.pageText(large.allocator(), i);
+        defer pt.deinit();
+        try testing.expectEqualStrings("Hello", pt.runs[0].text);
+    }
+    try testing.expectEqual(@as(usize, 0), large.count);
 }

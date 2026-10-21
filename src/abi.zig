@@ -2239,6 +2239,9 @@ test "stream and free: a page's tokens are freed operator by operator" {
     // runs, so the page's peak grows by about its content (decoded once), not by its operands.
     // An array allocates its elements (a number or a keyword token allocates nothing, so `cm`
     // operators would not show this): 8 elements take several times the 22 bytes of content.
+    // The stream is unfiltered, so it is read where it lies in the file and only the tokens use
+    // work memory. The line of text at the end must come back: the parser ran through every
+    // operator, so a flat peak is the tokens being freed, not a page that was not read.
     const gpa = std.testing.allocator;
     var peaks: [2]usize = undefined;
     var sizes: [2]usize = undefined;
@@ -2246,26 +2249,32 @@ test "stream and free: a page's tokens are freed operator by operator" {
         var content: std.ArrayList(u8) = .empty;
         defer content.deinit(gpa);
         for (0..k) |_| try content.appendSlice(gpa, "[1 2 3 4 5 6 7 8] 0 d\n");
+        try content.appendSlice(gpa, "BT /F1 12 Tf 72 720 Td (the end) Tj ET\n");
         const stream = try std.fmt.allocPrint(gpa, "<< /Length {d} >>\nstream\n{s}\nendstream", .{ content.items.len, content.items });
         defer gpa.free(stream);
         const pdf = try zpdf.read.test_util.build(gpa, &.{
             "<< /Type /Catalog /Pages 2 0 R >>",
             "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
-            "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+            "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R >> >> >>",
             stream,
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
         }, "");
         defer gpa.free(pdf);
         const c = try Context.create(gpa);
         defer c.destroy();
         const r = try c.rt.readerOpen(pdf);
-        c.counting.peak = c.counting.live;
+        // From the memory live before the page, not after it: the reader keeps up to
+        // max_retained_work of page work for the next page, so "after" is not "before".
+        const before = c.counting.live;
+        c.counting.peak = before;
         const wire = try c.rt.readerPageText(r, 0);
-        c.rt.gpa.free(wire);
-        peaks[n] = c.counting.peak - c.counting.live;
+        defer c.rt.gpa.free(wire);
+        try std.testing.expect(std.mem.indexOf(u8, wire, "the end") != null);
+        peaks[n] = c.counting.peak - before;
         sizes[n] = content.items.len;
     }
-    try std.testing.expect(peaks[1] > peaks[0]);
-    try std.testing.expect(peaks[1] - peaks[0] <= 4 * (sizes[1] - sizes[0]));
+    // Kept operands would grow the peak by several times the content; freed, it stays flat.
+    try std.testing.expect(peaks[1] <= peaks[0] + 4 * (sizes[1] - sizes[0]));
 }
 
 /// A test sink: keeps what it is given, fails after `fail_after` bytes, and can call zpdf from
