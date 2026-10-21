@@ -80,7 +80,7 @@ run_in() {
     echo "FATAL: \$program did not finish in \$image (exit \$status); read above." >&2
     exit 1
   fi
-  reports="\$(grep -cE '^==[0-9]+== [A-Z]' "\$log" || true)"
+  reports="\$(grep -cE '==[0-9]+== [A-Z]' "\$log" || true)"
   if [ "\$reports" -gt 0 ] || [ "\$status" -ne 0 ]; then
     echo "FATAL: valgrind reported \$reports finding(s) in libzpdf in \$image (exit \$status); the full report is above." >&2
     exit 1

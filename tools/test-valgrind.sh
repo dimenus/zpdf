@@ -127,7 +127,8 @@ if [ "$missed" -ne 0 ]; then
   exit 1
 fi
 
-reports="$(grep -cE '^==[0-9]+== [A-Z]' "$log" || true)"
+# Not anchored: a report can start on the line the test runner left open ("4/4 name...==1== ...").
+reports="$(grep -cE '==[0-9]+== [A-Z]' "$log" || true)"
 if [ "$reports" -gt 0 ]; then
   echo "FATAL: valgrind reported $reports finding(s); the full report is above." >&2
   exit 1
