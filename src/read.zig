@@ -12,8 +12,19 @@
 //! and TIFF predictors), ASCIIHexDecode, ASCII85Decode. The page tree is walked from the
 //! catalog; /Count is not trusted, and /Resources, /MediaBox, /CropBox and /Rotate are inherited.
 //!
+//! Encrypted files (7.6): the standard security handler, RC4 and AES (src/crypt.zig says which
+//! revisions), opened with Options.password, which is empty unless given: the empty user password
+//! opens most encrypted files. Strings are decrypted when their object is loaded from the file,
+//! streams before their filters. Not decrypted, as the standard says: the encryption dictionary,
+//! cross-reference streams, the objects inside an object stream (the whole stream is), a /Metadata
+//! stream when /EncryptMetadata is false, a stream whose /Crypt filter is /Identity, and a
+//! signature's /Contents.
+//!
 //! What it refuses, with an error and never with a guess:
-//! - error.Encrypted: the trailer has /Encrypt.
+//! - error.PasswordRequired: the file is encrypted, and Options.password is neither its user nor
+//!   its owner password.
+//! - error.UnsupportedEncryption: an encryption handler or revision src/crypt.zig does not read,
+//!   or a crypt filter other than /Identity and /StdCF.
 //! - error.UnsupportedFilter: a stream it must decode uses another filter.
 //! - error.Malformed: anything else that does not follow the syntax, including a broken xref,
 //!   a stream whose /Length does not reach `endstream`, and a reference cycle. There is no repair
@@ -30,6 +41,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const read_text = @import("read_text.zig");
+const crypt = @import("crypt.zig");
 pub const TextRun = read_text.TextRun;
 pub const Glyph = read_text.Glyph;
 pub const PageText = read_text.PageText;
@@ -51,6 +63,9 @@ pub const Options = struct {
     /// read. Without it, each page grew its working memory from nothing, which costs a system call
     /// per large block under an allocator that maps them directly (std.heap.smp_allocator).
     max_retained_work: usize = 1 << 20,
+    /// The password for an encrypted file, UTF-8: tried as its user password, then as its owner
+    /// password. Empty opens the files viewers open without asking (src/crypt.zig).
+    password: []const u8 = "",
 };
 
 pub const Ref = struct { num: u32, gen: u16 };
@@ -95,11 +110,13 @@ pub const Dict = struct {
 
 pub const Stream = struct {
     dict: Dict,
-    /// The encoded bytes, a slice of the file.
+    /// The encoded bytes, a slice of the file; still encrypted in an encrypted file.
     raw: []const u8,
+    /// The object it is, whose number and generation its decryption key is made from.
+    ref: Ref,
 };
 
-pub const Error = error{ Malformed, Encrypted, UnsupportedFilter, UnsupportedFont, TooDeep, TooLarge, OutOfMemory };
+pub const Error = error{ Malformed, PasswordRequired, UnsupportedEncryption, UnsupportedFilter, UnsupportedFont, TooDeep, TooLarge, OutOfMemory };
 
 pub const Page = struct {
     /// The page dictionary, with inherited entries not merged in.
@@ -137,6 +154,11 @@ pub const Reader = struct {
     pages: std.ArrayList(Page) = .empty,
     /// Fonts read_text has parsed, by object number.
     fonts: std.AutoHashMapUnmanaged(u32, *read_text.Font) = .empty,
+    /// The security handler of an encrypted file, set once its password is checked.
+    crypt: ?crypt.Handler = null,
+    /// The encryption dictionary's object number, when it is an indirect object: its strings are
+    /// not encrypted.
+    encrypt_num: ?u32 = null,
 
     /// `offsets`: object number then offset, per index; `ends`: where each object's bytes stop
     /// (the next object's offset, or the end), so a value cannot run into the next one.
@@ -153,7 +175,7 @@ pub const Reader = struct {
         var self: Reader = .{ .arena_state = arena_state, .work_state = work_state, .bytes = bytes, .options = options };
         errdefer self.deinit();
         try self.readXref();
-        if (self.trailer.get("Encrypt") != null) return error.Encrypted;
+        try self.openEncryption();
         try self.readPages();
         return self;
     }
@@ -293,9 +315,10 @@ pub const Reader = struct {
 
     fn decodeFilters(self: *Reader, a: Allocator, stream: Stream) Error![]const u8 {
         const allocator = a;
-        const filters = (try self.getResolved(stream.dict, "Filter")) orelse return stream.raw;
+        const filter_obj = try self.getResolved(stream.dict, "Filter");
         const params = try self.getResolved(stream.dict, "DecodeParms");
-        var data = stream.raw;
+        var data = try self.decryptStream(a, stream, filter_obj, params);
+        const filters = filter_obj orelse return data;
         switch (filters) {
             .name => |n| data = try self.applyFilter(allocator, n, if (params) |p| p else .null, data),
             .array => |list| {
@@ -305,6 +328,8 @@ pub const Reader = struct {
                         .name => |n| n,
                         else => return error.Malformed,
                     };
+                    // A /Crypt filter comes first (7.4.10); decryptStream has applied it.
+                    if (i > 0 and std.mem.eql(u8, name, "Crypt")) return error.Malformed;
                     const p: Object = if (params) |ps| switch (ps) {
                         .array => |pa| if (i < pa.len) try self.resolve(pa[i]) else .null,
                         else => return error.Malformed,
@@ -325,7 +350,41 @@ pub const Reader = struct {
         }
         if (std.mem.eql(u8, name, "ASCIIHexDecode") or std.mem.eql(u8, name, "AHx")) return asciiHex(allocator, data, max);
         if (std.mem.eql(u8, name, "ASCII85Decode") or std.mem.eql(u8, name, "A85")) return ascii85(allocator, data, max);
+        if (std.mem.eql(u8, name, "Crypt")) return data;
         return error.UnsupportedFilter;
+    }
+
+    /// The stream's data decrypted (7.6.2), into `a`, or its raw bytes when the file is not
+    /// encrypted or the stream is not: a cross-reference stream, a /Metadata stream when
+    /// /EncryptMetadata is false, or one whose /Crypt filter is /Identity (7.4.10). A /Crypt
+    /// filter names its crypt filter in its /DecodeParms /Name: /Identity when absent, or /StdCF.
+    fn decryptStream(self: *Reader, a: Allocator, stream: Stream, filters: ?Object, params: ?Object) Error![]const u8 {
+        const h = self.crypt orelse return stream.raw;
+        if (nameIs(stream.dict.get("Type"), "XRef")) return stream.raw;
+        if (!h.encrypt_metadata and nameIs(stream.dict.get("Type"), "Metadata")) return stream.raw;
+        var method = h.stream_method;
+        const first: ?Object = if (filters) |f| switch (f) {
+            .name => f,
+            .array => |list| if (list.len > 0) try self.resolve(list[0]) else null,
+            else => null,
+        } else null;
+        if (first != null and nameIs(first, "Crypt")) {
+            const p: ?Object = if (params) |ps| switch (ps) {
+                .array => |pa| if (pa.len > 0) try self.resolve(pa[0]) else null,
+                else => ps,
+            } else null;
+            const name: Object = if (p) |pd| switch (pd) {
+                .dict => |d| (try self.getResolved(d, "Name")) orelse .{ .name = "Identity" },
+                .null => .{ .name = "Identity" },
+                else => return error.Malformed,
+            } else .{ .name = "Identity" };
+            if (nameIs(name, "Identity")) {
+                method = .none;
+            } else if (nameIs(name, "StdCF")) {
+                method = h.std_cf_method;
+            } else return error.UnsupportedEncryption;
+        }
+        return h.decrypt(a, method, stream.ref.num, stream.ref.gen, stream.raw);
     }
 
     /// FlateDecode's /Predictor (7.4.4.4): 1 none, 2 TIFF, 10 to 15 PNG (each row says its own).
@@ -399,6 +458,140 @@ pub const Reader = struct {
         };
     }
 
+    // ---- encryption ----
+
+    /// The trailer's /Encrypt read, and Options.password checked against it (src/crypt.zig). How
+    /// /Encrypt is read follows MuPDF's pdf_new_crypt where the standard leaves room: a /Length
+    /// under 40 is in bytes, not bits; a /CF entry's /Length is too; with no /CF, /StdCF is RC4;
+    /// R5 and R6 use AES-256 whatever /CFM says, unless it is /None.
+    fn openEncryption(self: *Reader) Error!void {
+        const enc_obj = self.trailer.get("Encrypt") orelse return;
+        if (enc_obj == .ref) {
+            // Never in an object stream (7.5.7): that stream would be read undecrypted.
+            const entry = self.xref.get(enc_obj.ref.num) orelse return error.Malformed;
+            if (entry == .compressed) return error.Malformed;
+            self.encrypt_num = enc_obj.ref.num;
+        }
+        const enc = switch (try self.resolve(enc_obj)) {
+            .dict => |d| d,
+            else => return error.Malformed,
+        };
+        if (!nameIs(try self.getResolved(enc, "Filter"), "Standard")) return error.UnsupportedEncryption;
+        const v = try self.intParam(enc, "V", 0);
+        const r = try self.intParam(enc, "R", -1);
+        if (r < 0) return error.Malformed;
+        // Before reading the rest, which differs by revision.
+        if (r < 2 or r > 6) return error.UnsupportedEncryption;
+        switch (v) {
+            1, 2, 4, 5 => {},
+            else => return error.UnsupportedEncryption,
+        }
+        var length: i64 = 40;
+        if (v == 2 or v == 4) length = try keyBits(try self.intParam(enc, "Length", 40));
+        var params: crypt.Params = .{
+            .v = v,
+            .r = r,
+            .length = length,
+            .o = try self.stringParam(enc, "O"),
+            .u = try self.stringParam(enc, "U"),
+            .oe = if (r >= 5) try self.stringParam(enc, "OE") else &.{},
+            .ue = if (r >= 5) try self.stringParam(enc, "UE") else &.{},
+            .p = try self.intParam(enc, "P", 0),
+            .id = try self.firstId(),
+            .encrypt_metadata = switch ((try self.getResolved(enc, "EncryptMetadata")) orelse Object{ .boolean = true }) {
+                .boolean => |b| b,
+                else => return error.Malformed,
+            },
+            .string_method = .rc4,
+            .stream_method = .rc4,
+            .std_cf_method = .rc4,
+        };
+        if (v == 4 or v == 5) {
+            const cf: ?Dict = switch ((try self.getResolved(enc, "CF")) orelse Object.null) {
+                .dict => |d| d,
+                .null => null,
+                else => return error.Malformed,
+            };
+            const stm = try self.cryptFilter(cf, try self.getResolved(enc, "StmF"), r, length);
+            const str = try self.cryptFilter(cf, try self.getResolved(enc, "StrF"), r, length);
+            const std_cf = try self.cryptFilter(cf, .{ .name = "StdCF" }, r, length);
+            params.stream_method = stm.method;
+            params.string_method = str.method;
+            params.std_cf_method = std_cf.method;
+            // The crypt filter gives the key length: the stream filter's, else the string's.
+            if (stm.method != .none) {
+                params.length = stm.length;
+            } else if (str.method != .none) params.length = str.length;
+        }
+        // The objects loaded so far were read undecrypted: the encryption dictionary and what it
+        // refers to, which are never decrypted, and a cross-reference stream's /Length, an integer.
+        // An object stream read so early (for a /Length inside one) would stay cached undecrypted:
+        // refused, not read wrong.
+        if (self.object_streams.count() != 0) return error.Malformed;
+        self.crypt = try crypt.Handler.authenticate(params, self.options.password);
+    }
+
+    /// The method and key length of the crypt filter `name` (/StmF or /StrF; /Identity when
+    /// absent), from /CF (7.6.6).
+    fn cryptFilter(self: *Reader, cf: ?Dict, name_obj: ?Object, r: i64, length: i64) Error!struct { method: crypt.Method, length: i64 } {
+        const name = name_obj orelse return .{ .method = .none, .length = length };
+        if (nameIs(name, "Identity")) return .{ .method = .none, .length = length };
+        if (!nameIs(name, "StdCF")) return error.UnsupportedEncryption;
+        const filters = cf orelse return .{ .method = .rc4, .length = length };
+        const entry = switch ((try self.getResolved(filters, "StdCF")) orelse return error.Malformed) {
+            .dict => |d| d,
+            else => return error.Malformed,
+        };
+        const cfm = (try self.getResolved(entry, "CFM")) orelse Object{ .name = "None" };
+        var method: crypt.Method = if (nameIs(cfm, "None"))
+            .none
+        else if (nameIs(cfm, "V2"))
+            .rc4
+        else if (nameIs(cfm, "AESV2"))
+            .aesv2
+        else if (nameIs(cfm, "AESV3"))
+            .aesv3
+        else
+            return error.UnsupportedEncryption;
+        if (r >= 5 and method != .none) method = .aesv3;
+        const default: i64 = switch (method) {
+            .aesv2 => 128,
+            .aesv3 => 256,
+            else => length,
+        };
+        const bits = try keyBits(try self.intParam(entry, "Length", default));
+        return .{ .method = method, .length = bits };
+    }
+
+    /// A key length in bits; under 40 it was given in bytes, as some writers do.
+    fn keyBits(n: i64) Error!i64 {
+        const bits = if (n < 40) n * 8 else n;
+        if (@mod(bits, 8) != 0) return error.Malformed;
+        return bits;
+    }
+
+    fn stringParam(self: *Reader, d: Dict, key: []const u8) Error![]const u8 {
+        return switch ((try self.getResolved(d, key)) orelse return error.Malformed) {
+            .string => |s| s,
+            else => error.Malformed,
+        };
+    }
+
+    /// The first string of the trailer's /ID, or empty when there is none (MuPDF reads such a
+    /// file with an empty one).
+    fn firstId(self: *Reader) Error![]const u8 {
+        const id = (try self.getResolved(self.trailer, "ID")) orelse return &.{};
+        const items = switch (id) {
+            .array => |a| a,
+            else => return error.Malformed,
+        };
+        if (items.len == 0) return &.{};
+        return switch (try self.resolve(items[0])) {
+            .string => |s| s,
+            else => error.Malformed,
+        };
+    }
+
     // ---- cross-reference data ----
 
     fn readXref(self: *Reader) Error!void {
@@ -455,12 +648,11 @@ pub const Reader = struct {
         const head = try parseIndirectHead(&lx, self.arena());
         var p: Parser = .{ .lx = &lx, .arena = self.arena(), .max_depth = self.options.max_depth };
         const value = try p.parseValue(0);
-        const stream = try self.finishObject(self.arena(), &lx, value);
+        const stream = try self.finishObject(self.arena(), &lx, value, head);
         const s = switch (stream) {
             .stream => |s| s,
             else => return error.Malformed,
         };
-        _ = head;
         if (!nameIs(s.dict.get("Type"), "XRef")) return error.Malformed;
         try self.readXrefStream(s);
         return s.dict;
@@ -597,20 +789,50 @@ pub const Reader = struct {
         if (head.num != num or head.gen != gen) return error.Malformed;
         var p: Parser = .{ .lx = &lx, .arena = a, .max_depth = self.options.max_depth };
         const value = try p.parseValue(0);
-        return self.finishObject(a, &lx, value);
+        const obj = try self.finishObject(a, &lx, value, head);
+        const h = self.crypt orelse return obj;
+        if (self.encrypt_num == num) return obj;
+        return self.decryptStrings(a, &h, obj, head);
+    }
+
+    /// `obj` with every string in it decrypted (7.6.2), into `a`; a stream's dictionary too, not
+    /// its data (decodeFilters does that). A signature's /Contents is not encrypted (7.6.2).
+    fn decryptStrings(self: *Reader, a: Allocator, h: *const crypt.Handler, obj: Object, ref: Ref) Error!Object {
+        switch (obj) {
+            .string => |s| return .{ .string = try h.decryptString(a, ref.num, ref.gen, s) },
+            .array => |items| {
+                const out = try a.alloc(Object, items.len);
+                for (out, items) |*o, item| o.* = try self.decryptStrings(a, h, item, ref);
+                return .{ .array = out };
+            },
+            .dict => |d| return .{ .dict = try self.decryptDict(a, h, d, ref) },
+            .stream => |st| return .{ .stream = .{ .dict = try self.decryptDict(a, h, st.dict, ref), .raw = st.raw, .ref = st.ref } },
+            else => return obj,
+        }
+    }
+
+    fn decryptDict(self: *Reader, a: Allocator, h: *const crypt.Handler, d: Dict, ref: Ref) Error!Dict {
+        // As MuPDF tells a signature: /Type /Sig with /Contents, /ByteRange and /Filter.
+        const signature = nameIs(d.get("Type"), "Sig") and d.get("Contents") != null and
+            d.get("ByteRange") != null and d.get("Filter") != null;
+        const out = try a.alloc(Dict.Entry, d.entries.len);
+        for (out, d.entries) |*o, e| {
+            o.* = .{ .key = e.key, .value = if (signature and std.mem.eql(u8, e.key, "Contents")) e.value else try self.decryptStrings(a, h, e.value, ref) };
+        }
+        return .{ .entries = out };
     }
 
     /// After an indirect object's value: its stream, when `stream` follows a dictionary, then
     /// `endobj`, which must be there (7.3.10): without it, a value can run into the next object.
-    fn finishObject(self: *Reader, a: Allocator, lx: *Lexer, value: Object) Error!Object {
-        const obj = try self.finishStream(a, lx, value);
+    fn finishObject(self: *Reader, a: Allocator, lx: *Lexer, value: Object, ref: Ref) Error!Object {
+        const obj = try self.finishStream(a, lx, value, ref);
         const end = try lx.next(a);
         if (!(end == .keyword and std.mem.eql(u8, end.keyword, "endobj"))) return error.Malformed;
         return obj;
     }
 
     /// `stream ... endstream` when it follows a dictionary.
-    fn finishStream(self: *Reader, a: Allocator, lx: *Lexer, value: Object) Error!Object {
+    fn finishStream(self: *Reader, a: Allocator, lx: *Lexer, value: Object, ref: Ref) Error!Object {
         const dict = switch (value) {
             .dict => |d| d,
             else => return value,
@@ -643,7 +865,7 @@ pub const Reader = struct {
         at += keyword.len;
         if (at < self.bytes.len and !isWhite(self.bytes[at]) and !isDelimiter(self.bytes[at])) return error.Malformed;
         lx.pos = at;
-        return .{ .stream = .{ .dict = dict, .raw = self.bytes[start..end] } };
+        return .{ .stream = .{ .dict = dict, .raw = self.bytes[start..end], .ref = ref } };
     }
 
     fn parseCompressed(self: *Reader, a: Allocator, num: u32, stream_num: u32, index: u32) Error!Object {
@@ -1277,10 +1499,212 @@ test "zpdf's file and qpdf's object-stream and linearized rewrites read as the s
     }
 }
 
-test "an encrypted file is refused, not read as garbage" {
-    const bytes = try loadFixture("encrypted.pdf");
-    defer testing.allocator.free(bytes);
-    try testing.expectError(error.Encrypted, Reader.open(testing.allocator, bytes, .{}));
+/// The /Registry string of the first font's CID font on page 1: a string in an indirect object
+/// (an object-stream object in some fixtures), which decryption must get right.
+fn cidRegistry(r: *Reader) ![]const u8 {
+    const fonts = switch ((try r.getResolved(r.page(0).resources, "Font")).?) {
+        .dict => |d| d,
+        else => return error.TestUnexpectedResult,
+    };
+    var registry: ?[]const u8 = null;
+    for (fonts.entries) |e| {
+        const font = switch (try r.resolve(e.value)) {
+            .dict => |d| d,
+            else => continue,
+        };
+        const descendants = (try r.getResolved(font, "DescendantFonts")) orelse continue;
+        const cid = switch (try r.resolve(descendants.array[0])) {
+            .dict => |d| d,
+            else => return error.TestUnexpectedResult,
+        };
+        const info = switch ((try r.getResolved(cid, "CIDSystemInfo")).?) {
+            .dict => |d| d,
+            else => return error.TestUnexpectedResult,
+        };
+        registry = switch ((try r.getResolved(info, "Registry")).?) {
+            .string => |s| s,
+            else => return error.TestUnexpectedResult,
+        };
+    }
+    return registry orelse error.TestUnexpectedResult;
+}
+
+test "every revision of the standard security handler, written by qpdf, reads as the file it encrypts" {
+    const gpa = testing.allocator;
+    const base_bytes = try loadFixture("base.pdf");
+    defer gpa.free(base_bytes);
+    var base = try Reader.open(gpa, base_bytes, .{});
+    defer base.deinit();
+    try testing.expectEqualStrings("Adobe", try cidRegistry(&base));
+    // name, the password to open it with, its revision.
+    const files = [_]struct { []const u8, []const u8, u8 }{
+        .{ "encrypted/rc4-40.pdf", "", 2 },
+        .{ "encrypted/rc4-128.pdf", "", 3 },
+        .{ "encrypted/rc4-128-v4.pdf", "", 4 },
+        .{ "encrypted/aes-128.pdf", "", 4 },
+        .{ "encrypted/aes-128-cleartext-metadata.pdf", "", 4 },
+        .{ "encrypted/aes-256-r5.pdf", "", 5 },
+        .{ "encrypted/aes-256.pdf", "", 6 },
+        // The owner password opens a file whose user password is empty, too (R2, R4 and R6).
+        .{ "encrypted/rc4-40.pdf", "owner", 2 },
+        .{ "encrypted/aes-128.pdf", "owner", 4 },
+        .{ "encrypted/aes-256.pdf", "owner", 6 },
+        .{ "encrypted/aes-128-empty-owner.pdf", "user", 4 },
+        .{ "encrypted/rc4-128-password.pdf", "user", 3 },
+        .{ "encrypted/rc4-128-password.pdf", "owner", 3 },
+        .{ "encrypted/aes-256-r5-password.pdf", "user", 5 },
+        .{ "encrypted/aes-256-r5-password.pdf", "owner", 5 },
+        .{ "encrypted.pdf", "user", 6 },
+        .{ "encrypted.pdf", "owner", 6 },
+    };
+    for (files) |f| {
+        const bytes = try loadFixture(f[0]);
+        defer gpa.free(bytes);
+        var r = Reader.open(gpa, bytes, .{ .password = f[1] }) catch |err| {
+            std.debug.print("{s} with \"{s}\": {t}\n", .{ f[0], f[1], err });
+            return err;
+        };
+        defer r.deinit();
+        try testing.expectEqual(f[2], r.crypt.?.revision);
+        try testing.expectEqual(@as(usize, 3), r.pageCount());
+        for (0..3) |i| {
+            const want = (try base.pageContents(gpa, base.page(i))).?;
+            defer gpa.free(want);
+            const got = (try r.pageContents(gpa, r.page(i))).?;
+            defer gpa.free(got);
+            try testing.expectEqualStrings(want, got);
+        }
+        try testing.expectEqualStrings("Adobe", try cidRegistry(&r));
+        var want_text = try base.pageText(gpa, 1);
+        defer want_text.deinit();
+        var got_text = try r.pageText(gpa, 1);
+        defer got_text.deinit();
+        try testing.expectEqual(want_text.runs.len, got_text.runs.len);
+        for (want_text.runs, got_text.runs) |w, g| try testing.expectEqualStrings(w.text, g.text);
+    }
+}
+
+test "not decrypted: clear metadata, a signature's /Contents, the encryption dictionary, an xref stream" {
+    const gpa = testing.allocator;
+    {
+        const bytes = try loadFixture("encrypted/aes-128-sig-metadata.pdf");
+        defer gpa.free(bytes);
+        var r = try Reader.open(gpa, bytes, .{});
+        defer r.deinit();
+        const catalog = (try r.resolve(r.trailerDict().get("Root").?)).dict;
+        const metadata = (try r.getResolved(catalog, "Metadata")).?.stream;
+        try testing.expectEqualStrings("<?xpacket begin=\"\"?><x:xmpmeta xmlns:x=\"adobe:ns:meta/\">zpdf metadata</x:xmpmeta>", try r.streamData(metadata));
+        const sig = (try r.getResolved(catalog, "ZpdfTestSig")).?.dict;
+        var contents: [48]u8 = undefined;
+        for (&contents, 1..) |*b, i| b.* = @intCast(i);
+        try testing.expectEqualSlices(u8, &contents, sig.get("Contents").?.string);
+        // The same dictionary's other strings are encrypted.
+        try testing.expectEqualStrings("zpdf signer", sig.get("Name").?.string);
+        // The encryption dictionary, loaded again: /O is the 32 bytes the file has.
+        const enc = (try r.object(r.encrypt_num.?)).dict;
+        try testing.expectEqual(@as(usize, 32), enc.get("O").?.string.len);
+    }
+    {
+        // A cross-reference stream, loaded as an object after decryption is set up, still decodes:
+        // its rows are whole.
+        const bytes = try loadFixture("encrypted/aes-256.pdf");
+        defer gpa.free(bytes);
+        var r = try Reader.open(gpa, bytes, .{});
+        defer r.deinit();
+        var lx: Lexer = .{ .src = bytes, .pos = try findStartXref(bytes) };
+        const head = try parseIndirectHead(&lx, r.arenaAllocator());
+        const xref = (try r.object(head.num)).stream;
+        try testing.expect(nameIs(xref.dict.get("Type"), "XRef"));
+        var row: usize = 0;
+        for (xref.dict.get("W").?.array) |w| row += @intCast(w.integer);
+        const data = try r.streamData(xref);
+        try testing.expect(data.len > 0 and data.len % row == 0);
+    }
+}
+
+test "a /Crypt filter: /Identity, named or by default, leaves the data as written" {
+    const gpa = testing.allocator;
+    const base = try loadFixture("encrypted/aes-128-cleartext-metadata.pdf");
+    defer gpa.free(base);
+    // The update's trailer repeats /Encrypt and /ID, as a writer's would.
+    var extra_buf: [256]u8 = undefined;
+    const extra = blk: {
+        var r = try Reader.open(gpa, base, .{});
+        defer r.deinit();
+        const enc = r.trailerDict().get("Encrypt").?.ref;
+        const id = try r.firstId();
+        break :blk try std.fmt.bufPrint(&extra_buf, "/Encrypt {d} {d} R /ID [<{x}> <{x}>] ", .{ enc.num, enc.gen, id, id });
+    };
+    const pdf = try appendUpdate(gpa, base, &.{
+        .{ .num = 20, .body = "<< /Length 14 /Filter /Crypt /DecodeParms << /Name /Identity >> >>\nstream\nplain identity\nendstream" },
+        .{ .num = 21, .body = "<< /Length 11 /Filter [/Crypt /ASCIIHexDecode] /DecodeParms [<< /Name /Identity >> null] >>\nstream\n706c61696e>\nendstream" },
+        .{ .num = 22, .body = "<< /Length 7 /Filter /Crypt >>\nstream\ndefault\nendstream" },
+        .{ .num = 23, .body = "<< /Length 4 /Filter /Crypt /DecodeParms << /Name /Mine >> >>\nstream\nmine\nendstream" },
+        .{ .num = 24, .body = "<< /Length 5 /Filter [/ASCIIHexDecode /Crypt] >>\nstream\n6869>\nendstream" },
+    }, 25, extra);
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    try testing.expect(r.crypt != null);
+    try testing.expectEqualStrings("plain identity", try r.streamData((try r.object(20)).stream));
+    try testing.expectEqualStrings("plain", try r.streamData((try r.object(21)).stream));
+    try testing.expectEqualStrings("default", try r.streamData((try r.object(22)).stream));
+    // A crypt filter that is not /Identity or /StdCF, and /Crypt after another filter (7.4.10).
+    try testing.expectError(error.UnsupportedEncryption, r.streamData((try r.object(23)).stream));
+    try testing.expectError(error.Malformed, r.streamData((try r.object(24)).stream));
+    // The page content, through /StdCF (the file's stream method), still reads.
+    const content = (try r.pageContents(gpa, r.page(0))).?;
+    gpa.free(content);
+
+    // In a file that is not encrypted, /Crypt /Identity is accepted, and only as the first filter:
+    // above, the stream after another filter would fail as AES data anyway.
+    const plain = try buildPdf(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [] /Count 0 >>",
+        "<< /Length 5 /Filter [/Crypt /ASCIIHexDecode] >>\nstream\n6869>\nendstream",
+        "<< /Length 5 /Filter [/ASCIIHexDecode /Crypt] >>\nstream\n6869>\nendstream",
+    }, "");
+    defer gpa.free(plain);
+    var p = try Reader.open(gpa, plain, .{});
+    defer p.deinit();
+    try testing.expectEqualStrings("hi", try p.streamData((try p.object(3)).stream));
+    try testing.expectError(error.Malformed, p.streamData((try p.object(4)).stream));
+}
+
+test "a file with a user password needs it, or its owner password; a wrong one is PasswordRequired" {
+    const gpa = testing.allocator;
+    // aes-128-empty-owner.pdf: its owner password is empty, which must not open it (as in Acrobat
+    // and MuPDF), so "" is refused like any other wrong password.
+    for ([_][]const u8{ "encrypted.pdf", "encrypted/rc4-128-password.pdf", "encrypted/aes-256-r5-password.pdf", "encrypted/aes-128-empty-owner.pdf" }) |name| {
+        const bytes = try loadFixture(name);
+        defer gpa.free(bytes);
+        for ([_][]const u8{ "", "wrong", "use", "users", "owne" }) |pw| {
+            try testing.expectError(error.PasswordRequired, Reader.open(gpa, bytes, .{ .password = pw }));
+        }
+    }
+}
+
+test "an encryption handler or crypt filter it does not read is UnsupportedEncryption" {
+    const gpa = testing.allocator;
+    const pages = "<< /Type /Pages /Kids [] /Count 0 >>";
+    const o = "<" ++ "0000000000000000000000000000000000000000000000000000000000000000" ++ ">";
+    const cases = [_][]const u8{
+        // Public-key security.
+        "/Encrypt << /Filter /Adobe.PubSec /V 4 /R 4 >> /ID [<00> <00>] ",
+        // A revision past 6.
+        "/Encrypt << /Filter /Standard /V 5 /R 7 /O " ++ o ++ " /U " ++ o ++ " /P -4 >> /ID [<00> <00>] ",
+        // V 3, which was never published.
+        "/Encrypt << /Filter /Standard /V 3 /R 3 /O " ++ o ++ " /U " ++ o ++ " /P -4 >> /ID [<00> <00>] ",
+        // A crypt filter that is neither /Identity nor /StdCF.
+        "/Encrypt << /Filter /Standard /V 4 /R 4 /O " ++ o ++ " /U " ++ o ++ " /P -4 /CF << /Mine << /CFM /AESV2 >> >> /StmF /Mine /StrF /Mine >> /ID [<00> <00>] ",
+        // A crypt filter method it does not know.
+        "/Encrypt << /Filter /Standard /V 4 /R 4 /O " ++ o ++ " /U " ++ o ++ " /P -4 /CF << /StdCF << /CFM /Other >> >> /StmF /StdCF /StrF /StdCF >> /ID [<00> <00>] ",
+    };
+    for (cases) |extra| {
+        const pdf = try buildPdf(gpa, &.{ "<< /Type /Catalog /Pages 2 0 R >>", pages }, extra);
+        defer gpa.free(pdf);
+        try testing.expectError(error.UnsupportedEncryption, Reader.open(gpa, pdf, .{}));
+    }
 }
 
 test "the stream size limit and the depth limit are errors" {
@@ -1320,8 +1744,8 @@ fn buildPdf(gpa: Allocator, bodies: []const []const u8, extra: []const u8) ![]u8
 }
 
 /// `base` with an incremental update appended: each change sets object `num` to `body`, or
-/// frees it when body is null. The new trailer has /Prev, the old /Root and `size`.
-fn appendUpdate(gpa: Allocator, base: []const u8, changes: []const struct { num: u32, body: ?[]const u8 }, size: u32) ![]u8 {
+/// frees it when body is null. The new trailer has /Prev, the old /Root, `size` and `extra`.
+fn appendUpdate(gpa: Allocator, base: []const u8, changes: []const struct { num: u32, body: ?[]const u8 }, size: u32, extra: []const u8) ![]u8 {
     var aw: std.Io.Writer.Allocating = .init(gpa);
     errdefer aw.deinit();
     const w = &aw.writer;
@@ -1339,7 +1763,7 @@ fn appendUpdate(gpa: Allocator, base: []const u8, changes: []const struct { num:
         } else try w.print("{d} 1\n0000000000 00001 f \n", .{c.num});
     }
     const prev = try findStartXref(base);
-    try w.print("trailer\n<< /Size {d} /Root 1 0 R /Prev {d} >>\nstartxref\n{d}\n%%EOF\n", .{ size, prev, xref_at });
+    try w.print("trailer\n<< /Size {d} /Root 1 0 R /Prev {d} {s}>>\nstartxref\n{d}\n%%EOF\n", .{ size, prev, extra, xref_at });
     return aw.toOwnedSlice();
 }
 
@@ -1374,7 +1798,7 @@ test "an incremental update replaces and frees objects, and pages inherit from t
     const updated = try appendUpdate(gpa, base, &.{
         .{ .num = 2, .body = "<< /Type /Pages /Kids [4 0 R] /Count 1 /MediaBox [0 0 100 100] >>" },
         .{ .num = 6, .body = null },
-    }, 7);
+    }, 7, "");
     defer gpa.free(updated);
     var u = try Reader.open(gpa, updated, .{});
     defer u.deinit();

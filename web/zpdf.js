@@ -80,7 +80,7 @@ export const ERROR_NAMES = new Map([
   [-24, "LaterDrawn"],
   [-25, "LaterNotDrawn"],
   [-26, "Malformed"],
-  [-27, "Encrypted"],
+  [-27, "PasswordRequired"],
   [-28, "UnsupportedFilter"],
   [-29, "UnsupportedFont"],
   [-30, "TooDeep"],
@@ -92,6 +92,7 @@ export const ERROR_NAMES = new Map([
   [-36, "NotEmbedded"],
   [-37, "InvalidImage"],
   [-38, "UnsupportedImage"],
+  [-39, "UnsupportedEncryption"],
   [-127, "Unknown"],
 ]);
 

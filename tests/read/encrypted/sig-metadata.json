@@ -1,0 +1,10 @@
+{
+  "qpdf": [
+    { "jsonversion": 2, "pushedinheritedpageresources": false, "calledgetallpages": false, "maxobjectid": 18 },
+    {
+      "obj:1 0 R": { "value": { "/Type": "/Catalog", "/Pages": "2 0 R", "/Metadata": "19 0 R", "/ZpdfTestSig": "20 0 R" } },
+      "obj:19 0 R": { "stream": { "dict": { "/Type": "/Metadata", "/Subtype": "/XML" }, "data": "PD94cGFja2V0IGJlZ2luPSIiPz48eDp4bXBtZXRhIHhtbG5zOng9ImFkb2JlOm5zOm1ldGEvIj56cGRmIG1ldGFkYXRhPC94OnhtcG1ldGE+" } },
+      "obj:20 0 R": { "value": { "/Type": "/Sig", "/Filter": "/Adobe.PPKLite", "/ByteRange": [0, 10, 20, 30], "/Contents": "b:0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30", "/Name": "u:zpdf signer" } }
+    }
+  ]
+}

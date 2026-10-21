@@ -42,7 +42,7 @@ internal enum ZpdfError
     LaterDrawn = -24,
     LaterNotDrawn = -25,
     Malformed = -26,
-    Encrypted = -27,
+    PasswordRequired = -27,
     UnsupportedFilter = -28,
     UnsupportedFont = -29,
     TooDeep = -30,
@@ -54,6 +54,7 @@ internal enum ZpdfError
     NotEmbedded = -36,
     InvalidImage = -37,
     UnsupportedImage = -38,
+    UnsupportedEncryption = -39,
     Unknown = -127,
 }
 
@@ -202,7 +203,7 @@ internal unsafe struct GlyphRecord
 
 internal static unsafe partial class ZpdfAbi
 {
-    public const uint AbiVersion = 5;
+    public const uint AbiVersion = 6;
     public const string LibraryName = "zpdf";
 
     // abi_version. A caller checks it once, when it loads the library.
@@ -384,8 +385,10 @@ internal static unsafe partial class ZpdfAbi
     [LibraryImport(LibraryName, EntryPoint = "zpdf_doc_close")]
     public static partial int zpdf_doc_close(ZpdfContext* ctx, uint doc);
 
-    // Opens a PDF to read (zpdf.read.Reader, default limits). The bytes are copied. Refuses
-    // an encrypted file (Encrypted) and a file it cannot parse (Malformed and the others).
+    // Opens a PDF to read (zpdf.read.Reader, default limits). The bytes are copied. An encrypted
+    // file opens when its user password is empty, as most are; one that needs a password is
+    // PasswordRequired, one with an encryption zpdf does not read UnsupportedEncryption, and a
+    // file it cannot parse Malformed and the others.
     [LibraryImport(LibraryName, EntryPoint = "zpdf_reader_open")]
     public static partial int zpdf_reader_open(ZpdfContext* ctx, byte* bytes, nuint len, uint* @out);
 
