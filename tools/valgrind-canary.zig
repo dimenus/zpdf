@@ -1,16 +1,23 @@
-//! The canary tools/test-valgrind.sh runs under valgrind before the test binary, built the same way
-//! (target, optimize mode, LLVM). It reads uninitialised memory three times on purpose: on the heap,
-//! through the allocator std.testing.allocator is (a DebugAllocator over page_allocator); on the
-//! stack; and in a large block that libzpdf's block cache (src/block_cache.zig) hands out a second
-//! time, still holding what was written into it before. The script fails unless valgrind reports
-//! all three, in canaryHeapRead, canaryStackRead and canaryReusedBlockRead, so a build in which
-//! valgrind cannot see uninitialised memory fails instead of reporting a clean run.
-//! That build existed: Zig's self-hosted x86_64 backend emits no valgrind marking for undefined
-//! memory, and valgrind saw no uninitialised heap read in its binary (build.zig, test-artifacts).
+//! The canary run under valgrind before what it vouches for, and built the same way: before the test
+//! binary by tools/test-valgrind.sh (target, optimize mode, LLVM), and before libzpdf by
+//! tools/valgrind-abi-bundle.sh (libzpdf's module options, build.zig nativeModule). It reads
+//! uninitialised memory four times on purpose: on the heap, through the allocator
+//! std.testing.allocator is (a DebugAllocator over page_allocator); on the stack; in a large block
+//! that libzpdf's block cache (src/block_cache.zig) hands out a second time, still holding what was
+//! written into it before; and in a block a libzpdf context allocates (src/counting.zig over
+//! smp_allocator, never written by an allocator that marks it). tools/test-valgrind.sh fails unless
+//! valgrind reports all four, in canaryHeapRead, canaryStackRead, canaryReusedBlockRead and
+//! canaryContextRead; the bundle requires the last two, the ones that go through zpdf's own marks
+//! (libzpdf's build leaves Zig's marking of `undefined` values off). So a build in which valgrind
+//! cannot see uninitialised memory fails instead of reporting a clean run. Two such builds existed:
+//! Zig's self-hosted x86_64 backend emits no valgrind marking for undefined memory, and valgrind saw
+//! no uninitialised heap read in its binary (build.zig, test-artifacts); and libzpdf with no libc,
+//! before src/counting.zig marked its blocks.
 //!
 //! It prints which branch each read took and exits 0; the branch taken means nothing.
 const std = @import("std");
 const BlockCache = @import("block_cache").BlockCache;
+const Counting = @import("counting").Counting;
 
 pub fn main() !void {
     var dbg: std.heap.DebugAllocator(.{}) = .init;
@@ -18,6 +25,18 @@ pub fn main() !void {
     try canaryHeapRead(dbg.allocator());
     canaryStackRead();
     try canaryReusedBlockRead();
+    try canaryContextRead();
+}
+
+noinline fn canaryContextRead() !void {
+    var counting: Counting = .{ .child = std.heap.smp_allocator };
+    const a = counting.allocator();
+    // rawAlloc, for the reason canaryReusedBlockRead gives: the mark must be Counting's own.
+    const len = 4096;
+    const p = a.rawAlloc(len, .@"16", @returnAddress()) orelse return error.OutOfMemory;
+    defer a.rawFree(p[0..len], .@"16", @returnAddress());
+    const v: *volatile u8 = &p[5];
+    if (v.* > 3) std.debug.print("context: big\n", .{}) else std.debug.print("context: small\n", .{});
 }
 
 noinline fn canaryHeapRead(gpa: std.mem.Allocator) !void {

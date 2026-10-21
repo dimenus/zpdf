@@ -49,8 +49,8 @@
 - libzpdf speed through the C ABI: `uv run tools/bench-abi.py [--base <ref>]` times this tree's
   libzpdf against the base's (write and read, 1 and 4 threads; Linux or macOS) and exits 1 when this
   tree is slower twice. Run it on any change to `src/abi.zig` or to how libzpdf is built or
-  allocates; run it on Linux too (on a machine herd-run reaches; it needs only the standard library, so
-  `python3 tools/bench-abi.py` where uv is missing).
+  allocates; run it on Linux too (on a machine herd-run reaches), where libzpdf links no libc. It needs
+  only the standard library, so `python3 tools/bench-abi.py` where uv is missing.
 - Speed and output size against HarfBuzz + Cairo (`hb-view`) and PyMuPDF: `uv run bench/compare.py`
   (needs `hb-view`, `mutool`, `qpdf`). Compare tools on its `per 1k cp` column.
 - Memory follows one page, not the document ("stream and free"): the `stream and free` tests in

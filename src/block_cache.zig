@@ -20,12 +20,12 @@
 //! within its class; across classes resize fails and remap returns null, so the caller allocates
 //! and copies, as with any allocator that cannot grow in place.
 //!
-//! A reused block is marked undefined for valgrind (a client request, which does nothing outside
-//! valgrind and in a build without valgrind support), so reading it before writing it is reported
-//! as for a new block. tools/valgrind-canary.zig checks that this still fires.
+//! A reused block is marked undefined for valgrind (src/valgrind_marks.zig), so reading it before
+//! writing it is reported as for a new block. tools/valgrind-canary.zig checks that this still fires.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const Alignment = std.mem.Alignment;
+const valgrind_marks = @import("valgrind_marks");
 
 pub const BlockCache = struct {
     child: Allocator,
@@ -78,7 +78,7 @@ pub const BlockCache = struct {
             self.lists[class] = block.next;
             self.cached_bytes -= classSize(class);
             const bytes: [*]u8 = @ptrCast(block);
-            std.valgrind.memcheck.makeMemUndefined(bytes[0..classSize(class)]);
+            valgrind_marks.makeUndefined(bytes[0..classSize(class)]);
             return bytes;
         }
         return self.child.rawAlloc(classSize(class), block_alignment, ra);

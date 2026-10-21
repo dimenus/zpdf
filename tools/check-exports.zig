@@ -8,6 +8,11 @@
 //! that no binding covers. Each library is read by its own format, whatever the host: ELF (.dynsym),
 //! Mach-O (LC_SYMTAB, defined external symbols, without the leading underscore) or PE (the export
 //! directory). Only names starting with "zpdf_" count; the rest are the linker's own.
+//!
+//! An ELF libzpdf (Linux) must also need no other library (no DT_NEEDED) and import no symbol
+//! beyond `elf_imports`. It links no libc, so one file loads in a glibc process and in a musl
+//! one; a libc function it began to call would bind to whichever libc the process has, or fail
+//! to load where that libc lacks it, and nothing else would notice.
 
 const std = @import("std");
 const elf = std.elf;
@@ -15,6 +20,12 @@ const macho = std.macho;
 const coff = std.coff;
 
 const Names = std.StringArrayHashMapUnmanaged(void);
+
+/// What an ELF libzpdf may take from the process: Zig's std reads the auxiliary vector (the page
+/// size) through getauxval, and x86_64 reaches thread-locals through __tls_get_addr. glibc and musl
+/// both have them, in libc or in the dynamic loader, which every process that can load a shared
+/// library has loaded.
+const elf_imports = [_][]const u8{ "getauxval", "__tls_get_addr" };
 
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
@@ -43,7 +54,21 @@ pub fn main(init: std.process.Init) !void {
         const bytes = try cwd.readFileAlloc(io, path, arena, .limited(1 << 28));
         var exported: Names = .empty;
         if (std.mem.startsWith(u8, bytes, elf.MAGIC)) {
-            try elfExports(arena, bytes, &exported);
+            var needed: Names = .empty;
+            var imported: Names = .empty;
+            try elfSymbols(arena, bytes, &exported, &needed, &imported);
+            for (needed.keys()) |name| {
+                std.debug.print("{s}: needs a library, which libzpdf on Linux must not: {s}\n", .{ path, name });
+                bad = true;
+            }
+            for (imported.keys()) |name| {
+                for (elf_imports) |allowed| {
+                    if (std.mem.eql(u8, name, allowed)) break;
+                } else {
+                    std.debug.print("{s}: imports {s}, which is not in elf_imports\n", .{ path, name });
+                    bad = true;
+                }
+            }
         } else if (bytes.len >= 4 and std.mem.readInt(u32, bytes[0..4], .little) == macho.MH_MAGIC_64) {
             try machoExports(arena, bytes, &exported);
         } else if (std.mem.startsWith(u8, bytes, "MZ")) {
@@ -83,26 +108,41 @@ fn keep(arena: std.mem.Allocator, names: *Names, name: []const u8) !void {
     if (std.mem.startsWith(u8, name, "zpdf_")) try names.put(arena, name, {});
 }
 
-/// Defined global or weak functions in .dynsym (what the dynamic linker resolves).
-fn elfExports(arena: std.mem.Allocator, bytes: []const u8, names: *Names) !void {
+/// From .dynsym, what the dynamic linker resolves: the defined global or weak functions (`names`)
+/// and every named undefined symbol (`imported`). From .dynamic, each DT_NEEDED library (`needed`).
+fn elfSymbols(arena: std.mem.Allocator, bytes: []const u8, names: *Names, needed: *Names, imported: *Names) !void {
     if (bytes[elf.EI.CLASS] != elf.ELFCLASS64) return error.NotElf64;
     const header = try read(elf.Elf64_Ehdr, bytes, 0);
+    var found_dynsym = false;
     var i: usize = 0;
     while (i < header.e_shnum) : (i += 1) {
         const section = try read(elf.Elf64_Shdr, bytes, header.e_shoff + i * header.e_shentsize);
-        if (section.sh_type != @backingInt(elf.SHT.DYNSYM)) continue;
         const strings = try read(elf.Elf64_Shdr, bytes, header.e_shoff + section.sh_link * header.e_shentsize);
+        if (section.sh_type == @backingInt(elf.SHT.DYNAMIC)) {
+            var at = section.sh_offset;
+            while (at < section.sh_offset + section.sh_size) : (at += section.sh_entsize) {
+                const entry = try read(elf.Elf64_Dyn, bytes, at);
+                if (entry.d_tag == elf.DT_NULL) break;
+                if (entry.d_tag == elf.DT_NEEDED) try needed.put(arena, try cString(bytes, strings.sh_offset + entry.d_val), {});
+            }
+        }
+        if (section.sh_type != @backingInt(elf.SHT.DYNSYM)) continue;
+        found_dynsym = true;
         var at = section.sh_offset;
         while (at < section.sh_offset + section.sh_size) : (at += section.sh_entsize) {
             const sym = try read(elf.Elf64_Sym, bytes, at);
+            const name = try cString(bytes, strings.sh_offset + sym.st_name);
+            if (sym.st_shndx == elf.SHN_UNDEF) {
+                if (name.len > 0) try imported.put(arena, name, {});
+                continue;
+            }
             const bind = sym.st_bind();
-            if (sym.st_shndx == elf.SHN_UNDEF or sym.st_type() != elf.STT_FUNC) continue;
+            if (sym.st_type() != elf.STT_FUNC) continue;
             if (bind != elf.STB_GLOBAL and bind != elf.STB_WEAK) continue;
-            try keep(arena, names, try cString(bytes, strings.sh_offset + sym.st_name));
+            try keep(arena, names, name);
         }
-        return;
     }
-    return error.NoDynsym;
+    if (!found_dynsym) return error.NoDynsym;
 }
 
 /// External symbols defined in a section, from LC_SYMTAB; C names carry a leading underscore.

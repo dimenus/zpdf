@@ -64,6 +64,7 @@ const zpdf = @import("root.zig");
 const sfnt = @import("sfnt.zig");
 const text_layout = @import("text_layout.zig");
 const BlockCache = @import("block_cache.zig").BlockCache;
+const Counting = @import("counting.zig").Counting;
 const abi_options = @import("abi_options");
 
 const is_wasm = builtin.target.cpu.arch == .wasm32;
@@ -225,57 +226,6 @@ comptime {
 fn putRecord(out: []u8, at: usize, record: anytype) void {
     @memcpy(out[at..][0..@sizeOf(@TypeOf(record))], std.mem.asBytes(&record));
 }
-
-/// Counts the bytes an allocator has handed out and not taken back, so a test can
-/// see that closing everything returns to where it started. Counts the requested
-/// length; a resize or remap that succeeds moves the count by the difference.
-pub const Counting = struct {
-    child: std.mem.Allocator,
-    live: usize = 0,
-    /// The most `live` has been since it was last set; a test sets it to `live` to measure one
-    /// step's own peak.
-    peak: usize = 0,
-
-    fn grew(self: *Counting) void {
-        self.peak = @max(self.peak, self.live);
-    }
-
-    pub fn allocator(self: *Counting) std.mem.Allocator {
-        return .{ .ptr = self, .vtable = &vtable };
-    }
-
-    const vtable: std.mem.Allocator.VTable = .{ .alloc = alloc, .resize = resize, .remap = remap, .free = free };
-
-    fn alloc(ctx: *anyopaque, len: usize, alignment: std.mem.Alignment, ret_addr: usize) ?[*]u8 {
-        const self: *Counting = @ptrCast(@alignCast(ctx));
-        const p = self.child.rawAlloc(len, alignment, ret_addr) orelse return null;
-        self.live += len;
-        self.grew();
-        return p;
-    }
-
-    fn resize(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) bool {
-        const self: *Counting = @ptrCast(@alignCast(ctx));
-        if (!self.child.rawResize(memory, alignment, new_len, ret_addr)) return false;
-        self.live = self.live - memory.len + new_len;
-        self.grew();
-        return true;
-    }
-
-    fn remap(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, new_len: usize, ret_addr: usize) ?[*]u8 {
-        const self: *Counting = @ptrCast(@alignCast(ctx));
-        const p = self.child.rawRemap(memory, alignment, new_len, ret_addr) orelse return null;
-        self.live = self.live - memory.len + new_len;
-        self.grew();
-        return p;
-    }
-
-    fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
-        const self: *Counting = @ptrCast(@alignCast(ctx));
-        self.child.rawFree(memory, alignment, ret_addr);
-        self.live -= memory.len;
-    }
-};
 
 const slot_bits = 10;
 const slot_count = 1 << slot_bits;
@@ -1176,8 +1126,14 @@ pub fn capturePanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
     @trap();
 }
 
-/// Where a new context's memory comes from.
-const base_allocator = if (is_wasm) std.heap.wasm_allocator else std.heap.c_allocator;
+/// Where a new context's memory comes from: the system's malloc where libzpdf links libc, and
+/// smp_allocator on Linux, where it links none (build.zig, nativeModule).
+const base_allocator = if (is_wasm)
+    std.heap.wasm_allocator
+else if (builtin.link_libc)
+    std.heap.c_allocator
+else
+    std.heap.smp_allocator;
 
 /// The exports both builds have. tools/gen-abi.zig writes zpdf.h and the C# declarations from
 /// these: each doc comment goes with its function.

@@ -1589,7 +1589,7 @@ test "addImage keeps none of an image's memory once it returns" {
     defer file_arena.deinit();
     const png = try image.testPng(file_arena.allocator(), .{ .width = side, .height = side, .depth = 8, .color_type = 6, .interlaced = false }, &.{.{ "IDAT", try image.testZlib(file_arena.allocator(), rows) }});
 
-    var counting: @import("abi.zig").Counting = .{ .child = gpa };
+    var counting: @import("counting.zig").Counting = .{ .child = gpa };
     var discard: std.Io.Writer.Discarding = .init(&.{});
     var doc = try Document.begin(counting.allocator(), &discard.writer, .{ .compress = true });
     defer doc.deinit();

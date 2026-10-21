@@ -36,6 +36,7 @@ pub fn build(b: *std.Build) void {
     mod.addOptions("abi_options", abiOptions(b, false, false));
     addKb(b, mod, kb, .libc);
     addCidMaps(mod, &cid, true);
+    addValgrindMarks(mod);
 
     // libzpdf: the C ABI (src/abi.zig) as a native shared library, for .NET and C.
     const native = addNative(b, kb, &cid, target, false);
@@ -110,6 +111,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addOptions("abi_options", abiOptions(b, false, false));
     addKb(b, test_mod, kb, .libc);
     addCidMaps(test_mod, &cid, true);
+    addValgrindMarks(test_mod);
 
     const shape_exe_mod = b.createModule(.{
         .root_source_file = b.path("src/zpdf-shape.zig"),
@@ -169,20 +171,11 @@ pub fn build(b: *std.Build) void {
     // memory, so valgrind saw no uninitialised heap read in its binary, while the same code built by
     // LLVM was reported (2026-10-21). The valgrind canary is built the same way and run first.
     const valgrind_tests = b.addTest(.{ .root_module = test_mod, .filters = test_filters, .use_llvm = true });
-    const valgrind_canary = b.addExecutable(.{
-        .name = "valgrind-canary",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/valgrind-canary.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{.{ .name = "block_cache", .module = b.createModule(.{
-                .root_source_file = b.path("src/block_cache.zig"),
-                .target = target,
-                .optimize = optimize,
-            }) }},
-        }),
-        .use_llvm = true,
-    });
+    const valgrind_canary = canaryExe(b, "valgrind-canary", b.createModule(.{
+        .root_source_file = b.path("tools/valgrind-canary.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
     const test_artifacts = b.step("test-artifacts", "Install the valgrind test binary and its canary to <prefix>/test without running them");
     test_artifacts.dependOn(&b.addInstallArtifact(valgrind_tests, .{ .dest_dir = .{ .override = .{ .custom = "test" } } }).step);
     test_artifacts.dependOn(&b.addInstallArtifact(valgrind_canary, .{ .dest_dir = .{ .override = .{ .custom = "test" } } }).step);
@@ -261,6 +254,11 @@ pub fn build(b: *std.Build) void {
     abi_step.dependOn(&b.addInstallArtifact(native, .{}).step);
     abi_step.dependOn(&b.addInstallHeaderFile(header, "zpdf.h").step);
     abi_step.dependOn(&b.addInstallFileWithDir(csharp, .{ .custom = "csharp" }, "Zpdf.Abi.g.cs").step);
+    // The valgrind canary built as libzpdf is, for tools/valgrind-abi-bundle.sh.
+    const abi_canary = canaryExe(b, "valgrind-canary", nativeModule(b, target, b.path("tools/valgrind-canary.zig"), false));
+    b.step("abi-canary", "Install the valgrind canary, built with libzpdf's options, to <prefix>/canary").dependOn(
+        &b.addInstallArtifact(abi_canary, .{ .dest_dir = .{ .override = .{ .custom = "canary" } } }).step,
+    );
 
     // libzpdf for each runtime a .NET package carries, as runtimes/<rid>/native/<file>.
     const native_all = b.step("native-all", "Build libzpdf for linux-x64, linux-arm64, osx-arm64 and win-x64");
@@ -389,6 +387,7 @@ fn addZpdfModule(b: *std.Build, kb: *std.Build.Dependency, cid: *const CidMaps, 
     m.addOptions("abi_options", abiOptions(b, false, false));
     addKb(b, m, kb, .libc);
     addCidMaps(m, cid, true);
+    addValgrindMarks(m);
     return m;
 }
 
@@ -396,19 +395,53 @@ fn addZpdfModule(b: *std.Build, kb: *std.Build.Dependency, cid: *const CidMaps, 
 /// is (addWasm). In a native process a defect then ends the process, which src/abi.zig's
 /// protocol says. kb's symbols are hidden, so only the zpdf_ exports leave the library.
 fn addNative(b: *std.Build, kb: *std.Build.Dependency, cid: *const CidMaps, target: std.Build.ResolvedTarget, strip: bool) *std.Build.Step.Compile {
-    const m = b.createModule(.{
-        .root_source_file = b.path("src/root.zig"),
+    const m = nativeModule(b, target, b.path("src/root.zig"), strip);
+    m.addOptions("abi_options", abiOptions(b, false, true));
+    addKb(b, m, kb, if (m.link_libc == false) .no_crt_hidden else .libc_hidden);
+    addCidMaps(m, cid, true);
+    addValgrindMarks(m);
+    return b.addLibrary(.{ .name = "zpdf", .linkage = .dynamic, .root_module = m });
+}
+
+/// The module options libzpdf is built with, for libzpdf and for the canary that checks valgrind
+/// can see into it (tools/valgrind-abi-bundle.sh), so the two cannot drift apart.
+///
+/// Linux: no libc at all, so one .so loads on glibc and musl alike and needs no glibc version.
+/// kb is built without its C runtime defaults (as for wasm), and libzpdf allocates through
+/// std.heap.smp_allocator under each context's block cache (src/abi.zig). With no malloc for
+/// valgrind to replace, libzpdf marks its own allocations for valgrind (src/counting.zig), through
+/// addValgrindMarks.
+fn nativeModule(b: *std.Build, target: std.Build.ResolvedTarget, root: std.Build.LazyPath, strip: bool) *std.Build.Module {
+    const no_libc = target.result.os.tag == .linux;
+    return b.createModule(.{
+        .root_source_file = root,
         .target = target,
         .optimize = .ReleaseSafe,
-        .link_libc = true,
+        .link_libc = !no_libc,
         .pic = true,
         .sanitize_c = .trap,
         .strip = strip,
     });
-    m.addOptions("abi_options", abiOptions(b, false, true));
-    addKb(b, m, kb, .libc_hidden);
-    addCidMaps(m, cid, true);
-    return b.addLibrary(.{ .name = "zpdf", .linkage = .dynamic, .root_module = m });
+}
+
+/// tools/valgrind-canary.zig on `root`, with the parts of zpdf it reads through as modules that
+/// take root's target and options.
+fn canaryExe(b: *std.Build, name: []const u8, root: *std.Build.Module) *std.Build.Step.Compile {
+    const block_cache = b.createModule(.{ .root_source_file = b.path("src/block_cache.zig") });
+    const counting = b.createModule(.{ .root_source_file = b.path("src/counting.zig") });
+    root.addImport("block_cache", block_cache);
+    root.addImport("counting", counting);
+    // One marks module for both, since a file may belong to only one module of a compilation.
+    const marks = b.createModule(.{ .root_source_file = b.path("src/valgrind_marks.zig") });
+    block_cache.addImport("valgrind_marks", marks);
+    counting.addImport("valgrind_marks", marks);
+    return b.addExecutable(.{ .name = name, .root_module = root, .use_llvm = true });
+}
+
+/// src/valgrind_marks.zig as the module "valgrind_marks", which src/counting.zig and
+/// src/block_cache.zig import (that file says why it is a module).
+fn addValgrindMarks(m: *std.Build.Module) void {
+    m.addImport("valgrind_marks", m.owner.createModule(.{ .root_source_file = m.owner.path("src/valgrind_marks.zig") }));
 }
 
 /// test_exports: the wasm test build's zpdf_wasm_test_* exports. export_c: export the C ABI
@@ -436,6 +469,7 @@ fn addWasm(b: *std.Build, kb: *std.Build.Dependency, cid: *const CidMaps, name: 
     wasm_mod.addOptions("abi_options", abiOptions(b, test_exports, false));
     addKb(b, wasm_mod, kb, .no_crt);
     addCidMaps(wasm_mod, cid, false);
+    addValgrindMarks(wasm_mod);
     const wasm = b.addExecutable(.{
         .name = name,
         .root_module = wasm_mod,
@@ -448,13 +482,14 @@ fn addWasm(b: *std.Build, kb: *std.Build.Dependency, cid: *const CidMaps, name: 
 
 // kb_text_shape is compiled from src/kb_impl.c. Without a C runtime kb needs
 // memset and memcpy from somewhere, and takes its allocator from the caller.
-fn addKb(b: *std.Build, mod: *std.Build.Module, kb: *std.Build.Dependency, runtime: enum { no_crt, libc, libc_hidden }) void {
+fn addKb(b: *std.Build, mod: *std.Build.Module, kb: *std.Build.Dependency, runtime: enum { no_crt, no_crt_hidden, libc, libc_hidden }) void {
     mod.addIncludePath(kb.path("."));
     mod.addCSourceFiles(.{
         .root = b.path("src"),
         .files = &.{ "kb_impl.c", "kb_shim.c" },
         .flags = switch (runtime) {
             .no_crt => &.{ "-std=c11", "-DKB_TEXT_SHAPE_NO_CRT", "-DKBTS_MEMSET=__builtin_memset", "-DKBTS_MEMCPY=__builtin_memcpy" },
+            .no_crt_hidden => &.{ "-std=c11", "-ffreestanding", "-DKB_TEXT_SHAPE_NO_CRT", "-DKBTS_MEMSET=__builtin_memset", "-DKBTS_MEMCPY=__builtin_memcpy", "-fvisibility=hidden" },
             .libc => &.{"-std=c11"},
             .libc_hidden => &.{ "-std=c11", "-fvisibility=hidden" },
         },

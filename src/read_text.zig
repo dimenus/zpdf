@@ -1924,7 +1924,7 @@ test "CID fonts: an Adobe character collection maps CIDs to text without /ToUnic
 test "parseCMap frees each operator's tokens: a CMap's peak does not grow with its blocks" {
     // `gpa` holds only the tokens (the mappings go to the arena), so its peak is one block's
     // tokens when they are freed operator by operator, and all of them when they are not.
-    const Counting = @import("abi.zig").Counting;
+    const Counting = @import("counting.zig").Counting;
     var peaks: [2]usize = undefined;
     for ([_]usize{ 10, 100 }, &peaks) |blocks, *peak| {
         var text: std.ArrayList(u8) = .empty;
