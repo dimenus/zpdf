@@ -4,7 +4,7 @@
 # the reader must handle. qpdf writes them, not zpdf, so the reader is tested on another
 # writer's xref streams, object streams, predictors and linearization.
 #
-#   tools/read-fixtures.sh        (from the repo root; needs zig, bun, qpdf)
+#   tools/read-fixtures.sh        (from the repo root; needs zig, bun, qpdf, uv, and tiffcp from libtiff)
 #
 # The tests compare these files against each other, not against stored hashes, so a newer
 # qpdf that writes different bytes still passes.
@@ -45,6 +45,8 @@ qpdf --encrypt user "" 128 --use-aes=y -- "$out/base.pdf" "$enc/aes-128-empty-ow
 qpdf "$out/base.pdf" --update-from-json="$enc/sig-metadata.json" "$enc/sig-metadata.tmp.pdf"
 qpdf --encrypt "" owner 128 --use-aes=y --cleartext-metadata -- "$enc/sig-metadata.tmp.pdf" "$enc/aes-128-sig-metadata.pdf"
 rm "$enc/sig-metadata.tmp.pdf"
+# LZWDecode data that decodes to base.pdf: from libtiff, and with /EarlyChange 0.
+uv run tools/lzw-fixtures.py
 qpdf --check "$out/objstm.pdf" > /dev/null
 qpdf --check "$out/linear.pdf" > /dev/null
 ls -lR "$out"
