@@ -65,17 +65,31 @@ def zpdf(path):
         return {"crash": f"exit {p.returncode}, no JSON", "stderr": p.stderr[-500:]}
 
 
+def xml_allows(cp):
+    return cp in (0x9, 0xA, 0xD) or 0x20 <= cp <= 0xD7FF or 0xE000 <= cp <= 0xFFFD or 0x10000 <= cp <= 0x10FFFF
+
+
+# What a character XML forbids becomes on both sides: a private-use code point neither reader
+# gives for a code, so it never matches a U+FFFD that a reader reported for an unmapped code.
+XML_FORBIDDEN = 0x10FFFD
+
+
 def xml_safe(text):
     """mutool writes characters XML 1.0 forbids (control characters, surrogates) as numeric
-    references, which ElementTree refuses. Each becomes U+FFFD, so the text check still sees a
-    character there and reports a difference, instead of the file being skipped."""
+    references, which ElementTree refuses. Each becomes XML_FORBIDDEN, so the text check still sees
+    a character there, instead of the file being skipped. zpdf's text gets the same replacement
+    (as_mutool_reads), so a character both readers read compares equal."""
 
     def fix(m):
         cp = int(m.group(1)[1:], 16) if m.group(1)[0] in "xX" else int(m.group(1))
-        ok = cp in (0x9, 0xA, 0xD) or 0x20 <= cp <= 0xD7FF or 0xE000 <= cp <= 0xFFFD or 0x10000 <= cp <= 0x10FFFF
-        return m.group(0) if ok else "&#xFFFD;"
+        return m.group(0) if xml_allows(cp) else f"&#x{XML_FORBIDDEN:X};"
 
     return re.sub(r"&#([xX][0-9a-fA-F]+|[0-9]+);", fix, text)
+
+
+def as_mutool_reads(text):
+    """zpdf's text with xml_safe's replacement applied, for comparing with mutool's."""
+    return "".join(c if xml_allows(ord(c)) else chr(XML_FORBIDDEN) for c in text)
 
 
 def mutool_pages(path):
@@ -230,13 +244,16 @@ def check(path, verbose):
         cx0, cy0, cx1, cy1 = page["crop_box"]
 
         def inside(r):
-            end = r["x"] + (r["width"] or 0)
-            return cx0 + r["size"] <= r["x"] and end <= cx1 - r["size"] and cy0 + r["size"] <= r["y"] <= cy1 - r["size"]
+            # A vertical run goes down the page from its first glyph; a horizontal one, right.
+            w = r["width"] or 0
+            x_end, y_end = (r["x"], r["y"] - w) if r["vertical"] else (r["x"] + w, r["y"])
+            xs, ys = sorted((r["x"], x_end)), sorted((r["y"], y_end))
+            return cx0 + r["size"] <= xs[0] and xs[1] <= cx1 - r["size"] and cy0 + r["size"] <= ys[0] and ys[1] <= cy1 - r["size"]
 
         if mu_page is not None:
             theirs = collections.Counter(nonwhite("".join(c for c, _, _ in mu_page)))
-            all_ours = collections.Counter(nonwhite("".join(r["text"] for r in runs)))
-            ours_inside = collections.Counter(nonwhite("".join(r["text"] for r in runs if inside(r))))
+            all_ours = collections.Counter(nonwhite(as_mutool_reads("".join(r["text"] for r in runs))))
+            ours_inside = collections.Counter(nonwhite(as_mutool_reads("".join(r["text"] for r in runs if inside(r)))))
             missing, extra = theirs - all_ours, ours_inside - theirs
             if not missing and not extra:
                 res["text ok"] += 1
