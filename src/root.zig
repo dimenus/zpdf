@@ -50,6 +50,7 @@ test {
     _ = @import("read_text.zig");
     _ = @import("crypt.zig");
     _ = @import("cmap.zig");
+    _ = @import("cff.zig");
 }
 
 pub const Direction = enum(u32) {

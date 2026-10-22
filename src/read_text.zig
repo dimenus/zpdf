@@ -31,6 +31,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const read = @import("read.zig");
 const cmap = @import("cmap.zig");
+const cff = @import("cff.zig");
 const tables = @import("read_tables.zig");
 const winansi = @import("winansi.zig");
 const Reader = read.Reader;
@@ -805,6 +806,30 @@ fn isEmbedded(r: *Reader, dict: Dict) Error!bool {
     return false;
 }
 
+/// The built-in encoding of an embedded CFF program (/FontFile3 with /Subtype /Type1C): the glyph
+/// name of each code (src/cff.zig), copied into the reader's arena. null when the font has no such
+/// program, or cff.zig reads none from it. The program itself is decoded into scratch memory and
+/// not kept.
+fn cffEncoding(r: *Reader, dict: Dict) Error!?[256]?[]const u8 {
+    const fd = (try r.getResolved(dict, "FontDescriptor")) orelse return null;
+    if (fd != .dict) return error.Malformed;
+    const program = switch ((try r.getResolved(fd.dict, "FontFile3")) orelse return null) {
+        .stream => |s| s,
+        else => return error.Malformed,
+    };
+    const subtype = (try r.getResolved(program.dict, "Subtype")) orelse return null;
+    if (!(subtype == .name and std.mem.eql(u8, subtype.name, "Type1C"))) return null;
+    var scratch: std.heap.ArenaAllocator = .init(r.arena_state.child_allocator);
+    defer scratch.deinit();
+    const data = try r.decodeStream(scratch.allocator(), program);
+    const names = (try cff.builtinEncoding(scratch.allocator(), data)) orelse return null;
+    var out: [256]?[]const u8 = @splat(null);
+    for (names, &out) |n, *o| if (n) |name| {
+        o.* = try r.arenaAllocator().dupe(u8, name);
+    };
+    return out;
+}
+
 /// The built-in encoding of an embedded Type 1 font program (/FontFile): the glyph name of each
 /// code, from the /Encoding in its cleartext part, `StandardEncoding` or the `dup <code> /<name>
 /// put` entries of an array (Adobe Type 1 Font Format, 2.3). null when the font has no Type 1
@@ -875,10 +900,11 @@ fn loadSimple(r: *Reader, f: *Font, dict: Dict, type3: bool) Error!void {
     const std_metrics = standardMetrics(f.base_font);
     // Base encoding: /Encoding's name or /BaseEncoding, else the font's built-in one (9.6.6.1):
     // for a standard font that is not embedded, Standard (or the symbol fonts' own); for an
-    // embedded Type 1 program, the /Encoding in its cleartext. Other embedded programs (CFF,
-    // TrueType) are not read yet, and Standard is not guessed for them: Ghostscript re-encodes
-    // its subsets, so the guess gives wrong letters with no sign of it. Such codes get no base:
-    // unmapped unless /ToUnicode or /Differences says.
+    // embedded Type 1 program, the /Encoding in its cleartext; for an embedded CFF program
+    // (/FontFile3 /Type1C), its own encoding and glyph names (src/cff.zig). An embedded TrueType
+    // program is not read, and Standard is not guessed for it or for a program these do not read:
+    // Ghostscript re-encodes its subsets, so the guess gives wrong letters with no sign of it.
+    // Such codes get no base: unmapped unless /ToUnicode or /Differences says.
     var names: [256]?[]const u8 = @splat(null);
     var is_winansi = false;
     var base: ?[]const u8 = null;
@@ -901,7 +927,9 @@ fn loadSimple(r: *Reader, f: *Font, dict: Dict, type3: bool) Error!void {
         }
         // MacExpertEncoding and unknown names: no base; /Differences may still say.
     } else if (try isEmbedded(r, dict)) {
-        if (try type1Encoding(r, dict)) |builtin| names = builtin;
+        if (try type1Encoding(r, dict)) |builtin| {
+            names = builtin;
+        } else if (try cffEncoding(r, dict)) |builtin| names = builtin;
     } else if (std_metrics == null and try isSymbolic(r, dict)) {
         // A symbolic font's built-in encoding is its own (9.6.6.2), not Standard: unknown too.
     } else if (std_metrics) |m| switch (m) {
@@ -1684,6 +1712,42 @@ test "encoding CMaps, predefined and in the file: codes split by codespace, CIDs
     defer id.deinit();
     try testing.expectEqualStrings("\u{3042} ", id.runs[0].text);
     try testing.expect(id.runs[0].vertical);
+}
+
+test "an embedded CFF program's own encoding is the base under /Differences, and a non-CFF one is not read" {
+    const gpa = testing.allocator;
+    const options = @import("build_options");
+    var buf: [512]u8 = undefined;
+    // custom-scattered.cff: code 3 is A, 65 is B, 200 is alpha.sc, 255 is x.alt.
+    const program = try std.Io.Dir.cwd().readFileAlloc(testing.io, try std.fmt.bufPrint(&buf, "{s}/cff/custom-scattered.cff", .{options.read_fixtures}), gpa, .limited(1 << 20));
+    defer gpa.free(program);
+    const stream = try std.fmt.allocPrint(gpa, "<< /Subtype /Type1C /Length {d} >>\nstream\n{s}\nendstream", .{ program.len, program });
+    defer gpa.free(stream);
+    const other = try std.fmt.allocPrint(gpa, "<< /Subtype /OpenType /Length {d} >>\nstream\n{s}\nendstream", .{ program.len, program });
+    defer gpa.free(other);
+    const pdf = try read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R /F2 7 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+        streamObject("", "BT /F1 10 Tf (\\003A\\310\\377) Tj /F2 10 Tf (\\003A) Tj ET"),
+        // /Differences changes 255 only; the rest is the program's: 3 A, 65 B, 200 alpha.sc.
+        "<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+ZpdfTest /FirstChar 0 /LastChar 255 /Encoding << /Differences [255 /Z] >> /FontDescriptor 6 0 R >>",
+        "<< /Type /FontDescriptor /FontName /ABCDEF+ZpdfTest /Flags 4 /FontFile3 8 0 R >>",
+        // The same program as /OpenType, which it is not: not read, so no base.
+        "<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+ZpdfTest /Encoding << /Differences [255 /Z] >> /FontDescriptor 9 0 R >>",
+        stream,
+        "<< /Type /FontDescriptor /FontName /ABCDEF+ZpdfTest /Flags 4 /FontFile3 10 0 R >>",
+        other,
+    }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    var pt = try r.pageText(gpa, 0);
+    defer pt.deinit();
+    // alpha.sc is the AGL's alpha with a suffix (U+03B1); x.alt is overridden by /Z.
+    try testing.expectEqualStrings("AB\u{03B1}Z", pt.runs[0].text);
+    try testing.expectEqual(@as(u32, 0), pt.runs[0].unmapped);
+    try testing.expectEqualStrings("\u{FFFD}\u{FFFD}", pt.runs[1].text);
 }
 
 test "Identity-V: glyphs move by /W2 and /DW2's w1 and Tc along y, TJ along y, with no Tz or Tw" {
