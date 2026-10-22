@@ -34,6 +34,10 @@ excused; each one is in the code beside the place it applies:
   a glyph's origin (both undone in pdfminer_pages), and has no Euro width for Helvetica (the
   glyphs after such a gap must then be off by one constant shift, which is counted).
 - mutool splits ligature characters unless asked not to (preserve-ligatures).
+- mutool maps a CID with no /ToUnicode through MuPDF's copy of Adobe's CID-to-Unicode table for
+  the font's collection, which can be an older version than zpdf's (src/cid): MuPDF 1.28.5 has
+  Adobe-Japan1-UCS2 8.004, zpdf 10.002. A page whose only text differences are pairs that the two
+  versions give for one CID is counted, not failed (table_pairs, explained_by_tables).
 
 Prints one line per file and the totals; with --verbose, the first difference of each failed
 check. Exit status 1 when any check failed on any file.
@@ -43,12 +47,14 @@ says, not what its name or folder suggests.
 """
 
 import collections
+import functools
 import json
 import pathlib
 import re
 import subprocess
 import sys
 import unicodedata
+import urllib.request
 import xml.etree.ElementTree as ET
 
 ZPDF_READ = pathlib.Path(__file__).resolve().parent.parent / "zig-out/bin/zpdf-read"
@@ -202,6 +208,88 @@ def zero_width_gap(c, adv):
     return adv == 0 and c.strip() and not unicodedata.combining(c[0])
 
 
+def ucs2_table(text):
+    """{cid: text} from a CID-to-Unicode CMap (bfchar and bfrange over two-byte CIDs)."""
+    def chars(h):
+        return bytes.fromhex(h).decode("utf-16-be", "surrogatepass")
+
+    out = {}
+    for block in re.findall(r"beginbfchar(.*?)endbfchar", text, re.S):
+        for cid, dst in re.findall(r"<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>", block):
+            out[int(cid, 16)] = chars(dst)
+    for block in re.findall(r"beginbfrange(.*?)endbfrange", text, re.S):
+        for lo, hi, dst in re.findall(r"<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>\s*(<[0-9a-fA-F]+>|\[[^\]]*\])", block):
+            lo, hi = int(lo, 16), int(hi, 16)
+            if dst.startswith("["):
+                for k, d in enumerate(re.findall(r"<([0-9a-fA-F]+)>", dst)):
+                    out[lo + k] = chars(d)
+            else:
+                start = chars(dst[1:-1])
+                for k in range(hi - lo + 1):
+                    out[lo + k] = start[:-1] + chr(ord(start[-1]) + k)
+    return out
+
+
+@functools.cache
+def table_pairs():
+    """The (zpdf's text, MuPDF's text) pairs the two readers' CID-to-Unicode tables give for one
+    CID, over the collections both have: MuPDF's tables for the installed mutool's version, from
+    its source tree (cached in .cache/zpdf-oracle in the home folder), against src/cid. None,
+    with a note, when MuPDF's tables cannot be had: the differences then fail."""
+    v = subprocess.run(["mutool", "-v"], capture_output=True, text=True)
+    version = re.search(r"version (\S+)", v.stdout + v.stderr)
+    if not version:
+        print("note: mutool -v gave no version; CID-to-Unicode table differences fail")
+        return None
+    cache = pathlib.Path.home() / ".cache" / "zpdf-oracle" / f"mupdf-{version.group(1)}"
+    pairs = set()
+    for ordering in ("Japan1", "GB1", "CNS1", "Korea1"):
+        name = f"Adobe-{ordering}-UCS2"
+        theirs_path = cache / name
+        if not theirs_path.exists():
+            url = f"https://raw.githubusercontent.com/ArtifexSoftware/mupdf/{version.group(1)}/resources/cmaps/{name}"
+            try:
+                data = urllib.request.urlopen(url, timeout=60).read()
+            except OSError as e:
+                print(f"note: {url}: {e}; CID-to-Unicode table differences fail")
+                return None
+            cache.mkdir(parents=True, exist_ok=True)
+            theirs_path.write_bytes(data)
+        ours = ucs2_table((pathlib.Path(__file__).resolve().parent.parent / "src/cid" / name).read_text(encoding="latin-1"))
+        theirs = ucs2_table(theirs_path.read_text(encoding="latin-1"))
+        for cid in ours.keys() | theirs.keys():
+            a, b = ours.get(cid, "\ufffd"), theirs.get(cid, "\ufffd")
+            if nonwhite(a) != nonwhite(b):
+                pairs.add((nonwhite(a), nonwhite(b)))
+    # Each pair as what it adds on each side: 通 + U+E0100 against 通 is one more U+E0100 in zpdf.
+    reduced = {(frozenset((collections.Counter(a) - collections.Counter(b)).items()), frozenset((collections.Counter(b) - collections.Counter(a)).items())) for a, b in pairs}
+    return [(collections.Counter(dict(z)), collections.Counter(dict(m))) for z, m in reduced if z or m]
+
+
+def explained_by_tables(missing, extra):
+    """Whether the text check's differences (missing: mutool has, zpdf not; extra: zpdf has,
+    mutool not) are all pairs table_pairs gives: each pair is taken out of both while it fits."""
+    pairs = table_pairs()
+    if pairs is None:
+        return False
+    missing, extra = collections.Counter(missing), collections.Counter(extra)
+    by_char = collections.defaultdict(list)
+    for z, m in pairs:
+        for c in z or m:
+            by_char[c].append((z, m))
+    progress = True
+    while progress and (missing or extra):
+        progress = False
+        for c in list(extra) + list(missing):
+            for z, m in by_char.get(c, ()):
+                if all(extra[k] >= n for k, n in z.items()) and all(missing[k] >= n for k, n in m.items()):
+                    extra -= z
+                    missing -= m
+                    progress = True
+                    break
+    return not missing and not extra
+
+
 def check(path, verbose):
     res = collections.Counter()
     notes = []
@@ -257,6 +345,8 @@ def check(path, verbose):
             missing, extra = theirs - all_ours, ours_inside - theirs
             if not missing and not extra:
                 res["text ok"] += 1
+            elif explained_by_tables(missing, extra):
+                res["text: only where MuPDF's CID-to-Unicode tables are another version"] += 1
             elif not missing and set(extra) == {"\ufffd"}:
                 # A Type0 font's code with no CID mapping draws CID 0's glyph (ISO 32000-1
                 # 9.7.6.3), which zpdf gives as U+FFFD; MuPDF drops the code (pdf_show_string).
