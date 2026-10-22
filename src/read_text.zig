@@ -3,7 +3,9 @@
 //! A run is one text-showing operator (Tj, TJ, ' or "), as drawn: its text in Unicode, where its
 //! first glyph's origin is (after any TJ adjustment before it), its size and its advance. An
 //! operator that shows no glyph makes no run. The glyphs inside a marked-content span with
-//! /ActualText make one run whose text is the ActualText. Runs come in content-stream order, which
+//! /ActualText make one run whose text is the ActualText; a span that draws no glyph but an image
+//! makes a run placed on the image, with no glyphs. The ActualText is the span's own, else that
+//! of the structure element its /MCID names (14.7.4.4). Runs come in content-stream order, which
 //! is not always reading order: readers that agree on the text disagree on its order (MuPDF
 //! keeps content order, Poppler sorts by position), so ordering is left to the caller. No space
 //! is invented between runs or for a large TJ gap; the caller decides what a gap means.
@@ -46,6 +48,7 @@ pub const TextRun = struct {
     x: f64,
     y: f64,
     /// The text's height in user space: the font size scaled by the text and current matrices.
+    /// For an ActualText run placed on an image, the image's height.
     size: f64,
     /// From the first glyph's origin to where the next glyph would start, in user space. null
     /// when a glyph's width is unknown (a font with no width for one of its codes).
@@ -54,7 +57,8 @@ pub const TextRun = struct {
     font: []const u8,
     /// Codes with no Unicode mapping; each is U+FFFD in `text`.
     unmapped: u32,
-    /// Each glyph's origin, in default user space, in drawing order.
+    /// Each glyph's origin, in default user space, in drawing order. None for an ActualText run
+    /// placed on an image: its x and y are the image's bottom-left corner, its width the image's.
     glyphs: []const Glyph,
     /// The text is a marked-content span's /ActualText (14.9.4), which replaces what its glyphs
     /// map to; the run covers every glyph drawn inside the span. zpdf writes one around each
@@ -1057,13 +1061,35 @@ const Interp = struct {
     operations: u32 = 0,
     glyph_count: u32 = 0,
     unplaced_actual_text: u32 = 0,
+    /// The structure elements of the stream being run, by MCID: its /StructParents entry in the
+    /// structure tree's /ParentTree (14.7.4.4). null when it has none.
+    mcids: ?[]const Object = null,
 
     const Marked = struct {
         /// The span's /ActualText, as UTF-8, when it has one.
         actual: ?[]const u8,
         /// The first run drawn inside it.
         first_run: usize,
+        /// The box, in user space, of the images drawn inside it: [x0, y0, x1, y1].
+        image_box: ?[4]f64 = null,
     };
+
+    /// An image is drawn, through the CTM's unit square (8.9.4): every open span's box grows to
+    /// hold it.
+    fn noteImage(self: *Interp) void {
+        const m = self.gs.ctm;
+        var box: [4]f64 = .{ std.math.inf(f64), std.math.inf(f64), -std.math.inf(f64), -std.math.inf(f64) };
+        for ([_][2]f64{ .{ 0, 0 }, .{ 1, 0 }, .{ 0, 1 }, .{ 1, 1 } }) |c| {
+            const x = c[0] * m[0] + c[1] * m[2] + m[4];
+            const y = c[0] * m[1] + c[1] * m[3] + m[5];
+            box = .{ @min(box[0], x), @min(box[1], y), @max(box[2], x), @max(box[3], y) };
+        }
+        if (!std.math.isFinite(box[0] + box[1] + box[2] + box[3])) return;
+        for (self.marked.items) |*mk| {
+            const b = mk.image_box orelse box;
+            mk.image_box = .{ @min(b[0], box[0]), @min(b[1], box[1]), @max(b[2], box[2]), @max(b[3], box[3]) };
+        }
+    }
 
     fn run(self: *Interp, content: []const u8, resources: Dict, depth: u32) Error!void {
         // Tokens and operands live until their operator returns: the arena is reset after each
@@ -1089,6 +1115,7 @@ const Interp = struct {
                     if (self.operations > self.r.options.max_operations) return error.TooLarge;
                     if (eql(u8, op, "BI")) {
                         try skipInlineImage(&lx, a, self.r.options.max_depth);
+                        self.noteImage();
                     } else try self.operator(op, operands.items, resources, depth);
                     operands.clearRetainingCapacity();
                     _ = tokens.reset(.retain_capacity);
@@ -1205,7 +1232,7 @@ const Interp = struct {
                 if (try self.r.getResolved(d, "ActualText")) |at| {
                     if (at != .string) return error.Malformed;
                     actual = try textString(self.scratch, at.string);
-                }
+                } else if (try self.elementActualText(d)) |at| actual = try textString(self.scratch, at);
             }
             try self.beginMarked(actual);
         } else if (eql(u8, op, "EMC")) {
@@ -1214,11 +1241,48 @@ const Interp = struct {
             if (self.marked.items.len <= self.marked_floor) return;
             const m = self.marked.pop().?;
             const actual = m.actual orelse return;
+            // A span that drew no glyph but an image: its text is placed on the image.
+            if (m.first_run >= self.runs.items.len) if (m.image_box) |b| {
+                try self.runs.append(self.scratch, .{
+                    .text = actual,
+                    .x = b[0],
+                    .y = b[1],
+                    .size = b[3] - b[1],
+                    .width = b[2] - b[0],
+                    .font = "",
+                    .unmapped = 0,
+                    .glyphs = &.{},
+                    .actual_text = true,
+                    .vertical = false,
+                });
+                try self.ends.append(self.scratch, .{ b[2], b[1] });
+            };
             // A nested span merges first; an enclosing one then merges that run with the rest,
             // so the outermost ActualText is the text.
             try self.mergeActual(m.first_run, actual);
         }
         // Every other operator (paths, colour, images, marked content) draws no text.
+    }
+
+    /// The /ActualText of the structure element a marked-content sequence belongs to by its
+    /// /MCID (14.7.4.4, 14.9.4), when the sequence's own property list has none. The element is
+    /// the stream's /ParentTree array at the MCID, and counts only when its /K lists that MCID:
+    /// an array whose entries are out of place gives no text, rather than a guess at which entry
+    /// was meant.
+    fn elementActualText(self: *Interp, props: Dict) Error!?[]const u8 {
+        const mcids = self.mcids orelse return null;
+        const id = switch ((try self.r.getResolved(props, "MCID")) orelse return null) {
+            .integer => |n| n,
+            else => return null,
+        };
+        if (id < 0 or id >= mcids.len) return null;
+        const elem = switch (try self.r.resolve(mcids[@intCast(id)])) {
+            .dict => |d| d,
+            else => return null,
+        };
+        if (!try kHolds(self.r, (try self.r.getResolved(elem, "K")) orelse return null, id)) return null;
+        const at = (try self.r.getResolved(elem, "ActualText")) orelse return null;
+        return if (at == .string) at.string else null;
     }
 
     fn beginMarked(self: *Interp, actual: ?[]const u8) Error!void {
@@ -1269,6 +1333,7 @@ const Interp = struct {
             else => return error.Malformed,
         };
         const subtype = (try self.r.getResolved(s.dict, "Subtype")) orelse return error.Malformed;
+        if (subtype == .name and std.mem.eql(u8, subtype.name, "Image")) return self.noteImage();
         if (!(subtype == .name and std.mem.eql(u8, subtype.name, "Form"))) return;
         if (depth >= 16) return error.TooDeep;
         if (ref == .ref) {
@@ -1298,6 +1363,10 @@ const Interp = struct {
             for (0..6) |i| mat[i] = (try self.r.resolve(m[i])).number() orelse return error.Malformed;
             self.gs.ctm = mul(mat, self.gs.ctm);
         }
+        // A form's MCIDs are its own, by its /StructParents (14.7.4.4).
+        const saved_mcids = self.mcids;
+        defer self.mcids = saved_mcids;
+        self.mcids = try structParents(self.r, s.dict);
         const form_resources = if (try self.r.getResolved(s.dict, "Resources")) |res| switch (res) {
             .dict => |d| d,
             else => return error.Malformed,
@@ -1544,8 +1613,86 @@ pub fn pageRuns(r: *Reader, index: usize) Error!PageRuns {
     const work = r.work_state.allocator();
     const page = r.page(index);
     var interp: Interp = .{ .r = r, .out = work, .scratch = work, .gpa = r.arena_state.child_allocator };
+    interp.mcids = try structParents(r, page.dict);
     if (try r.pageContentsIn(work, page)) |content| try interp.run(content, page.resources, 0);
     return .{ .runs = interp.runs.items, .unplaced_actual_text = interp.unplaced_actual_text };
+}
+
+/// The structure elements, by MCID, of a page or form `dict`: the array its /StructParents names in
+/// the structure tree's /ParentTree (14.7.4.4). null when either is missing or not that shape: the
+/// page then has no structure-tree ActualText, and its text is its glyphs'.
+fn structParents(r: *Reader, dict: Dict) Error!?[]const Object {
+    const key = switch ((try r.getResolved(dict, "StructParents")) orelse return null) {
+        .integer => |n| n,
+        else => return null,
+    };
+    const root = switch ((try r.getResolved(r.trailerDict(), "Root")) orelse return null) {
+        .dict => |d| d,
+        else => return null,
+    };
+    const tree = switch ((try r.getResolved(root, "StructTreeRoot")) orelse return null) {
+        .dict => |d| d,
+        else => return null,
+    };
+    const parents = switch ((try r.getResolved(tree, "ParentTree")) orelse return null) {
+        .dict => |d| d,
+        else => return null,
+    };
+    return switch ((try numberTreeGet(r, parents, key, 0)) orelse return null) {
+        .array => |a| a,
+        else => null,
+    };
+}
+
+/// The value for `key` in a number tree (7.9.7), or null: /Nums pairs in a leaf, /Kids with
+/// /Limits above. A kid without /Limits is searched too.
+fn numberTreeGet(r: *Reader, node: Dict, key: i64, depth: u32) Error!?Object {
+    if (depth >= 32) return error.TooDeep;
+    if (try r.getResolved(node, "Nums")) |nums| {
+        if (nums != .array) return null;
+        var i: usize = 0;
+        while (i + 1 < nums.array.len) : (i += 2) {
+            const k = try r.resolve(nums.array[i]);
+            if (k == .integer and k.integer == key) return try r.resolve(nums.array[i + 1]);
+        }
+    }
+    const kids = (try r.getResolved(node, "Kids")) orelse return null;
+    if (kids != .array) return null;
+    for (kids.array) |kid_ref| {
+        const kid = switch (try r.resolve(kid_ref)) {
+            .dict => |d| d,
+            else => continue,
+        };
+        if (try r.getResolved(kid, "Limits")) |limits| {
+            if (limits == .array and limits.array.len == 2) {
+                const lo = try r.resolve(limits.array[0]);
+                const hi = try r.resolve(limits.array[1]);
+                if (lo == .integer and hi == .integer and (key < lo.integer or key > hi.integer)) continue;
+            }
+        }
+        if (try numberTreeGet(r, kid, key, depth + 1)) |v| return v;
+    }
+    return null;
+}
+
+/// Whether a structure element's /K lists marked-content id `id`: as an integer, a marked-content
+/// reference's /MCID, or either inside an array (14.7.2, Table 323).
+fn kHolds(r: *Reader, k: Object, id: i64) Error!bool {
+    switch (k) {
+        .integer => |n| return n == id,
+        .dict => |d| {
+            const m = (try r.getResolved(d, "MCID")) orelse return false;
+            return m == .integer and m.integer == id;
+        },
+        .array => |items| {
+            for (items) |item| {
+                const v = try r.resolve(item);
+                if (v != .array and try kHolds(r, v, id)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
 }
 
 /// Reader.endPageRuns's work: the work arena reset down to max_retained_work (Options says why).
@@ -1712,6 +1859,63 @@ test "encoding CMaps, predefined and in the file: codes split by codespace, CIDs
     defer id.deinit();
     try testing.expectEqualStrings("\u{3042} ", id.runs[0].text);
     try testing.expect(id.runs[0].vertical);
+}
+
+test "ActualText from the structure tree by MCID, and on an image span with no glyph" {
+    const gpa = testing.allocator;
+    // MCIDs 0 to 3 on the page; MCID 0 in the form, which has its own /StructParents.
+    // 0: /K 0, ActualText "zero" over a glyph. 1: /K [1], ActualText "one" over an image.
+    // 2: /K << /MCID 2 >> (a reference), ActualText "two" over an inline image.
+    // 3: the element at index 3 lists /K 9, not 3: no ActualText, so the glyph's own text.
+    // A span with its own /ActualText and nothing drawn: unplaced, counted.
+    const page =
+        \\/Span <</MCID 0>> BDC BT /F1 10 Tf 10 700 Td (A) Tj ET EMC
+        \\/Span <</MCID 1>> BDC q 50 0 0 20 100 600 cm /Im1 Do Q EMC
+        \\/Span <</MCID 2>> BDC q 30 0 0 10 200 500 cm BI /W 1 /H 1 /BPC 8 /CS /G ID
+    ++ "\n\x00\nEI Q EMC\n" ++
+        \\/Span <</MCID 3>> BDC BT /F1 10 Tf 10 400 Td (B) Tj ET EMC
+        \\/Span <</ActualText (none)>> BDC EMC
+        \\/Fm1 Do
+    ;
+    const pdf = try read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 8 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /StructParents 7 /Resources << /Font << /F1 5 0 R >> /XObject << /Im1 6 0 R /Fm1 15 0 R >> >> >>",
+        streamObject("", page),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        streamObject("/Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray", "\x00"),
+        "<< /Type /StructElem /S /Document >>",
+        // The parent tree: a root with two kids, the second holding keys 7 and 8.
+        "<< /Type /StructTreeRoot /ParentTree 9 0 R >>",
+        "<< /Kids [10 0 R 11 0 R] >>",
+        "<< /Limits [0 5] /Nums [0 [7 0 R]] >>",
+        "<< /Limits [7 8] /Nums [7 [12 0 R 13 0 R 14 0 R 16 0 R] 8 [17 0 R]] >>",
+        "<< /Type /StructElem /S /Span /P 7 0 R /K 0 /ActualText (zero) >>",
+        "<< /Type /StructElem /S /Span /P 7 0 R /K [1] /ActualText (one) >>",
+        "<< /Type /StructElem /S /Span /P 7 0 R /K << /Type /MCR /MCID 2 >> /ActualText (two) >>",
+        streamObject("/Type /XObject /Subtype /Form /BBox [0 0 612 792] /StructParents 8 /Resources << /Font << /F1 5 0 R >> >>", "/Span <</MCID 0>> BDC BT /F1 10 Tf 10 300 Td (C) Tj ET EMC"),
+        "<< /Type /StructElem /S /Span /P 7 0 R /K 9 /ActualText (wrong) >>",
+        "<< /Type /StructElem /S /Span /P 7 0 R /K 0 /ActualText (form) >>",
+    }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    var pt = try r.pageText(gpa, 0);
+    defer pt.deinit();
+    try testing.expectEqual(@as(usize, 5), pt.runs.len);
+    try testing.expectEqualStrings("zero", pt.runs[0].text);
+    try testing.expect(pt.runs[0].actual_text);
+    try testing.expectEqual(@as(usize, 1), pt.runs[0].glyphs.len);
+    // On the image: its bottom-left corner, its width, its height as the size, and no glyphs.
+    try testing.expectEqualStrings("one", pt.runs[1].text);
+    try testing.expectEqual(@as(usize, 0), pt.runs[1].glyphs.len);
+    try testing.expectEqual([4]f64{ 100, 600, 50, 20 }, [4]f64{ pt.runs[1].x, pt.runs[1].y, pt.runs[1].width.?, pt.runs[1].size });
+    try testing.expectEqualStrings("two", pt.runs[2].text);
+    try testing.expectEqual([4]f64{ 200, 500, 30, 10 }, [4]f64{ pt.runs[2].x, pt.runs[2].y, pt.runs[2].width.?, pt.runs[2].size });
+    try testing.expectEqualStrings("B", pt.runs[3].text);
+    try testing.expect(!pt.runs[3].actual_text);
+    try testing.expectEqualStrings("form", pt.runs[4].text);
+    try testing.expectEqual(@as(u32, 1), pt.unplaced_actual_text);
 }
 
 test "an embedded CFF program's own encoding is the base under /Differences, and a non-CFF one is not read" {
