@@ -257,6 +257,10 @@ def check(path, verbose):
             missing, extra = theirs - all_ours, ours_inside - theirs
             if not missing and not extra:
                 res["text ok"] += 1
+            elif not missing and set(extra) == {"\ufffd"}:
+                # A Type0 font's code with no CID mapping draws CID 0's glyph (ISO 32000-1
+                # 9.7.6.3), which zpdf gives as U+FFFD; MuPDF drops the code (pdf_show_string).
+                res["text: only U+FFFD more than mutool (codes with no CID mapping)"] += 1
             else:
                 res["text FAIL"] += 1
                 if verbose:
@@ -291,6 +295,14 @@ def check(path, verbose):
         chars = geom["chars"]
         glyphs = [g for r in runs for g in r["glyphs"]]
         if len(glyphs) != len(chars):
+            # pdfminer drops a code with no CID mapping (its CMap.decode yields nothing), where
+            # zpdf draws CID 0 (9.7.6.3) as U+FFFD: counted when zpdf's extra glyphs are exactly
+            # its U+FFFD glyphs beyond pdfminer's. The page's positions are then not compared.
+            ours_fffd = sum(1 for r in runs if not r["actual_text"] for g in r["glyphs"] if r["text"][g["text_at"] : g["text_at"] + 1] == "\ufffd")
+            theirs_fffd = sum(1 for c, _, _ in chars if c == "\ufffd")
+            if len(glyphs) > len(chars) and len(glyphs) - len(chars) == ours_fffd - theirs_fffd:
+                res["glyph count: pdfminer drops codes with no CID mapping (page not compared)"] += 1
+                continue
             res["glyph count FAIL"] += 1
             if verbose:
                 notes.append(f"p{i} glyphs: zpdf {len(glyphs)}, pdfminer {len(chars)}")

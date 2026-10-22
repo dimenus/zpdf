@@ -38,6 +38,10 @@
   Pillow, and each PNG's samples exactly (`tools/image-oracle.py`). Run it on any change to
   `src/image.zig` or to how `src/pdf.zig` writes images. `uv run tools/image-fixtures.py` rebuilds
   `tests/images/exif` and `tests/images/jpeg`.
+- The predefined CMaps (`src/cmap`, Adobe's): `zig build cmap-test` (needs uv) checks every code
+  of every one, as the reader reads it, against Adobe's files and pdfminer
+  (`tools/cmap-oracle.py`). Run it on any change to `src/cmap.zig`, `src/cmap` or
+  `tools/gen-cmaps.zig`.
 - Mutation testing a new test: `uv run tools/mutate.py <mutants.json>` (its docstring has the
   format). Every kill must name the failing test; it exits 1 when a mutant survives.
 - Speed of a change: `uv run tools/bench-ab.py` (hyperfine; needs hyperfine, mutool, Homebrew mupdf-tools)

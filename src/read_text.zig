@@ -13,20 +13,24 @@
 //!
 //! Characters come from the font's /ToUnicode CMap when it has one, else from its encoding
 //! (/Encoding, /Differences, the Adobe Glyph List for glyph names, WinAnsi, MacRoman, Standard).
-//! A Type0 font whose CIDFont has an Adobe character collection (Japan1, GB1, CNS1, Korea1, KR)
-//! maps a code /ToUnicode does not have through Adobe's CID-to-Unicode CMap for that collection
-//! (9.10.2; src/cid, compiled to a CidTable at build time). A code with none of these is U+FFFD
-//! in the text and counted in `unmapped`. Widths come from
-//! /Widths or /W, and for the 14 standard fonts with no /Widths from Adobe's AFM metrics
-//! (read_tables.zig).
+//! A Type0 font's /Encoding CMap (src/cmap.zig: one of the standard's predefined CMaps, or a CMap
+//! stream) splits its strings into codes and maps each code to a CID. A Type0 font whose CIDFont
+//! has an Adobe character collection (Japan1, GB1, CNS1, Korea1, KR) maps a code /ToUnicode does
+//! not have through Adobe's CID-to-Unicode CMap for that collection (9.10.2; src/cid, compiled to
+//! a CidTable at build time). A code with none of these, or with no CID mapping, is U+FFFD in the
+//! text and counted in `unmapped`; a code with no CID mapping still draws a glyph, CID 0's or
+//! its notdef mapping's (9.7.6.3), and moves the text position by that glyph's width. Widths
+//! come from /Widths or /W (by CID), and for the 14 standard fonts with no /Widths from Adobe's
+//! AFM metrics (read_tables.zig).
 //!
-//! Refused: a Type0 font whose /Encoding is not Identity-H or Identity-V (error.UnsupportedFont:
-//! without its CMap the codes cannot even be split into characters), and anything zpdf.read
-//! refuses.
+//! Refused: a Type0 font whose /Encoding names a CMap that is not one of the standard's predefined
+//! ones, or a CMap stream that uses one (error.UnsupportedFont: without its CMap the codes cannot
+//! even be split into characters), and anything zpdf.read refuses.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const read = @import("read.zig");
+const cmap = @import("cmap.zig");
 const tables = @import("read_tables.zig");
 const winansi = @import("winansi.zig");
 const Reader = read.Reader;
@@ -103,13 +107,14 @@ fn mul(m: Matrix, n: Matrix) Matrix {
 /// A font as text extraction needs it. Lives in the reader's arena, cached by object number.
 pub const Font = struct {
     base_font: []const u8,
-    /// Two-byte codes (Type0 with Identity-H or Identity-V); else one byte.
-    two_byte: bool,
-    /// Type0 with Identity-V.
+    /// Type0: its /Encoding CMap (src/cmap.zig), which splits strings into codes and gives each
+    /// code's CID. null for a simple font, whose codes are single bytes.
+    code_map: ?cmap.Map,
+    /// The CMap's /WMode is 1: vertical writing.
     vertical: bool,
     to_unicode: ?CMap,
     /// Type0 with an Adobe character collection: Adobe's CID-to-Unicode table for it, static
-    /// data built from src/cid. With Identity-H the code is the CID.
+    /// data built from src/cid, by CID.
     cid_unicode: ?CidTable,
     /// Simple fonts: the characters of each code from the encoding (null: none).
     encoding: [256]?[]const u21,
@@ -119,7 +124,7 @@ pub const Font = struct {
     /// Type0: /W, as sorted ranges, and /DW.
     cid_widths: []const CidRange,
     default_width: f64,
-    /// Type0 with Identity-V: each CID's vertical displacement w1, from /W2 as sorted ranges, and
+    /// Type0 with a vertical CMap: each CID's vertical displacement w1, from /W2 as sorted ranges, and
     /// /DW2's (9.7.4.3). The position vectors in /W2 and /DW2 place the glyph's outline relative
     /// to the text position and do not move it, so they are not kept.
     cid_v_displacements: []const CidRange,
@@ -127,14 +132,33 @@ pub const Font = struct {
 
     const CidRange = struct { first: u32, last: u32, widths: []const f64 };
 
-    fn width(self: *const Font, code: u32) ?f64 {
-        if (!self.two_byte) return self.simple_widths[code];
-        return cidMetric(self.cid_widths, code) orelse self.default_width;
+    /// One code taken from a string, and for a Type0 font its CIDs.
+    const Shown = struct {
+        code: u32,
+        len: u3,
+        /// The CID its mappings select; null when it has none, which leaves it with no character
+        /// but the ToUnicode CMap's.
+        cid: ?u16,
+        /// The CID whose glyph is drawn: `cid`, else its notdef mapping's, else 0.
+        glyph: u16,
+    };
+
+    /// The code at the start of `s`, which must not be empty.
+    fn take(self: *const Font, s: []const u8) Shown {
+        const m = self.code_map orelse return .{ .code = s[0], .len = 1, .cid = null, .glyph = 0 };
+        const c = m.split(s);
+        const mapped = m.cid(c);
+        return .{ .code = c.value, .len = c.len, .cid = mapped, .glyph = mapped orelse m.notdef(c) orelse 0 };
     }
 
-    /// The vertical displacement w1 of a vertical font's code (a CID).
-    fn vDisplacement(self: *const Font, code: u32) f64 {
-        return cidMetric(self.cid_v_displacements, code) orelse self.default_v_displacement;
+    fn width(self: *const Font, g: Shown) ?f64 {
+        if (self.code_map == null) return self.simple_widths[g.code];
+        return cidMetric(self.cid_widths, g.glyph) orelse self.default_width;
+    }
+
+    /// The vertical displacement w1 of a vertical font's glyph.
+    fn vDisplacement(self: *const Font, g: Shown) f64 {
+        return cidMetric(self.cid_v_displacements, g.glyph) orelse self.default_v_displacement;
     }
 
     fn cidMetric(ranges: []const CidRange, code: u32) ?f64 {
@@ -152,13 +176,14 @@ pub const Font = struct {
         return null;
     }
 
-    fn unicode(self: *const Font, code: u32, code_len: u8, buf: *[max_chars]u21) ?[]const u21 {
+    fn unicode(self: *const Font, g: Shown, buf: *[max_chars]u21) ?[]const u21 {
         if (self.to_unicode) |cm| {
-            if (cm.lookup(code, code_len, buf)) |u| return u;
+            if (cm.lookup(g.code, g.len, buf)) |u| return u;
         }
-        if (!self.two_byte) return self.encoding[code];
+        if (self.code_map == null) return self.encoding[g.code];
+        const cid = g.cid orelse return null;
         // Comptime-false in zpdf.wasm, so the lookup is not compiled there.
-        if (cid_tables) if (self.cid_unicode) |t| return t.lookup(code, buf);
+        if (cid_tables) if (self.cid_unicode) |t| return t.lookup(cid, buf);
         return null;
     }
 };
@@ -466,7 +491,7 @@ pub fn loadFont(r: *Reader, ref: Object) Error!*const Font {
     const f = try a.create(Font);
     f.* = .{
         .base_font = if (try r.getResolved(dict, "BaseFont")) |b| (if (b == .name) b.name else "") else "",
-        .two_byte = false,
+        .code_map = null,
         .vertical = false,
         .to_unicode = null,
         .cid_unicode = null,
@@ -628,12 +653,9 @@ fn orderingTable(r: *Reader, info: Dict) Error!?CidTable {
 }
 
 fn loadType0(r: *Reader, f: *Font, dict: Dict) Error!void {
-    const enc = (try r.getResolved(dict, "Encoding")) orelse return error.Malformed;
-    if (enc != .name) return error.UnsupportedFont;
-    if (std.mem.eql(u8, enc.name, "Identity-V")) {
-        f.vertical = true;
-    } else if (!std.mem.eql(u8, enc.name, "Identity-H")) return error.UnsupportedFont;
-    f.two_byte = true;
+    const m = try encodingCMap(r, (try r.getResolved(dict, "Encoding")) orelse return error.Malformed, 0);
+    f.code_map = m;
+    f.vertical = m.vertical();
     const descendants = switch ((try r.getResolved(dict, "DescendantFonts")) orelse return error.Malformed) {
         .array => |arr| arr,
         else => return error.Malformed,
@@ -711,6 +733,50 @@ fn cidMetrics(r: *Reader, obj: Object, stride: usize) Error![]const Font.CidRang
 fn firstOfGroup(r: *Reader, group: []const Object) Error!f64 {
     for (group[1..]) |x| _ = (try r.resolve(x)).number() orelse return error.Malformed;
     return (try r.resolve(group[0])).number() orelse error.Malformed;
+}
+
+/// A Type0 font's /Encoding: a predefined CMap's name (Table 118; UnsupportedFont for any other
+/// name), or a CMap stream, encoded into the reader's arena.
+fn encodingCMap(r: *Reader, enc: Object, depth: u32) Error!cmap.Map {
+    return switch (enc) {
+        .name => |n| cmap.predefined(n) orelse error.UnsupportedFont,
+        .stream => |s| {
+            const gpa = r.arena_state.child_allocator;
+            var scratch: std.heap.ArenaAllocator = .init(gpa);
+            defer scratch.deinit();
+            const resolved = try cmapStream(r, scratch.allocator(), s, depth);
+            const bytes = if (resolved.parent) |p| try cmap.encodeOver(r.arenaAllocator(), &resolved.b, p) else try cmap.encode(r.arenaAllocator(), &resolved.b, cmap.no_parent);
+            return cmap.fromStream(bytes);
+        },
+        else => error.Malformed,
+    };
+}
+
+/// A CMap stream's definitions over those of the CMap it uses (its usecmap operator, else its
+/// /UseCMap entry): a stream's are merged in; a predefined CMap is named by its index, and
+/// answers what the stream does not map. Identity-H and Identity-V are merged in.
+fn cmapStream(r: *Reader, a: Allocator, s: read.Stream, depth: u32) Error!struct { b: cmap.Builder, parent: ?u16 } {
+    if (depth >= 4) return error.TooDeep;
+    var b = try cmap.parse(a, r.arena_state.child_allocator, try r.streamData(s));
+    const use: ?Object = if (b.usecmap) |n| Object{ .name = n } else try r.getResolved(s.dict, "UseCMap");
+    const u = use orelse return .{ .b = b, .parent = null };
+    switch (u) {
+        .name => |n| {
+            const vertical = std.mem.eql(u8, n, "Identity-V");
+            if (vertical or std.mem.eql(u8, n, "Identity-H")) {
+                var id: cmap.Builder = .{ .wmode = @intFromBool(vertical) };
+                try id.codespace.append(a, .{ .len = 2, .lo = .{ 0, 0, 0, 0 }, .hi = .{ 0xFF, 0xFF, 0, 0 } });
+                try id.map(a, 2, 0, 0xFFFF, 0);
+                return .{ .b = try b.over(a, &id), .parent = null };
+            }
+            return .{ .b = b, .parent = cmap.predefinedIndex(n) orelse return error.UnsupportedFont };
+        },
+        .stream => |ps| {
+            const base = try cmapStream(r, a, ps, depth + 1);
+            return .{ .b = try b.over(a, &base.b), .parent = base.parent };
+        },
+        else => return error.Malformed,
+    }
 }
 
 fn cidOf(r: *Reader, o: Object) Error!u32 {
@@ -1236,32 +1302,29 @@ const Interp = struct {
         var glyphs: std.ArrayList(Glyph) = .empty;
         for (parts) |part| switch (part) {
             .string => |bytes| {
-                const step: usize = if (font.two_byte) 2 else 1;
-                // A two-byte font's string holds whole codes: a last half code is refused,
-                // not dropped.
-                if (bytes.len % step != 0) return error.Malformed;
                 var i: usize = 0;
-                while (i + step <= bytes.len) : (i += step) {
+                while (i < bytes.len) {
+                    const g = font.take(bytes[i..]);
+                    i += g.len;
                     const at = self.origin();
                     self.glyph_count += 1;
                     if (self.glyph_count > self.r.options.max_page_glyphs) return error.TooLarge;
                     const text_at = std.math.cast(u32, text.items.len) orelse return error.TooLarge;
                     try glyphs.append(a, .{ .x = at[0], .y = at[1], .text_at = text_at });
-                    const code: u32 = if (font.two_byte) (@as(u32, bytes[i]) << 8) | bytes[i + 1] else bytes[i];
                     var buf: [max_chars]u21 = undefined;
-                    if (font.unicode(code, @intCast(step), &buf)) |chars| {
+                    if (font.unicode(g, &buf)) |chars| {
                         for (chars) |cp| try appendUtf8(a, &text, cp);
                     } else {
                         try appendUtf8(a, &text, std.unicode.replacement_character);
                         unmapped += 1;
                     }
-                    const word: f64 = if (step == 1 and code == 32) self.gs.word_spacing else 0;
+                    const word: f64 = if (g.len == 1 and g.code == 32) self.gs.word_spacing else 0;
                     // 9.4.4: tx = (w0 Tfs + Tc + Tw) Th, or in vertical writing ty = w1 Tfs + Tc
                     // + Tw, with no horizontal scaling.
                     if (font.vertical) {
-                        self.advance(0, font.vDisplacement(code) / 1000 * self.gs.size + self.gs.char_spacing + word);
+                        self.advance(0, font.vDisplacement(g) / 1000 * self.gs.size + self.gs.char_spacing + word);
                     } else {
-                        const w0 = font.width(code) orelse blk: {
+                        const w0 = font.width(g) orelse blk: {
                             width_known = false;
                             break :blk 0;
                         };
@@ -1530,6 +1593,99 @@ fn streamObject(comptime dict: []const u8, comptime data: []const u8) []const u8
     return std.fmt.comptimePrint("<< {s} /Length {d} >>\nstream\n{s}\nendstream", .{ dict, data.len, data });
 }
 
+test "encoding CMaps, predefined and in the file: codes split by codespace, CIDs give widths and text" {
+    const gpa = testing.allocator;
+    // R (90ms-RKSJ-H): ① 8740 is CID 7555, the one-byte space 20 is CID 231 (U+2002 in Adobe's
+    // Japan1 table, /W 500), 外 8A4F is CID 1422, あ 82A0 is CID 843. Tw 0.5 applies to the
+    // one-byte code 32 (9.3.3): the space moves 500 / 1000 * 10 + 0.5.
+    // V (UniJIS-UCS2-V): vertical; あ い are CIDs 843 and 845.
+    // E (a CMap stream): one-byte codes 00 to 7F and two-byte 8000 to FFFF; 41 is CID 34 (A),
+    // 8001 CID 843; 05 has only a notdef mapping, CID 1 (/W 250), so no character; FF at the end
+    // is half a code: invalid, CID 0, no character.
+    // U (a stream that uses UniJIS-UCS2-H): its own 3042 is CID 999; 3044 falls to the parent.
+    const page =
+        \\BT /R 10 Tf 0.5 Tw 100 700 Td <8740208a4f82a0> Tj 0 Tw ET
+        \\BT /V 10 Tf 300 700 Td <30423044> Tj ET
+        \\BT /E 10 Tf 400 700 Td <41800105ff> Tj ET
+        \\BT /U 10 Tf 500 700 Td <30423044> Tj ET
+    ;
+    const stream_cmap =
+        \\/CIDInit /ProcSet findresource begin 12 dict begin begincmap
+        \\2 begincodespacerange <00> <7F> <8000> <FFFF> endcodespacerange
+        \\1 begincidrange <41> <5a> 34 endcidrange
+        \\1 begincidchar <8001> 843 endcidchar
+        \\1 beginnotdefrange <00> <1f> 1 endnotdefrange
+        \\endcmap CMapName currentdict /CMap defineresource pop end end
+    ;
+    const japan1 = "/CIDSystemInfo << /Registry (Adobe) /Ordering (Japan1) /Supplement 6 >>";
+    const pdf = try read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 20 0 R] /Count 4 /MediaBox [0 0 612 792] /Resources << /Font << /R 9 0 R /V 10 0 R /E 11 0 R /U 12 0 R /X 13 0 R /S 14 0 R /I 21 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 8 0 R >>",
+        streamObject("", page),
+        streamObject("", "BT /X 10 Tf <0041> Tj ET"),
+        streamObject("", "BT /S 10 Tf <41> Tj ET"),
+        "<< /Type /Font /Subtype /Type0 /BaseFont /R /Encoding /90ms-RKSJ-H /DescendantFonts [15 0 R] >>",
+        "<< /Type /Font /Subtype /Type0 /BaseFont /V /Encoding /UniJIS-UCS2-V /DescendantFonts [15 0 R] >>",
+        "<< /Type /Font /Subtype /Type0 /BaseFont /E /Encoding 16 0 R /DescendantFonts [15 0 R] >>",
+        "<< /Type /Font /Subtype /Type0 /BaseFont /U /Encoding 17 0 R /DescendantFonts [15 0 R] >>",
+        // Refused: a stream that uses a CMap that is not predefined.
+        "<< /Type /Font /Subtype /Type0 /BaseFont /X /Encoding 18 0 R /DescendantFonts [15 0 R] >>",
+        // A stream that uses itself, through /UseCMap: refused, not followed forever.
+        "<< /Type /Font /Subtype /Type0 /BaseFont /S /Encoding 19 0 R /DescendantFonts [15 0 R] >>",
+        "<< /Type /Font /Subtype /CIDFontType0 /BaseFont /C " ++ japan1 ++ " /W [1 [250] 34 [600] 231 [500] 843 [900] 999 [700]] >>",
+        streamObject("/Type /CMap", stream_cmap),
+        streamObject("/Type /CMap", "/UniJIS-UCS2-H usecmap 1 begincidchar <3042> 999 endcidchar"),
+        streamObject("/Type /CMap", "/Not-A-CMap usecmap"),
+        streamObject("/Type /CMap /UseCMap 19 0 R", "1 begincodespacerange <00> <FF> endcodespacerange"),
+        "<< /Type /Page /Parent 2 0 R /Contents 22 0 R >>",
+        // I uses Identity-V with one code of its own: 0022 is CID 843; 0001 is CID 1 by Identity.
+        "<< /Type /Font /Subtype /Type0 /BaseFont /I /Encoding 23 0 R /DescendantFonts [15 0 R] >>",
+        streamObject("", "BT /I 10 Tf 600 700 Td <00220001> Tj ET"),
+        streamObject("/Type /CMap", "/Identity-V usecmap 1 begincidchar <0022> 843 endcidchar"),
+    }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    var pt = try r.pageText(gpa, 0);
+    defer pt.deinit();
+    try testing.expectEqual(@as(usize, 4), pt.runs.len);
+
+    const rk = pt.runs[0];
+    try testing.expectEqualStrings("\u{2460}\u{2002}\u{5916}\u{3042}", rk.text);
+    try testing.expectEqual(@as(u32, 0), rk.unmapped);
+    for ([_]f64{ 100, 110, 115.5, 125.5 }, rk.glyphs) |x, g| try testing.expectApproxEqAbs(x, g.x, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 34.5), rk.width.?, 1e-9);
+    try testing.expect(!rk.vertical);
+
+    const v = pt.runs[1];
+    try testing.expectEqualStrings("\u{3042}\u{3044}", v.text);
+    try testing.expect(v.vertical);
+    try testing.expectApproxEqAbs(@as(f64, 690), v.glyphs[1].y, 1e-9);
+
+    // 41: /W 600; 8001: CID 843, 900; 05: CID 1, 250; FF: CID 0, /DW 1000.
+    const e = pt.runs[2];
+    try testing.expectEqualStrings("A\u{3042}\u{fffd}\u{fffd}", e.text);
+    try testing.expectEqual(@as(u32, 2), e.unmapped);
+    for ([_]f64{ 400, 406, 415, 417.5 }, e.glyphs) |x, g| try testing.expectApproxEqAbs(x, g.x, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 27.5), e.width.?, 1e-9);
+
+    // 3042 is CID 999 (/W 700) by the stream; 3044 is CID 845 by UniJIS-UCS2-H (/DW 1000).
+    const u = pt.runs[3];
+    try testing.expectApproxEqAbs(@as(f64, 507), u.glyphs[1].x, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 17), u.width.?, 1e-9);
+    try testing.expectEqualStrings("\u{3044}", u.text[u.glyphs[1].text_at..]);
+
+    try testing.expectError(error.UnsupportedFont, r.pageText(gpa, 1));
+    try testing.expectError(error.TooDeep, r.pageText(gpa, 2));
+    var id = try r.pageText(gpa, 3);
+    defer id.deinit();
+    try testing.expectEqualStrings("\u{3042} ", id.runs[0].text);
+    try testing.expect(id.runs[0].vertical);
+}
+
 test "Identity-V: glyphs move by /W2 and /DW2's w1 and Tc along y, TJ along y, with no Tz or Tw" {
     const gpa = testing.allocator;
     // Tc 2, Tz 50 and Tw 3 hold for every run. By ISO 32000-1 9.4.4, a vertical glyph moves the
@@ -1608,7 +1764,7 @@ test "text state, matrices, encodings, CMaps, inline images and forms give the r
         \\BT 0 Tc 0 Tw 100 Tz 0 Ts /F2 12 Tf 50 400 Td <00010002000A01010020002100050003> Tj ET
         \\BI /W 11 /H 1 /BPC 8 /CS /G ID
     ++ "\x00EI (Z) Tj \nEI\n/X1 Do\nBT 10 30 TD T* <0001> Tj ET";
-    const cmap =
+    const to_unicode =
         \\/CIDInit /ProcSet findresource begin 12 dict begin begincmap
         \\1 begincodespacerange <0000> <FFFF> endcodespacerange
         \\2 beginbfchar <0001> <0041> <0003> <D83DDE00> endbfchar
@@ -1627,14 +1783,15 @@ test "text state, matrices, encodings, CMaps, inline images and forms give the r
         "<< /Type /Page /Parent 2 0 R >>",
         "<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+Helvetica /Encoding << /BaseEncoding /WinAnsiEncoding /Differences [65 /uni00C5 /f_i /eacute.sc 128 /bogusname] >> >>",
         "<< /Type /Font /Subtype /Type0 /BaseFont /Test /Encoding /Identity-H /DescendantFonts [15 0 R] /ToUnicode 16 0 R >>",
-        "<< /Type /Font /Subtype /Type0 /BaseFont /V /Encoding /UniJIS-UCS2-H /DescendantFonts [15 0 R] >>",
+        // UniJIS-UTF32-H is one of Adobe's CMaps but not one of Table 118's predefined ones.
+        "<< /Type /Font /Subtype /Type0 /BaseFont /V /Encoding /UniJIS-UTF32-H /DescendantFonts [15 0 R] >>",
         streamObject("/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Matrix [1 0 0 1 300 0]", "BT /F1 8 Tf 0 0 Td (A\x80) Tj ET"),
         streamObject("/Type /XObject /Subtype /Form /BBox [0 0 1 1] /Resources << /XObject << /X2 11 0 R >> >>", "/X2 Do"),
         streamObject("", page1),
         streamObject("", "BT /F3 12 Tf <0001> Tj ET"),
         streamObject("", "/X2 Do"),
         "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Test /W [1 [500 600] 10 20 250] /DW 1000 >>",
-        streamObject("", cmap),
+        streamObject("", to_unicode),
     }, "");
     defer gpa.free(pdf);
     var r = try Reader.open(gpa, pdf, .{});
@@ -1916,8 +2073,13 @@ test "the interpreter: budgets, finite results, forms keep their q/Q and BMC/EMC
     var rf = try Reader.open(gpa, far, .{});
     defer rf.deinit();
     try testing.expectError(error.Malformed, rf.pageText(gpa, 0));
-    // An odd byte at the end of a two-byte font's string: refused.
-    try testing.expectError(error.Malformed, r.pageText(gpa, 2));
+    // An odd byte at the end of a two-byte font's string matches no codespace range: it is one
+    // invalid code (9.7.6.2), drawn as CID 0 with /DW's width, and has no character.
+    var half = try r.pageText(gpa, 2);
+    defer half.deinit();
+    try testing.expectEqual(@as(usize, 2), half.runs[0].glyphs.len);
+    try testing.expectEqual(@as(u32, 2), half.runs[0].unmapped);
+    try testing.expectApproxEqAbs(@as(f64, 20), half.runs[0].width.?, 1e-9);
     var few_ops = try Reader.open(gpa, pdf, .{ .max_operations = 5 });
     defer few_ops.deinit();
     try testing.expectError(error.TooLarge, few_ops.pageText(gpa, 0));

@@ -249,6 +249,27 @@ pub fn build(b: *std.Build) void {
     image_test.has_side_effects = true;
     b.step("image-test", "Draw every test image with zpdf, render it with MuPDF, and compare it with pypng and Pillow").dependOn(&image_test.step);
 
+    // Every code of every predefined CMap, as zpdf reads it, against pdfminer's tables, which are
+    // built from Adobe's cid2code.txt, not from the CMap files (tools/cmap-oracle.py). Needs uv.
+    const cmap_mod = b.createModule(.{
+        .root_source_file = b.path("src/cmap.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    addCidMaps(cmap_mod, &cid, true);
+    const cmap_dump_mod = b.createModule(.{
+        .root_source_file = b.path("tools/cmap-dump.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    cmap_dump_mod.addImport("cmap", cmap_mod);
+    const cmap_dump = b.addExecutable(.{ .name = "cmap-dump", .root_module = cmap_dump_mod });
+    const cmap_test = b.addSystemCommand(&.{ "uv", "run", "tools/cmap-oracle.py", "--exe" });
+    cmap_test.addFileArg(cmap_dump.getEmittedBin());
+    cmap_test.setCwd(b.path("."));
+    cmap_test.has_side_effects = true;
+    b.step("cmap-test", "Compare every code of every predefined CMap with pdfminer's tables").dependOn(&cmap_test.step);
+
     b.installArtifact(native);
     const abi_step = b.step("abi", "Install libzpdf, include/zpdf.h and csharp/Zpdf.Abi.g.cs");
     abi_step.dependOn(&b.addInstallArtifact(native, .{}).step);
@@ -325,6 +346,8 @@ pub fn build(b: *std.Build) void {
     notices_run.addFileArg(b.path("src/read_tables.zig"));
     notices_run.addFileArg(kb.path("LICENSE"));
     for (cid_orderings) |ordering| notices_run.addFileArg(b.path(b.fmt("src/cid/Adobe-{s}-UCS2", .{ordering})));
+    notices_run.addArg("--");
+    for (cmapFiles(b)) |path| notices_run.addFileArg(b.path(path));
     const update_notices = b.addUpdateSourceFiles();
     update_notices.addCopyFileToSource(notices, "THIRD-PARTY-NOTICES.md");
     b.step("notices", "Write THIRD-PARTY-NOTICES.md from the files it covers").dependOn(&update_notices.step);
@@ -581,7 +604,12 @@ fn readRootFile(b: *std.Build, sub_path: []const u8, limit: usize) ![]u8 {
 /// The orderings src/cid has a CID-to-Unicode CMap for (Adobe-<ordering>-UCS2).
 const cid_orderings = [_][]const u8{ "Japan1", "GB1", "CNS1", "Korea1", "KR" };
 
-const CidMaps = [cid_orderings.len]std.Build.LazyPath;
+const CidMaps = struct {
+    /// Each ordering's CidTable.
+    tables: [cid_orderings.len]std.Build.LazyPath,
+    /// src/cmap's predefined CMaps, compiled by tools/gen-cmaps.zig (src/cmap.zig reads them).
+    cmaps: std.Build.LazyPath,
+};
 
 /// Each of src/cid's CMaps compiled to a CidTable by tools/gen-cid-table.zig, built for the
 /// host once. The tool builds src/read_text.zig as its own module with no tables, so it does
@@ -603,11 +631,26 @@ fn packCidMaps(b: *std.Build) CidMaps {
     gen_mod.addImport("read_text", read_text);
     const gen = b.addExecutable(.{ .name = "gen-cid-table", .root_module = gen_mod });
     var maps: CidMaps = undefined;
-    for (cid_orderings, &maps) |ordering, *map| {
+    for (cid_orderings, &maps.tables) |ordering, *map| {
         const run = b.addRunArtifact(gen);
         run.addFileArg(b.path(b.fmt("src/cid/Adobe-{s}-UCS2", .{ordering})));
         map.* = run.addOutputFileArg(b.fmt("Adobe-{s}-UCS2.cidtable", .{ordering}));
     }
+    const cmap_mod = b.createModule(.{
+        .root_source_file = b.path("src/cmap.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    cmap_mod.addOptions("read_options", no_tables);
+    const gen_cmaps_mod = b.createModule(.{
+        .root_source_file = b.path("tools/gen-cmaps.zig"),
+        .target = b.graph.host,
+        .optimize = .ReleaseSafe,
+    });
+    gen_cmaps_mod.addImport("cmap", cmap_mod);
+    const gen_cmaps = b.addRunArtifact(b.addExecutable(.{ .name = "gen-cmaps", .root_module = gen_cmaps_mod }));
+    maps.cmaps = gen_cmaps.addOutputFileArg("cmaps.bin");
+    for (cmapFiles(b)) |path| gen_cmaps.addFileArg(b.path(path));
     return maps;
 }
 
@@ -619,7 +662,27 @@ fn addCidMaps(m: *std.Build.Module, maps: *const CidMaps, use: bool) void {
     o.addOption(bool, "cid_tables", use);
     m.addOptions("read_options", o);
     if (!use) return;
-    for (cid_orderings, maps) |ordering, map| {
+    for (cid_orderings, maps.tables) |ordering, map| {
         m.addAnonymousImport(m.owner.fmt("cid_{s}", .{ordering}), .{ .root_source_file = map });
     }
+    m.addAnonymousImport("cid_cmaps", .{ .root_source_file = maps.cmaps });
+}
+
+/// src/cmap's files, sorted: the predefined CMaps.
+fn cmapFiles(b: *std.Build) []const []const u8 {
+    b.dependOnDirectoryContents(b.path("src/cmap"));
+    var dir = b.root.openDir(b.graph.io, "src/cmap", .{ .iterate = true }) catch |err| std.debug.panic("src/cmap: {t}", .{err});
+    defer dir.close(b.graph.io);
+    var list: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (it.next(b.graph.io) catch |err| std.debug.panic("src/cmap: {t}", .{err})) |entry| {
+        if (entry.kind != .file) continue;
+        list.append(b.allocator, b.fmt("src/cmap/{s}", .{entry.name})) catch @panic("OOM");
+    }
+    std.mem.sort([]const u8, list.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.lt);
+    return list.items;
 }
