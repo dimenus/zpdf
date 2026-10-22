@@ -1296,7 +1296,7 @@ pub const Lexer = struct {
     }
 };
 
-fn isNumberStart(c: u8) bool {
+pub fn isNumberStart(c: u8) bool {
     return std.ascii.isDigit(c) or c == '+' or c == '-' or c == '.';
 }
 
@@ -1328,6 +1328,12 @@ pub const Parser = struct {
         return self.fromToken(try self.lx.next(self.arena), depth);
     }
 
+    fn notRef(self: *Parser, err: Error, save: usize, i: i64) Error!Object {
+        if (err != error.Malformed) return err;
+        self.lx.pos = save;
+        return .{ .integer = i };
+    }
+
     pub fn fromToken(self: *Parser, t: Token, depth: u32) Error!Object {
         switch (t) {
             .eof, .array_close, .dict_close => return error.Malformed,
@@ -1335,11 +1341,13 @@ pub const Parser = struct {
             .string => |s| return .{ .string = s },
             .name => |n| return .{ .name = n },
             .integer => |i| {
-                // "n g R" is a reference; anything else leaves the lexer where it was.
+                // "n g R" is a reference; anything else leaves the lexer where it was. A token
+                // that does not lex is not a reference either: its caller reads it again and
+                // decides, so a content stream can skip `1 0.00-30 m` (read_text's Interp.run).
                 const save = self.lx.pos;
-                const g = try self.lx.next(self.arena);
+                const g = self.lx.next(self.arena) catch |err| return self.notRef(err, save, i);
                 if (g == .integer) {
-                    const r = try self.lx.next(self.arena);
+                    const r = self.lx.next(self.arena) catch |err| return self.notRef(err, save, i);
                     if (r == .keyword and std.mem.eql(u8, r.keyword, "R")) {
                         if (i <= 0 or i > std.math.maxInt(u32) or g.integer < 0 or g.integer > 65535) return error.Malformed;
                         return .{ .ref = .{ .num = @intCast(i), .gen = @intCast(g.integer) } };

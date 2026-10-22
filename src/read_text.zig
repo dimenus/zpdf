@@ -1101,8 +1101,22 @@ const Interp = struct {
         var lx: read.Lexer = .{ .src = content, .pos = 0 };
         var p: read.Parser = .{ .lx = &lx, .arena = a, .max_depth = self.r.options.max_depth };
         var operands: std.ArrayList(Object) = .empty;
+        // A word that starts like a number but is not one (`0.00-30`), among the operands of the
+        // next operator. Writers make these in path coordinates; the operator is skipped, unless
+        // it is one this reader acts on, which then refuses the page rather than guess a value.
+        var bad_operand = false;
         while (true) {
-            const t = try lx.next(a);
+            lx.skipWhite();
+            const start = lx.pos;
+            const t = lx.next(a) catch |err| switch (err) {
+                // The lexer reads a word from a number's first character and fails only when
+                // the word is not a number; any other refusal (a string, a dictionary) stands.
+                error.Malformed => if (start < content.len and read.isNumberStart(content[start])) {
+                    bad_operand = true;
+                    continue;
+                } else return err,
+                else => return err,
+            };
             switch (t) {
                 .eof => break,
                 .keyword => |op| {
@@ -1116,7 +1130,10 @@ const Interp = struct {
                     if (eql(u8, op, "BI")) {
                         try skipInlineImage(&lx, a, self.r.options.max_depth);
                         self.noteImage();
+                    } else if (bad_operand) {
+                        if (readsOperator(op)) return error.Malformed;
                     } else try self.operator(op, operands.items, resources, depth);
+                    bad_operand = false;
                     operands.clearRetainingCapacity();
                     _ = tokens.reset(.retain_capacity);
                 },
@@ -1135,7 +1152,17 @@ const Interp = struct {
         return v;
     }
 
+    /// The operators the interpreter acts on. operator() returns at once for any other, so an
+    /// operator added there and not here never runs, and its test fails.
+    fn readsOperator(op: []const u8) bool {
+        const ops = [_][]const u8{ "q", "Q", "cm", "BT", "Tf", "Tc", "Tw", "Tz", "TL", "Ts", "Td", "TD", "Tm", "T*", "Tj", "TJ", "'", "\"", "Do", "gs", "BMC", "BDC", "EMC" };
+        for (ops) |o| if (std.mem.eql(u8, op, o)) return true;
+        return false;
+    }
+
     fn operator(self: *Interp, op: []const u8, ops: []const Object, resources: Dict, depth: u32) Error!void {
+        // Every other operator (paths, painting, colour, line style) draws no text.
+        if (!readsOperator(op)) return;
         const eql = std.mem.eql;
         if (eql(u8, op, "q")) {
             if (self.stack.items.len >= 1024) return error.TooDeep;
@@ -1261,7 +1288,6 @@ const Interp = struct {
             // so the outermost ActualText is the text.
             try self.mergeActual(m.first_run, actual);
         }
-        // Every other operator (paths, colour, images, marked content) draws no text.
     }
 
     /// The /ActualText of the structure element a marked-content sequence belongs to by its
@@ -2354,6 +2380,44 @@ test "the interpreter: budgets, finite results, forms keep their q/Q and BMC/EMC
     var few_glyphs = try Reader.open(gpa, pdf, .{ .max_page_glyphs = 2 });
     defer few_glyphs.deinit();
     try testing.expectError(error.TooLarge, few_glyphs.pageText(gpa, 0));
+}
+
+test "a word that starts like a number and is not one skips its operator, unless the reader acts on it" {
+    const gpa = testing.allocator;
+    const pdf = try read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R 9 0 R] /Count 4 /MediaBox [0 0 612 792] /Resources << /Font << /F1 10 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+        // A path's and a colour's operators skipped; an inline image after a bad word is still
+        // skipped to its EI, so its "(" is not read as a string.
+        streamObject("",
+            \\0.00-30 5 m 10 0.00-30 l 10 20 0.00-30 5 re S 1.-2 g 3-4 BI /W 1 /H 1 /CS /G /BPC 8 ID ( EI
+            \\BT /F1 10 Tf 7 8 Td (A) Tj ET
+        ),
+        "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>",
+        // Td still has two numbers without the bad word; it is refused all the same.
+        streamObject("", "BT /F1 10 Tf 1 0.00-30 5 Td (A) Tj ET"),
+        "<< /Type /Page /Parent 2 0 R /Contents 8 0 R >>",
+        // Inside an array the word is part of an object, which is refused.
+        streamObject("", "BT /F1 10 Tf [(A) 1-2 (B)] TJ ET"),
+        "<< /Type /Page /Parent 2 0 R /Contents 11 0 R >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        // A refusal that is not a word: a stray ")".
+        streamObject("", ") 0 0 m BT /F1 10 Tf (A) Tj ET"),
+    }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    var pt = try r.pageText(gpa, 0);
+    defer pt.deinit();
+    try testing.expectEqual(@as(usize, 1), pt.runs.len);
+    try testing.expectEqualStrings("A", pt.runs[0].text);
+    try testing.expectApproxEqAbs(@as(f64, 7), pt.runs[0].x, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 8), pt.runs[0].y, 1e-9);
+    // Td's operand has no value to guess.
+    try testing.expectError(error.Malformed, r.pageText(gpa, 1));
+    try testing.expectError(error.Malformed, r.pageText(gpa, 2));
+    try testing.expectError(error.Malformed, r.pageText(gpa, 3));
 }
 
 test "a PageText outlives its reader and the file's bytes" {
