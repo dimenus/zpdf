@@ -122,7 +122,8 @@ public sealed unsafe class PdfReader : IDisposable
                 run.size,
                 double.IsNaN(run.width) ? null : run.width,
                 checked((int)run.unmapped),
-                (run.flags & 1) != 0);
+                (run.flags & (uint)RunFlag.ActualText) != 0,
+                (run.flags & (uint)RunFlag.Vertical) != 0);
         }
         return new PageText(runs, checked((int)header.unplaced_actual_text));
     }
@@ -162,12 +163,17 @@ public sealed record PdfPage(int Index, PdfBox MediaBox, PdfBox CropBox, int Rot
 /// <summary>One run of text a page draws: glyphs drawn in one text-showing operation with one
 /// font and size.</summary>
 /// <param name="Font">The font's /BaseFont, possibly empty.</param>
-/// <param name="X">The origin of the run's first glyph.</param>
-/// <param name="Width">The run's advance, or null when a glyph's width is unknown.</param>
+/// <param name="X">The origin of the run's first glyph: in vertical writing, its vertical origin
+/// (see <paramref name="IsVertical"/>).</param>
+/// <param name="Width">The run's advance, or null when a glyph's width is unknown. In vertical
+/// writing it runs along the text's y axis.</param>
 /// <param name="UnmappedCodes">Codes with no Unicode mapping; each is U+FFFD in
 /// <paramref name="Text"/>.</param>
 /// <param name="IsActualText">The text is the span's /ActualText, which replaces what the glyphs
 /// map to.</param>
+/// <param name="IsVertical">Vertical writing (an /Identity-V font): each glyph moves the text
+/// position along the text's y axis, usually down the page, and a glyph's position is the text
+/// position it is drawn at, which is its vertical origin.</param>
 public sealed record TextRun(
     string Text,
     string Font,
@@ -176,7 +182,8 @@ public sealed record TextRun(
     double Size,
     double? Width,
     int UnmappedCodes,
-    bool IsActualText);
+    bool IsActualText,
+    bool IsVertical);
 
 /// <param name="Runs">In the order the page draws them.</param>
 /// <param name="UnplacedActualText">/ActualText spans that drew no glyph, so their text is in

@@ -58,6 +58,17 @@ internal enum ZpdfError
     Unknown = -127,
 }
 
+// RunRecord.flags: a run has the bit 1 << n for each flag n that is true of it.
+[System.Flags]
+internal enum RunFlag : uint
+{
+    // The text is the span's /ActualText (zpdf.read.TextRun.actual_text).
+    ActualText = 1u << 0,
+    // Vertical writing (zpdf.read.TextRun.vertical): each glyph moves the text position along
+    // text space's y axis, and a glyph's position is its vertical origin.
+    Vertical = 1u << 1,
+}
+
 // zpdf_font_axes: one per axis, in fvar order.
 [StructLayout(LayoutKind.Sequential, Size = 20)]
 internal unsafe struct AxisRecord
@@ -187,7 +198,7 @@ internal unsafe struct RunRecord
     public uint glyph_count;
     // Codes with no Unicode mapping; each is U+FFFD in the text.
     public uint unmapped;
-    // Bit 0: the text is the span's /ActualText (zpdf.read.TextRun.actual_text).
+    // The RunFlag bits.
     public uint flags;
 }
 
@@ -203,7 +214,7 @@ internal unsafe struct GlyphRecord
 
 internal static unsafe partial class ZpdfAbi
 {
-    public const uint AbiVersion = 6;
+    public const uint AbiVersion = 7;
     public const string LibraryName = "zpdf";
 
     // abi_version. A caller checks it once, when it loads the library.

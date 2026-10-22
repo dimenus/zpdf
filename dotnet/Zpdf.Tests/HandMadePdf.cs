@@ -6,7 +6,7 @@ namespace Zpdf.Tests;
 
 // A one-page PDF written byte by byte, for what zpdf's fixtures do not
 // have: a rotation and a crop box, /ActualText (placed on glyphs, and with no glyph), a code with
-// no Unicode mapping, and a font with no widths.
+// no Unicode mapping, a font with no widths, and vertical writing.
 internal static class HandMadePdf
 {
     public static byte[] Write()
@@ -17,17 +17,22 @@ internal static class HandMadePdf
             // ActualText with no glyph in it: counted, in no run.
             + "/Span <</ActualText (unplaced)>> BDC EMC\n"
             // F2 maps code 0x41 to a glyph name with no Unicode value, and has no /Widths.
-            + "BT /F2 10 Tf 100 600 Td (AB) Tj ET\n";
+            + "BT /F2 10 Tf 100 600 Td (AB) Tj ET\n"
+            // F3 writes vertically: each glyph moves the text position by /DW2's default w1,
+            // -1000 / 1000 * 10.
+            + "BT /F3 10 Tf 300 500 Td <00010002> Tj ET\n";
         var objects = new List<string>
         {
             "<< /Type /Catalog /Pages 2 0 R >>",
             "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
             "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 600 800] /CropBox [50 60 550 760] /Rotate 90 "
-                + "/Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>",
+                + "/Resources << /Font << /F1 5 0 R /F2 6 0 R /F3 7 0 R >> >> /Contents 4 0 R >>",
             $"<< /Length {content.Length} >>\nstream\n{content}\nendstream",
             "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
             "<< /Type /Font /Subtype /Type1 /BaseFont /Mystery "
                 + "/Encoding << /Differences [65 /zz.unknown 66 /B] >> >>",
+            "<< /Type /Font /Subtype /Type0 /BaseFont /Tate /Encoding /Identity-V "
+                + "/DescendantFonts [<< /Type /Font /Subtype /CIDFontType2 /BaseFont /Tate >>] >>",
         };
 
         var pdf = new StringBuilder("%PDF-1.7\n");
