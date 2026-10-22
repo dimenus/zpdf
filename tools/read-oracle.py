@@ -36,6 +36,11 @@ excused; each one is in the code beside the place it applies:
 - mutool splits ligature characters unless asked not to (preserve-ligatures).
 - mutool draw leaves out text that the clip hides completely (FZ_STEXT_CLIP, set by mudraw.c
   unless clip=no). zpdf gives all the text a page draws, so mutool is asked for it too (clip=no).
+- mutool draw -F stext collects styles (FZ_STEXT_COLLECT_STYLES, set by mudraw.c for every text
+  format but txt). With it, a glyph drawn twice at one place is given once (taken as fake bold),
+  and the text MuPDF places on an image for an ActualText span with no glyph
+  (fz_stext_end_metatext) is missing from the output, though txt has it. zpdf gives both, so
+  mutool is asked without styles (collect-styles=no).
 - mutool maps a CID with no /ToUnicode through MuPDF's copy of Adobe's CID-to-Unicode table for
   the font's collection, which can be an older version than zpdf's (src/cid): MuPDF 1.28.5 has
   Adobe-Japan1-UCS2 8.004, zpdf 10.002. A page whose only text differences are pairs that the two
@@ -105,7 +110,8 @@ def mutool_pages(path):
     when mutool cannot read the file."""
     # preserve-ligatures: mutool otherwise splits U+FB03 into "ffi", which is not what the file says.
     # clip=no: mutool otherwise leaves out text the clip hides; zpdf gives all the text drawn.
-    p = subprocess.run(["mutool", "draw", "-q", "-F", "stext", "-O", "preserve-ligatures,clip=no", "-o", "-", path], capture_output=True, timeout=120)
+    # collect-styles=no: mutool otherwise drops a glyph drawn twice, and an image's ActualText.
+    p = subprocess.run(["mutool", "draw", "-q", "-F", "stext", "-O", "preserve-ligatures,clip=no,collect-styles=no", "-o", "-", path], capture_output=True, timeout=120)
     damaged = b"repair" in p.stderr or b"broken" in p.stderr
     if p.returncode != 0:
         return None, damaged
