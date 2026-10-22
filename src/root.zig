@@ -32,6 +32,9 @@ pub const PathCommand = instancer.PathCommand;
 pub const FontId = pdf.FontId;
 pub const PageId = pdf.PageId;
 pub const ImageId = pdf.ImageId;
+pub const BookmarkId = pdf.BookmarkId;
+pub const Destination = pdf.Destination;
+pub const LinkTarget = pdf.LinkTarget;
 
 test {
     _ = abi;

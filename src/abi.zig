@@ -71,12 +71,12 @@ const is_wasm = builtin.target.cpu.arch == .wasm32;
 
 /// Changes when an export, a wire record or an error code changes. A caller checks it once,
 /// when it loads the library.
-pub const abi_version: u32 = 7;
+pub const abi_version: u32 = 8;
 
 /// The hash of the ABI that abi_version names (surfaceHash). The test "exports: the ABI surface
 /// is the one abi_version names" fails when they differ: then bump abi_version and set this to
 /// the hash the test prints.
-const abi_surface: u64 = 0x0043908598ebb832;
+const abi_surface: u64 = 0x9645d39643ea65cd;
 
 comptime {
     // The records are written with their in-memory bytes; every target zpdf builds for
@@ -741,6 +741,18 @@ pub const Runtime = struct {
         try d.doc.drawImage(@fromBackingInt(@intCast(page)), @fromBackingInt(image), x, y, width, height);
     }
 
+    pub fn docAddLink(rt: *Runtime, handle: u32, page: u32, x: f64, y: f64, width: f64, height: f64, target: zpdf.LinkTarget) !void {
+        const d = try rt.doc(handle);
+        try d.doc.addLink(@fromBackingInt(@intCast(page)), x, y, width, height, target);
+    }
+
+    /// The bookmark's id is its zpdf.BookmarkId + 1, so that a parent of 0 is the top level.
+    pub fn docAddBookmark(rt: *Runtime, handle: u32, parent: u32, title: []const u8, dest: zpdf.Destination, open: bool) !u32 {
+        const d = try rt.doc(handle);
+        const p: ?zpdf.BookmarkId = if (parent == 0) null else @fromBackingInt(parent - 1);
+        return @backingInt(try d.doc.addBookmark(p, title, dest, open)) + 1;
+    }
+
     pub fn docDrawLine(rt: *Runtime, handle: u32, page: u32, x1: f64, y1: f64, x2: f64, y2: f64, width: f64, color: zpdf.Color) !void {
         const d = try rt.doc(handle);
         try d.doc.drawLine(@fromBackingInt(@intCast(page)), x1, y1, x2, y2, width, color);
@@ -979,6 +991,9 @@ pub const error_codes = [_]struct { anyerror, i32 }{
     .{ error.InvalidImage, -37 },
     .{ error.UnsupportedImage, -38 },
     .{ error.UnsupportedEncryption, -39 },
+    .{ error.MissingPage, -40 },
+    .{ error.InvalidUri, -41 },
+    .{ error.InvalidBookmark, -42 },
 };
 pub const unknown_code: i32 = -127;
 
@@ -1469,6 +1484,41 @@ pub const exports = struct {
         const c = Context.enter(ctx) catch |err| return mapError(err);
         defer c.leave();
         c.rt.docDrawImage(doc, page_id, image_id, x, y, width, height) catch |err| return mapError(err);
+        return 0;
+    }
+
+    /// Makes the rectangle with bottom-left (x, y), width by height, on the open page a link to a
+    /// URI: printable ASCII with no space (percent-encode the rest), else InvalidUri. The area has
+    /// no border: draw what shows it (zpdf.Document's addLink).
+    pub fn zpdf_doc_add_link_uri(ctx: ?*Context, doc: u32, page_id: u32, x: f64, y: f64, width: f64, height: f64, uri: ?[*]const u8, len: usize) callconv(.c) i32 {
+        const u = input(uri, len) catch |err| return mapError(err);
+        const c = Context.enter(ctx) catch |err| return mapError(err);
+        defer c.leave();
+        c.rt.docAddLink(doc, page_id, x, y, width, height, .{ .uri = u }) catch |err| return mapError(err);
+        return 0;
+    }
+
+    /// The same, a link to page target_page (0 is the first; a page not begun yet is allowed)
+    /// shown with (dest_x, dest_y) at the window's top left, the zoom unchanged. zpdf_doc_finish
+    /// is MissingPage while a page a link or bookmark goes to has not been begun.
+    pub fn zpdf_doc_add_link_page(ctx: ?*Context, doc: u32, page_id: u32, x: f64, y: f64, width: f64, height: f64, target_page: u32, dest_x: f64, dest_y: f64) callconv(.c) i32 {
+        const c = Context.enter(ctx) catch |err| return mapError(err);
+        defer c.leave();
+        c.rt.docAddLink(doc, page_id, x, y, width, height, .{ .page = .{ .page_index = target_page, .x = dest_x, .y = dest_y } }) catch |err| return mapError(err);
+        return 0;
+    }
+
+    /// Adds a bookmark titled with UTF-8 `title` that goes to target_page as in
+    /// zpdf_doc_add_link_page: at the top level when parent is 0, else as the last child of the
+    /// bookmark whose id parent is (InvalidBookmark otherwise). open (0 or 1) shows its children
+    /// at first. Ids start at 1. Any time before zpdf_doc_finish, a page open or not.
+    pub fn zpdf_doc_add_bookmark(ctx: ?*Context, doc: u32, parent: u32, title: ?[*]const u8, len: usize, target_page: u32, dest_x: f64, dest_y: f64, open: u32, out_bookmark_id: ?*u32) callconv(.c) i32 {
+        const o = output(u32, out_bookmark_id) catch |err| return mapError(err);
+        const t = input(title, len) catch |err| return mapError(err);
+        if (open > 1) return mapError(error.InvalidNumber);
+        const c = Context.enter(ctx) catch |err| return mapError(err);
+        defer c.leave();
+        o.* = c.rt.docAddBookmark(doc, parent, t, .{ .page_index = target_page, .x = dest_x, .y = dest_y }, open == 1) catch |err| return mapError(err);
         return 0;
     }
 
@@ -2739,6 +2789,46 @@ test "sinks: draw_text_later's form is in the caller's memory when it returns, e
     const none = try c.rt.docFinish(d);
     c.rt.gpa.free(none);
     try c.rt.docClose(d);
+}
+
+test "exports: links and bookmarks, their ids from 1, and their refusals' codes" {
+    const gpa = std.testing.allocator;
+    const c = try Context.create(gpa);
+    defer c.destroy();
+    const e = exports;
+    var d: u32 = 0;
+    try std.testing.expectEqual(@as(i32, 0), e.zpdf_doc_new(c, 0, &d));
+    var page: u32 = 0;
+    try std.testing.expectEqual(@as(i32, 0), e.zpdf_doc_begin_page(c, d, 612, 792, &page));
+    const uri = "https://example.com/";
+    try std.testing.expectEqual(@as(i32, 0), e.zpdf_doc_add_link_uri(c, d, page, 72, 700, 100, 12, uri, uri.len));
+    try std.testing.expectEqual(mapError(error.InvalidUri), e.zpdf_doc_add_link_uri(c, d, page, 72, 700, 100, 12, "a b", 3));
+    // To page 1, not begun yet.
+    try std.testing.expectEqual(@as(i32, 0), e.zpdf_doc_add_link_page(c, d, page, 72, 680, 100, 12, 1, 0, 792));
+    var top: u32 = 0;
+    var child: u32 = 0;
+    try std.testing.expectEqual(@as(i32, 0), e.zpdf_doc_add_bookmark(c, d, 0, "Top", 3, 0, 0, 792, 1, &top));
+    try std.testing.expectEqual(@as(u32, 1), top);
+    try std.testing.expectEqual(@as(i32, 0), e.zpdf_doc_add_bookmark(c, d, top, "Child", 5, 1, 0, 700, 0, &child));
+    try std.testing.expectEqual(@as(u32, 2), child);
+    try std.testing.expectEqual(mapError(error.InvalidBookmark), e.zpdf_doc_add_bookmark(c, d, 3, "x", 1, 0, 0, 0, 0, &child));
+    try std.testing.expectEqual(mapError(error.InvalidNumber), e.zpdf_doc_add_bookmark(c, d, 0, "x", 1, 0, 0, 0, 2, &child));
+    try std.testing.expectEqual(mapError(error.InvalidUtf8), e.zpdf_doc_add_bookmark(c, d, 0, "\xff", 1, 0, 0, 0, 0, &child));
+    // A refused call's id is 0, as every output of a failed call is.
+    try std.testing.expectEqual(@as(u32, 0), child);
+    try std.testing.expectEqual(@as(i32, 0), e.zpdf_doc_end_page(c, d, page));
+    var ptr: ?[*]u8 = null;
+    var len: usize = 0;
+    try std.testing.expectEqual(mapError(error.MissingPage), e.zpdf_doc_finish(c, d, &ptr, &len));
+    try std.testing.expectEqualStrings("MissingPage", std.mem.span(e.zpdf_error_name(mapError(error.MissingPage)).?));
+    try std.testing.expectEqual(@as(i32, 0), e.zpdf_doc_begin_page(c, d, 612, 792, &page));
+    try std.testing.expectEqual(@as(i32, 0), e.zpdf_doc_end_page(c, d, page));
+    try std.testing.expectEqual(@as(i32, 0), e.zpdf_doc_finish(c, d, &ptr, &len));
+    const pdf = ptr.?[0..len];
+    try std.testing.expect(std.mem.indexOf(u8, pdf, "/URI (https://example.com/)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, pdf, "/Type /Outlines") != null);
+    try std.testing.expectEqual(@as(i32, 0), e.zpdf_free(c, ptr, len));
+    try std.testing.expectEqual(@as(i32, 0), e.zpdf_doc_close(c, d));
 }
 
 test "exports: a direction other than 0, 1 or 2 is InvalidDirection, for a standard font too" {

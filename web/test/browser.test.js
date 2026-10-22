@@ -676,6 +676,69 @@ test("reserveLater places drawn after the last page read as Page N of M on each 
   expect(page_errors).toEqual([]);
 });
 
+test("links and bookmarks read back in pdf.js: URLs, forward page links, and the outline tree", async () => {
+  const got = await page.evaluate(async () => {
+    const { Zpdf } = await import("/zpdf.js");
+    const pdfjs = await import("/pdfjs/pdf.mjs");
+    const zpdf = await Zpdf.create(window.zpdfPage.wasmModule);
+    const start = zpdf.liveBytes();
+    const doc = zpdf.newDocument();
+    const attempt = (f) => {
+      try {
+        f();
+        return null;
+      } catch (error) {
+        return error.code ?? error.name;
+      }
+    };
+    const p0 = doc.beginPage(612, 792);
+    doc.addLink(p0, 72, 700, 100, 12, { uri: "https://example.com/a" });
+    // To page 2, which is not begun yet.
+    doc.addLink(p0, 72, 680, 100, 12, { page: 2, x: 0, y: 792 });
+    const badUri = attempt(() => doc.addLink(p0, 0, 0, 10, 10, { uri: "https://example.com/a b" }));
+    const top = doc.addBookmark(null, "Top", { page: 0, x: 0, y: 792 }, true);
+    const kid = doc.addBookmark(top, "Kid", { page: 2, x: 0, y: 500 }, false);
+    doc.addBookmark(kid, "Leaf \u00e9", { page: 1, x: 0, y: 400 }, true);
+    doc.addBookmark(null, "Second", { page: 1, x: 0, y: 792 }, true);
+    const badParent = attempt(() => doc.addBookmark(99, "x", { page: 0, x: 0, y: 0 }, true));
+    doc.endPage(p0);
+    doc.endPage(doc.beginPage(612, 792));
+    const missing = attempt(() => doc.finish());
+    doc.endPage(doc.beginPage(612, 792));
+    const pdf = doc.finish();
+    doc.close();
+    const loading = pdfjs.getDocument({ data: pdf.slice() });
+    try {
+      const reader = await loading.promise;
+      const where = async (dest) => [await reader.getPageIndex(dest[0]), dest[1].name, dest[2], dest[3]];
+      const links = [];
+      for (const a of await (await reader.getPage(1)).getAnnotations()) {
+        links.push({ subtype: a.subtype, url: a.url ?? null, dest: a.dest ? await where(a.dest) : null, rect: a.rect });
+      }
+      const tree = async (items) => Promise.all(items.map(async (i) => ({ title: i.title, count: i.count ?? null, dest: await where(i.dest), items: await tree(i.items) })));
+      const outline = await tree(await reader.getOutline());
+      return { links, outline, badUri, badParent, missing, leftOver: zpdf.liveBytes() - start };
+    } finally {
+      await loading.destroy();
+    }
+  });
+  expect(got).toEqual({
+    links: [
+      { subtype: "Link", url: "https://example.com/a", dest: null, rect: [72, 700, 172, 712] },
+      { subtype: "Link", url: null, dest: [2, "XYZ", 0, 792], rect: [72, 680, 172, 692] },
+    ],
+    outline: [
+      {
+        title: "Top", count: 1, dest: [0, "XYZ", 0, 792],
+        items: [{ title: "Kid", count: -1, dest: [2, "XYZ", 0, 500], items: [{ title: "Leaf \u00e9", count: null, dest: [1, "XYZ", 0, 400], items: [] }] }],
+      },
+      { title: "Second", count: null, dest: [1, "XYZ", 0, 792], items: [] },
+    ],
+    badUri: "InvalidUri", badParent: "InvalidBookmark", missing: "MissingPage", leftOver: 0,
+  });
+  expect(page_errors).toEqual([]);
+});
+
 test("live bytes return to their start after 200 open, shape, path, finish and close cycles", async () => {
   const got = await page.evaluate(async () => {
     const { BLACK, Zpdf } = await import("/zpdf.js");

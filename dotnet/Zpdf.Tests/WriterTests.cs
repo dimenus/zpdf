@@ -352,6 +352,46 @@ public sealed class WriterTests
     }
 
     [Fact]
+    public void Links_and_bookmarks_are_written_and_their_refusals_throw_by_name()
+    {
+        var output = new ArrayBufferWriter<byte>();
+        using (var writer = PdfWriter.Create(output, compress: false))
+        {
+            var first = writer.BeginPage(612, 792);
+            // Its path has a space and a non-ASCII letter; AbsoluteUri percent-encodes both.
+            writer.AddLink(first, 72, 700, 100, 12, new Uri("https://example.com/a b/\u00e9"));
+            writer.AddLink(first, 72, 680, 100, 12, new PdfDestination(1, 0, 792));
+            Assert.Equal("InvalidUri", Assert.Throws<ZpdfException>(() => writer.AddLink(first, 0, 0, 10, 10, new Uri("a b", UriKind.Relative))).ErrorName);
+            Assert.Throws<ArgumentOutOfRangeException>(() => writer.AddLink(first, 0, 0, 10, 10, new PdfDestination(-1, 0, 0)));
+            // Closed, with one child: its /Count is -1.
+            var top = writer.AddBookmark(null, "Contents", new PdfDestination(0, 0, 792), open: false);
+            writer.AddBookmark(top, "Chapter \u00e9", new PdfDestination(1, 0, 792), open: true);
+            writer.EndPage(first);
+            Assert.Equal("MissingPage", Assert.Throws<ZpdfException>(writer.Finish).ErrorName);
+            writer.EndPage(writer.BeginPage(612, 792));
+
+            // An id from another writer that has more bookmarks than this one.
+            using var other = PdfWriter.Create(new ArrayBufferWriter<byte>(), compress: false);
+            BookmarkId foreign = default;
+            for (var i = 0; i < 3; i++)
+            {
+                foreign = other.AddBookmark(null, "x", new PdfDestination(0, 0, 0), open: true);
+            }
+            Assert.Equal("InvalidBookmark", Assert.Throws<ZpdfException>(() => writer.AddBookmark(foreign, "y", new PdfDestination(0, 0, 0), open: true)).ErrorName);
+            writer.Finish();
+        }
+
+        var pdf = System.Text.Encoding.Latin1.GetString(output.WrittenSpan);
+        Assert.Contains("/URI (https://example.com/a%20b/%C3%A9)", pdf);
+        Assert.Equal(2, CountOf(pdf, "/Subtype /Link"));
+        Assert.Contains("/Title <FEFF0043006800610070007400650072002000E9>", pdf);
+        Assert.Contains("/Type /Outlines", pdf);
+        Assert.Contains("/Count -1 ", pdf);
+        using var reader = PdfReader.Open(output.WrittenSpan);
+        Assert.Equal(2, reader.PageCount);
+    }
+
+    [Fact]
     public void A_refused_image_throws_its_error_and_the_document_goes_on()
     {
         var output = new ArrayBufferWriter<byte>();

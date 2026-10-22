@@ -14,6 +14,7 @@ Writing:
 - JPEG and PNG images. A JPEG goes in as it is; a PNG is decoded and checked, and its transparency
   is kept. A photo's Exif orientation is applied. Each image is in the file once, however many
   pages draw it.
+- Links, to a web address or to a place on any page (a later one too), and bookmarks in a tree.
 - Pages go out as they end. Memory follows one page, not the whole document.
 
 Reading:
