@@ -93,6 +93,9 @@ export const ERROR_NAMES = new Map([
   [-37, "InvalidImage"],
   [-38, "UnsupportedImage"],
   [-39, "UnsupportedEncryption"],
+  [-40, "MissingPage"],
+  [-41, "InvalidUri"],
+  [-42, "InvalidBookmark"],
   [-127, "Unknown"],
 ]);
 
@@ -493,6 +496,14 @@ export class ZpdfFont {
   }
 }
 
+// A destination { page, x, y } as the C ABI takes it: [page index, x, y].
+function destination(d) {
+  if (d === null || typeof d !== "object" || !(Number.isInteger(d.page) && d.page >= 0)) {
+    throw new TypeError("a destination is { page, x, y } with page an index from 0");
+  }
+  return [d.page, d.x, d.y];
+}
+
 export class ZpdfDocument {
   constructor(zpdf, handle) {
     this.zpdf = zpdf;
@@ -583,6 +594,39 @@ export class ZpdfDocument {
 
   strokeRect(page, x, y, width, height, lineWidth, color) {
     this.zpdf._status("zpdf_doc_stroke_rect", [], () => [this.handle, page, x, y, width, height, lineWidth, ...rgb(color)]);
+  }
+
+  // Makes the rectangle whose bottom-left is (x, y), width by height points, on the open page a
+  // link, with no border: draw what shows it. target is { uri } (printable ASCII with no space,
+  // else InvalidUri: percent-encode the rest, as encodeURI does) or a destination { page, x, y }:
+  // the page at that index (0 is the first; one not begun yet is allowed, but finish throws
+  // MissingPage until it exists), shown with (x, y) at the window's top left, zoom unchanged.
+  addLink(page, x, y, width, height, target) {
+    if (target !== null && typeof target === "object" && typeof target.uri === "string") {
+      const uri = new TextEncoder().encode(target.uri);
+      this.zpdf._status("zpdf_doc_add_link_uri", [uri], ([u]) => [this.handle, page, x, y, width, height, u, uri.length]);
+      return;
+    }
+    const [index, dx, dy] = destination(target);
+    this.zpdf._status("zpdf_doc_add_link_page", [], () => [this.handle, page, x, y, width, height, index, dx, dy]);
+  }
+
+  // Adds a bookmark titled `title` that goes to `dest` ({ page, x, y }, as for addLink): at the
+  // top level when parent is null, else as the last child of the bookmark parent is. `open`
+  // shows its children when the viewer first shows it. Returns its id (1 and up).
+  addBookmark(parent, title, dest, open) {
+    if (parent !== null && !(Number.isInteger(parent) && parent > 0)) {
+      throw new TypeError("parent must be null or a bookmark id");
+    }
+    if (typeof title !== "string") {
+      throw new TypeError("title must be a string");
+    }
+    if (typeof open !== "boolean") {
+      throw new TypeError("open must be true or false");
+    }
+    const [index, dx, dy] = destination(dest);
+    const utf8 = new TextEncoder().encode(title);
+    return this.zpdf._u32("zpdf_doc_add_bookmark", [utf8], ([t]) => [this.handle, parent ?? 0, t, utf8.length, index, dx, dy, open ? 1 : 0]);
   }
 
   // The PDF. Every page must be ended first.

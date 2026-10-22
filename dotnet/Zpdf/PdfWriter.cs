@@ -177,6 +177,63 @@ public sealed unsafe partial class PdfWriter : IDisposable
     public void DrawImage(PageId page, PdfImage image, double x, double y, double width, double height) =>
         Call(ZpdfAbi.zpdf_doc_draw_image(Enter(), _document, page.Value, image.Value, x, y, width, height));
 
+    /// <summary>Makes the rectangle whose bottom-left corner is (<paramref name="x"/>,
+    /// <paramref name="y"/>) on the open page a link to <paramref name="uri"/>. The area has no
+    /// border or colour: draw what shows it. An absolute URI is written as its
+    /// <see cref="Uri.AbsoluteUri"/>, which is ASCII; a relative one as given, and zpdf refuses it
+    /// (<see cref="ZpdfException"/> InvalidUri) if it holds a space or a character outside
+    /// printable ASCII.</summary>
+    public void AddLink(PageId page, double x, double y, double width, double height, Uri uri)
+    {
+        ArgumentNullException.ThrowIfNull(uri);
+        var context = Enter();
+        var text = uri.IsAbsoluteUri ? uri.AbsoluteUri : uri.OriginalString;
+        Span<byte> stack = stackalloc byte[StackTextBytes];
+        var utf8 = Encode(text, stack, out var rented);
+        try
+        {
+            fixed (byte* bytes = utf8)
+            {
+                Call(ZpdfAbi.zpdf_doc_add_link_uri(context, _document, page.Value, x, y, width, height, bytes, (nuint)utf8.Length));
+            }
+        }
+        finally
+        {
+            Return(rented);
+        }
+    }
+
+    /// <summary>Makes the rectangle a link to <paramref name="destination"/>, which may be on a page
+    /// not begun yet: <see cref="Finish"/> then throws <see cref="ZpdfException"/> MissingPage until
+    /// that page exists.</summary>
+    public void AddLink(PageId page, double x, double y, double width, double height, PdfDestination destination) =>
+        Call(ZpdfAbi.zpdf_doc_add_link_page(Enter(), _document, page.Value, x, y, width, height, destination.Page, destination.X, destination.Y));
+
+    /// <summary>Adds a bookmark that goes to <paramref name="destination"/>: at the top level when
+    /// <paramref name="parent"/> is null, else as the parent's last child. <paramref name="open"/>
+    /// shows its children when the viewer first shows it. Any time before <see cref="Finish"/>,
+    /// with a page open or not; a destination on a page not begun yet works as for
+    /// <see cref="AddLink(PageId, double, double, double, double, PdfDestination)"/>.</summary>
+    public BookmarkId AddBookmark(BookmarkId? parent, ReadOnlySpan<char> title, PdfDestination destination, bool open)
+    {
+        var context = Enter();
+        Span<byte> stack = stackalloc byte[StackTextBytes];
+        var utf8 = Encode(title, stack, out var rented);
+        try
+        {
+            uint id;
+            fixed (byte* bytes = utf8)
+            {
+                Call(ZpdfAbi.zpdf_doc_add_bookmark(context, _document, parent?.Value ?? 0, bytes, (nuint)utf8.Length, destination.Page, destination.X, destination.Y, open ? 1u : 0u, &id));
+            }
+            return new BookmarkId(id);
+        }
+        finally
+        {
+            Return(rented);
+        }
+    }
+
     /// <summary>A place on the page for text drawn later, such as "Page 3 of 12". Every place must
     /// be drawn before <see cref="Finish"/>.</summary>
     public LaterId ReserveLater(PageId page)
@@ -341,6 +398,23 @@ public readonly record struct PageId
     internal PageId(uint value) => Value = value;
 
     internal uint Value { get; }
+}
+
+/// <summary>A bookmark of one <see cref="PdfWriter"/>, a parent for later ones.</summary>
+public readonly record struct BookmarkId
+{
+    internal BookmarkId(uint value) => Value = value;
+
+    internal uint Value { get; }
+}
+
+/// <summary>A place to go in the document: the page at <paramref name="PageIndex"/> (0 is the
+/// first, in <see cref="PdfWriter.BeginPage"/> order) shown with the point
+/// (<paramref name="X"/>, <paramref name="Y"/>), in points from the page's bottom left, at the top
+/// left of the window, the zoom unchanged.</summary>
+public readonly record struct PdfDestination(int PageIndex, double X, double Y)
+{
+    internal uint Page => PageIndex >= 0 ? (uint)PageIndex : throw new ArgumentOutOfRangeException(nameof(PageIndex), PageIndex, "A page index is 0 or more.");
 }
 
 /// <summary>A place reserved with <see cref="PdfWriter.ReserveLater"/>.</summary>

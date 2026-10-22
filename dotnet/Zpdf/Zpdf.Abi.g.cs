@@ -55,6 +55,9 @@ internal enum ZpdfError
     InvalidImage = -37,
     UnsupportedImage = -38,
     UnsupportedEncryption = -39,
+    MissingPage = -40,
+    InvalidUri = -41,
+    InvalidBookmark = -42,
     Unknown = -127,
 }
 
@@ -214,7 +217,7 @@ internal unsafe struct GlyphRecord
 
 internal static unsafe partial class ZpdfAbi
 {
-    public const uint AbiVersion = 7;
+    public const uint AbiVersion = 8;
     public const string LibraryName = "zpdf";
 
     // abi_version. A caller checks it once, when it loads the library.
@@ -367,6 +370,25 @@ internal static unsafe partial class ZpdfAbi
     // orientation says.
     [LibraryImport(LibraryName, EntryPoint = "zpdf_doc_draw_image")]
     public static partial int zpdf_doc_draw_image(ZpdfContext* ctx, uint doc, uint page_id, uint image_id, double x, double y, double width, double height);
+
+    // Makes the rectangle with bottom-left (x, y), width by height, on the open page a link to a
+    // URI: printable ASCII with no space (percent-encode the rest), else InvalidUri. The area has
+    // no border: draw what shows it (zpdf.Document's addLink).
+    [LibraryImport(LibraryName, EntryPoint = "zpdf_doc_add_link_uri")]
+    public static partial int zpdf_doc_add_link_uri(ZpdfContext* ctx, uint doc, uint page_id, double x, double y, double width, double height, byte* uri, nuint len);
+
+    // The same, a link to page target_page (0 is the first; a page not begun yet is allowed)
+    // shown with (dest_x, dest_y) at the window's top left, the zoom unchanged. zpdf_doc_finish
+    // is MissingPage while a page a link or bookmark goes to has not been begun.
+    [LibraryImport(LibraryName, EntryPoint = "zpdf_doc_add_link_page")]
+    public static partial int zpdf_doc_add_link_page(ZpdfContext* ctx, uint doc, uint page_id, double x, double y, double width, double height, uint target_page, double dest_x, double dest_y);
+
+    // Adds a bookmark titled with UTF-8 `title` that goes to target_page as in
+    // zpdf_doc_add_link_page: at the top level when parent is 0, else as the last child of the
+    // bookmark whose id parent is (InvalidBookmark otherwise). open (0 or 1) shows its children
+    // at first. Ids start at 1. Any time before zpdf_doc_finish, a page open or not.
+    [LibraryImport(LibraryName, EntryPoint = "zpdf_doc_add_bookmark")]
+    public static partial int zpdf_doc_add_bookmark(ZpdfContext* ctx, uint doc, uint parent, byte* title, nuint len, uint target_page, double dest_x, double dest_y, uint open, uint* out_bookmark_id);
 
     [LibraryImport(LibraryName, EntryPoint = "zpdf_doc_draw_line")]
     public static partial int zpdf_doc_draw_line(ZpdfContext* ctx, uint doc, uint page_id, double x1, double y1, double x2, double y2, double width, double r, double g, double b);

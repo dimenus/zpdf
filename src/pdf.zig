@@ -15,6 +15,24 @@ pub const PageId = enum(u32) { _ };
 pub const LaterId = enum(u32) { _ };
 /// An image added by addImage, drawn by drawImage.
 pub const ImageId = enum(u32) { _ };
+/// A bookmark added by addBookmark, a parent for later ones.
+pub const BookmarkId = enum(u32) { _ };
+
+/// A place to go in the document: page `page_index` (0 is the first; a page not begun yet is
+/// allowed) shown with the point (x, y), in points, PDF space, at the top left of the window, the
+/// zoom unchanged (ISO 32000-1 12.3.2.2, /XYZ x y null).
+pub const Destination = struct {
+    page_index: u32,
+    x: f64,
+    y: f64,
+};
+
+/// Where a link goes: a URI (12.6.4.7), or a place in this document.
+pub const LinkTarget = union(enum) {
+    /// 7-bit ASCII, printable, no space (RFC 3986's characters); a viewer opens it.
+    uri: []const u8,
+    page: Destination,
+};
 
 /// A DeviceRGB colour, each component from 0 to 1. Every drawing call takes one;
 /// a component outside 0..1, or not finite, is error.InvalidColor.
@@ -107,10 +125,35 @@ const OpenPage = struct {
     id: PageId,
     width_pt: f64,
     height_pt: f64,
-    /// Its page object; the content stream is the next number.
+    /// Its page object, which a link to it may have taken before beginPage.
     object: u32,
+    content: u32,
     /// In the page arena.
     ops: std.ArrayList(DrawOp) = .empty,
+    /// In the page arena; written as /Link annotations by endPage.
+    links: std.ArrayList(Link) = .empty,
+};
+
+/// One addLink: the area (x1, y1, x2, y2) and where it goes.
+const Link = struct {
+    rect: [4]f64,
+    target: union(enum) {
+        /// In the page arena.
+        uri: []const u8,
+        page: Dest,
+    },
+};
+
+/// A Destination with its page's object number.
+const Dest = struct { object: u32, x: f64, y: f64 };
+
+/// One addBookmark. A parent is always added before its children, so its index is lower.
+const Bookmark = struct {
+    parent: ?u32,
+    /// UTF-16BE with its byte order mark, a PDF text string's bytes; in gpa.
+    title: []const u8,
+    dest: Dest,
+    open: bool,
 };
 
 /// One reserveLater: a form XObject the page paints, written by drawTextLater.
@@ -234,6 +277,11 @@ pub const Document = struct {
     laters: std.ArrayList(Later) = .empty,
     /// How many of `laters` drawTextLater has not written yet; finish needs 0.
     laters_open: u32 = 0,
+    /// Page object numbers given before their page began, to a link or bookmark that goes to
+    /// it: page index to object number. beginPage takes its page's out; finish needs none left.
+    future_pages: std.AutoHashMapUnmanaged(u32, u32) = .empty,
+    /// Every addBookmark, by BookmarkId; written as the outline by finish.
+    bookmarks: std.ArrayList(Bookmark) = .empty,
     /// Every addImage, by ImageId.
     images: std.ArrayList(DocImage) = .empty,
     /// The most memory one addImage may hold while it decodes a PNG (image.decode's max_bytes);
@@ -285,6 +333,9 @@ pub const Document = struct {
         self.font_objects.deinit(self.gpa);
         self.page_objects.deinit(self.gpa);
         self.laters.deinit(self.gpa);
+        self.future_pages.deinit(self.gpa);
+        for (self.bookmarks.items) |b| self.gpa.free(b.title);
+        self.bookmarks.deinit(self.gpa);
         self.images.deinit(self.gpa);
         self.objects.offsets.deinit(self.gpa);
         if (self.objects.deflate) |d| {
@@ -309,11 +360,42 @@ pub const Document = struct {
         try writeReal(out, open.width_pt);
         try out.writeByte(' ');
         try writeReal(out, open.height_pt);
-        try out.print("] /Contents {d} 0 R ", .{open.object + 1});
+        try out.print("] /Contents {d} 0 R ", .{open.content});
+        const first_link = self.next_object;
+        if (open.links.items.len > 0) {
+            try out.writeAll("/Annots [");
+            for (0..open.links.items.len) |i| try out.print("{s}{d} 0 R", .{ if (i == 0) "" else " ", first_link + i });
+            try out.writeAll("] ");
+            self.next_object += @intCast(open.links.items.len);
+        }
         try self.writeResources(scratch, out, open.ops.items);
         try out.writeAll(">>\n");
         try self.objects.end();
-        try self.objects.stream(self.gpa, open.object + 1, "", try self.content(scratch, .{}, open.ops.items), null);
+        try self.objects.stream(self.gpa, open.content, "", try self.content(scratch, .{}, open.ops.items), null);
+        for (open.links.items, first_link..) |link, number| {
+            _ = try self.objects.begin(self.gpa, @intCast(number));
+            // No border: the caller draws what shows the link (12.5.2, /Border [0 0 0]).
+            try out.writeAll("<< /Type /Annot /Subtype /Link /Rect [");
+            for (link.rect, 0..) |v, i| {
+                if (i != 0) try out.writeByte(' ');
+                try writeReal(out, v);
+            }
+            try out.writeAll("] /Border [0 0 0] ");
+            switch (link.target) {
+                .uri => |uri| {
+                    try out.writeAll("/A << /S /URI /URI ");
+                    try writeLiteralString(out, uri);
+                    try out.writeAll(" >> ");
+                },
+                .page => |d| {
+                    try out.writeAll("/Dest ");
+                    try writeDest(out, d);
+                    try out.writeByte(' ');
+                },
+            }
+            try out.writeAll(">>\n");
+            try self.objects.end();
+        }
     }
 
     /// The /Resources entry for `ops`, ending with ' ': each font they draw with, and each
@@ -467,8 +549,11 @@ pub const Document = struct {
         try out.writeAll("] >>\n");
         try self.objects.end();
 
+        const outlines = try self.writeOutlines();
         _ = try self.objects.begin(self.gpa, 1);
-        try out.writeAll("<< /Type /Catalog /Pages 2 0 R >>\n");
+        try out.writeAll("<< /Type /Catalog /Pages 2 0 R ");
+        if (outlines) |o| try out.print("/Outlines {d} 0 R ", .{o});
+        try out.writeAll(">>\n");
         try self.objects.end();
 
         // Every number below next_object was given to an object that is now
@@ -540,13 +625,19 @@ pub const Document = struct {
         try checkPdfReal(height_pt);
         // A MediaBox with no area is not a page a viewer can show.
         if (!(width_pt > 0) or !(height_pt > 0)) return error.InvalidNumber;
+        const index: u32 = @intCast(self.page_objects.items.len);
+        const object = if (self.future_pages.fetchRemove(index)) |kv| kv.value else blk: {
+            self.next_object += 1;
+            break :blk self.next_object - 1;
+        };
         self.open = .{
-            .id = @fromBackingInt(@intCast(self.page_objects.items.len)),
+            .id = @fromBackingInt(index),
             .width_pt = width_pt,
             .height_pt = height_pt,
-            .object = self.next_object,
+            .object = object,
+            .content = self.next_object,
         };
-        self.next_object += 2;
+        self.next_object += 1;
         return self.open.?.id;
     }
 
@@ -580,6 +671,9 @@ pub const Document = struct {
         try self.checkWriting();
         if (self.open != null) return error.PageOpen;
         if (self.laters_open != 0) return error.LaterNotDrawn;
+        // A link or bookmark goes to a page that was never begun. Nothing is written yet, so the
+        // caller can add the page and finish again.
+        if (self.future_pages.count() != 0) return error.MissingPage;
         self.writeEnd() catch |err| {
             self.state = .failed;
             return err;
@@ -880,6 +974,148 @@ pub const Document = struct {
         const matrix = im.orientation.matrix(x, y, width, height);
         for (matrix) |v| try checkPdfReal(v);
         try self.appendOp(.{ .image = .{ .index = index, .object = im.object, .matrix = matrix } });
+    }
+
+    /// Makes the rectangle whose bottom-left corner is (x, y), `width` by `height` points, PDF
+    /// space, on the open page `page_id` a link to `target` (a /Link annotation, 12.5.6.5). The
+    /// area has no border and no colour: draw what shows it. A URI that is empty or holds a byte
+    /// that is not printable ASCII (a space included) is error.InvalidUri: percent-encode it
+    /// first. A destination's page may be one not begun yet; finish is then error.MissingPage
+    /// until it is. A `width` or `height` below 0.0001 is error.InvalidNumber. A failed call
+    /// changes nothing.
+    pub fn addLink(self: *Document, page_id: PageId, x: f64, y: f64, width: f64, height: f64, target: LinkTarget) !void {
+        try self.checkPage(page_id);
+        try checkPdfReal(x);
+        try checkPdfReal(y);
+        try checkLineWidth(width);
+        try checkLineWidth(height);
+        const rect: [4]f64 = .{ x, y, x + width, y + height };
+        for (rect) |v| try checkPdfReal(v);
+        const arena = self.page_allocator orelse self.page_arena.allocator();
+        const open = &self.open.?;
+        switch (target) {
+            .uri => |uri| {
+                if (uri.len == 0) return error.InvalidUri;
+                for (uri) |c| if (c < 0x21 or c > 0x7E) return error.InvalidUri;
+                try open.links.ensureUnusedCapacity(arena, 1);
+                open.links.appendAssumeCapacity(.{ .rect = rect, .target = .{ .uri = try arena.dupe(u8, uri) } });
+            },
+            .page => |d| {
+                try checkDestination(d);
+                try open.links.ensureUnusedCapacity(arena, 1);
+                try self.future_pages.ensureUnusedCapacity(self.gpa, 1);
+                open.links.appendAssumeCapacity(.{ .rect = rect, .target = .{ .page = self.dest(d) } });
+            },
+        }
+    }
+
+    /// Adds a bookmark (an outline item, 12.3.3) titled `title` (UTF-8, else error.InvalidUtf8)
+    /// that goes to `dest`: at the top level when `parent` is null, else as `parent`'s last
+    /// child (an id this document gave, else error.InvalidBookmark). `open` shows its children
+    /// when the viewer first shows it. Any time before finish, with or without an open page; a
+    /// destination's page may be one not begun yet, as for addLink. A failed call changes
+    /// nothing.
+    pub fn addBookmark(self: *Document, parent: ?BookmarkId, title: []const u8, dest_to: Destination, open: bool) !BookmarkId {
+        try self.checkWriting();
+        if (parent) |p| if (@backingInt(p) >= self.bookmarks.items.len) return error.InvalidBookmark;
+        if (!std.unicode.utf8ValidateSlice(title)) return error.InvalidUtf8;
+        try checkDestination(dest_to);
+        const utf16 = try std.unicode.utf8ToUtf16LeAlloc(self.gpa, title);
+        defer self.gpa.free(utf16);
+        const bytes = try self.gpa.alloc(u8, 2 + 2 * utf16.len);
+        errdefer self.gpa.free(bytes);
+        bytes[0] = 0xFE;
+        bytes[1] = 0xFF;
+        for (utf16, 0..) |u, i| std.mem.writeInt(u16, bytes[2 + 2 * i ..][0..2], u, .big);
+        try self.bookmarks.ensureUnusedCapacity(self.gpa, 1);
+        try self.future_pages.ensureUnusedCapacity(self.gpa, 1);
+        self.bookmarks.appendAssumeCapacity(.{
+            .parent = if (parent) |p| @backingInt(p) else null,
+            .title = bytes,
+            .dest = self.dest(dest_to),
+            .open = open,
+        });
+        return @fromBackingInt(@intCast(self.bookmarks.items.len - 1));
+    }
+
+    fn checkDestination(d: Destination) !void {
+        try checkPdfReal(d.x);
+        try checkPdfReal(d.y);
+    }
+
+    /// `d` with its page's object number: a finished page's, the open page's, or one kept in
+    /// future_pages for a page not begun yet. future_pages must have room for one more.
+    fn dest(self: *Document, d: Destination) Dest {
+        const finished = self.page_objects.items.len;
+        const object = if (d.page_index < finished)
+            self.page_objects.items[d.page_index]
+        else if (self.open != null and d.page_index == finished)
+            self.open.?.object
+        else blk: {
+            const gop = self.future_pages.getOrPutAssumeCapacity(d.page_index);
+            if (!gop.found_existing) {
+                gop.value_ptr.* = self.next_object;
+                self.next_object += 1;
+            }
+            break :blk gop.value_ptr.*;
+        };
+        return .{ .object = object, .x = d.x, .y = d.y };
+    }
+
+    /// finish's outline (12.3.3), if any bookmark was added: its root's object number. Each
+    /// item's /Count is what it shows when opened: its children and their shown descendants,
+    /// positive when open, negative when closed (none when it has no children).
+    fn writeOutlines(self: *Document) !?u32 {
+        const items = self.bookmarks.items;
+        if (items.len == 0) return null;
+        const scratch = self.write_scratch.allocator();
+        defer _ = self.write_scratch.reset(.retain_capacity);
+        const Links = struct { first: ?u32 = null, last: ?u32 = null, prev: ?u32 = null, next: ?u32 = null, shown: u32 = 0 };
+        const links = try scratch.alloc(Links, items.len);
+        @memset(links, .{});
+        var root: Links = .{};
+        for (items, 0..) |b, i_usize| {
+            const i: u32 = @intCast(i_usize);
+            const p = if (b.parent) |pi| &links[pi] else &root;
+            if (p.last) |l| {
+                links[l].next = i;
+                links[i].prev = l;
+            } else p.first = i;
+            p.last = i;
+        }
+        // Children come after their parent, so from the last item back each item's count is done
+        // before its parent needs it.
+        var i = items.len;
+        while (i > 0) {
+            i -= 1;
+            const own = if (items[i].open) links[i].shown else 0;
+            const p = if (items[i].parent) |pi| &links[pi] else &root;
+            p.shown += 1 + own;
+        }
+        const root_object = self.next_object;
+        self.next_object += @intCast(items.len + 1);
+        const out = self.objects.out();
+        _ = try self.objects.begin(self.gpa, root_object);
+        try out.print("<< /Type /Outlines /First {d} 0 R /Last {d} 0 R /Count {d} >>\n", .{ root_object + 1 + root.first.?, root_object + 1 + root.last.?, root.shown });
+        try self.objects.end();
+        for (items, links, 0..) |b, l, n| {
+            _ = try self.objects.begin(self.gpa, root_object + 1 + @as(u32, @intCast(n)));
+            try out.writeAll("<< /Title <");
+            for (b.title) |c| try out.print("{X:0>2}", .{c});
+            try out.print("> /Parent {d} 0 R ", .{if (b.parent) |pi| root_object + 1 + pi else root_object});
+            if (l.prev) |v| try out.print("/Prev {d} 0 R ", .{root_object + 1 + v});
+            if (l.next) |v| try out.print("/Next {d} 0 R ", .{root_object + 1 + v});
+            if (l.first) |v| try out.print("/First {d} 0 R /Last {d} 0 R /Count {d} ", .{
+                root_object + 1 + v,
+                root_object + 1 + l.last.?,
+                if (b.open) @as(i64, l.shown) else -@as(i64, l.shown),
+            });
+            try out.writeAll("/Dest ");
+            try writeDest(out, b.dest);
+            try out.writeAll(" >>\n");
+            try self.objects.end();
+        }
+        return root_object;
     }
 
     /// addImage's write: the image XObject, and its soft mask as the next object.
@@ -1388,6 +1624,15 @@ fn checkRect(x: f64, y: f64, width: f64, height: f64) !void {
     if (width < 0 or height < 0) return error.InvalidNumber;
 }
 
+/// [page /XYZ x y null]: the page with (x, y) at the window's top left, the zoom unchanged.
+fn writeDest(out: *std.Io.Writer, d: Dest) !void {
+    try out.print("[{d} 0 R /XYZ ", .{d.object});
+    try writeReal(out, d.x);
+    try out.writeByte(' ');
+    try writeReal(out, d.y);
+    try out.writeAll(" null]");
+}
+
 fn checkPdfReal(v: f64) !void {
     if (!std.math.isFinite(v)) return error.InvalidNumber;
     if (@abs(v) > max_pdf_real) return error.InvalidNumber;
@@ -1571,6 +1816,94 @@ test "addImage writes the image at once; each page names it once and paints it t
     try std.testing.expectEqual(1, std.mem.count(u8, try parsed.objectBody(5), "/X3 3 0 R"));
     try std.testing.expectEqualStrings("q\n64 0 0 32 10 20 cm\n/X3 Do\nQ\nq\n32 0 0 32 100 200 cm\n/X3 Do\nQ\n", try parsed.streamData(6));
     try std.testing.expectEqualStrings("q\n1.5 0 0 2.25 0 0 cm\n/X3 Do\nQ\n", try parsed.streamData(8));
+}
+
+test "addLink and addBookmark write /Link annotations and an outline whose /Count follows /open" {
+    const gpa = std.testing.allocator;
+    var td_doc: TestDoc = undefined;
+    try td_doc.init(gpa, false);
+    defer td_doc.deinit();
+    const doc = &td_doc.doc;
+    const p0 = try doc.beginPage(612, 792);
+    // A link to page 2, which is not begun yet, and one to a URI with ( ) to escape.
+    try doc.addLink(p0, 72, 700, 100, 12, .{ .page = .{ .page_index = 2, .x = 0, .y = 792 } });
+    try doc.addLink(p0, 72, 680, 100.5, 12, .{ .uri = "https://example.com/a_(b)" });
+    // A open: A1 (closed, with A1a) and A2. B, closed with no children. B is added before A's
+    // later children, so the tree is not in addition order.
+    const a = try doc.addBookmark(null, "A", .{ .page_index = 0, .x = 0, .y = 792 }, true);
+    const a1 = try doc.addBookmark(a, "A1", .{ .page_index = 1, .x = 0, .y = 700 }, false);
+    _ = try doc.addBookmark(null, "B \u{00e9}\u{1F600}", .{ .page_index = 2, .x = 10.5, .y = 20 }, false);
+    _ = try doc.addBookmark(a1, "A1a", .{ .page_index = 1, .x = 0, .y = 400 }, true);
+    _ = try doc.addBookmark(a, "A2", .{ .page_index = 0, .x = 0, .y = 300 }, true);
+    try doc.endPage(p0);
+    const p1 = try doc.beginPage(612, 792);
+    // A link to the open page itself.
+    try doc.addLink(p1, 0, 0, 10, 10, .{ .page = .{ .page_index = 1, .x = 0, .y = 0 } });
+    try doc.endPage(p1);
+    try doc.endPage(try doc.beginPage(612, 792));
+    try doc.finish();
+
+    var parsed = try E2e.parse(gpa, td_doc.aw.written());
+    defer parsed.deinit(gpa);
+    // Page 0 is 3 with content 4. Page 2's object (5) was taken by the first link and page 1's
+    // (6) by bookmark A1, before either began. Page 0's annotations are 7 and 8; page 1's
+    // content is 9 and its annotation 10; page 2's content 11. The outline root is 12, items 13
+    // to 17 in addition order.
+    try std.testing.expect(std.mem.startsWith(u8, try parsed.objectBody(2), "<< /Type /Pages /Count 3 /Kids [3 0 R 6 0 R 5 0 R]"));
+    try E2e.expectContains(try parsed.objectBody(3), "/Contents 4 0 R /Annots [7 0 R 8 0 R] ");
+    try std.testing.expectEqualStrings("<< /Type /Annot /Subtype /Link /Rect [72 700 172 712] /Border [0 0 0] /Dest [5 0 R /XYZ 0 792 null] >>", try parsed.objectBody(7));
+    try std.testing.expectEqualStrings("<< /Type /Annot /Subtype /Link /Rect [72 680 172.5 692] /Border [0 0 0] /A << /S /URI /URI (https://example.com/a_\\(b\\)) >> >>", try parsed.objectBody(8));
+    try E2e.expectContains(try parsed.objectBody(6), "/Contents 9 0 R /Annots [10 0 R] ");
+    try E2e.expectContains(try parsed.objectBody(10), "/Dest [6 0 R /XYZ 0 0 null]");
+    try E2e.expectContains(try parsed.objectBody(5), "/Contents 11 0 R ");
+    try std.testing.expectEqualStrings("<< /Type /Catalog /Pages 2 0 R /Outlines 12 0 R >>", try parsed.objectBody(1));
+    // Shown: A, A1, A2 (A open; A1 closed hides A1a) and B: 4.
+    try std.testing.expectEqualStrings("<< /Type /Outlines /First 13 0 R /Last 15 0 R /Count 4 >>", try parsed.objectBody(12));
+    try std.testing.expectEqualStrings("<< /Title <FEFF0041> /Parent 12 0 R /Next 15 0 R /First 14 0 R /Last 17 0 R /Count 2 /Dest [3 0 R /XYZ 0 792 null] >>", try parsed.objectBody(13));
+    try std.testing.expectEqualStrings("<< /Title <FEFF00410031> /Parent 13 0 R /Next 17 0 R /First 16 0 R /Last 16 0 R /Count -1 /Dest [6 0 R /XYZ 0 700 null] >>", try parsed.objectBody(14));
+    try std.testing.expectEqualStrings("<< /Title <FEFF0042002000E9D83DDE00> /Parent 12 0 R /Prev 13 0 R /Dest [5 0 R /XYZ 10.5 20 null] >>", try parsed.objectBody(15));
+    try std.testing.expectEqualStrings("<< /Title <FEFF004100310061> /Parent 14 0 R /Dest [6 0 R /XYZ 0 400 null] >>", try parsed.objectBody(16));
+    try std.testing.expectEqualStrings("<< /Title <FEFF00410032> /Parent 13 0 R /Prev 14 0 R /Dest [3 0 R /XYZ 0 300 null] >>", try parsed.objectBody(17));
+}
+
+test "addLink and addBookmark refuse bad calls and change nothing; a missing target page stops finish until it exists" {
+    const gpa = std.testing.allocator;
+    var td_doc: TestDoc = undefined;
+    try td_doc.init(gpa, false);
+    defer td_doc.deinit();
+    const doc = &td_doc.doc;
+    const page = try doc.beginPage(612, 792);
+    const ok: Destination = .{ .page_index = 0, .x = 0, .y = 0 };
+    for ([_][]const u8{ "", "https://example.com/a b", "https://example.com/\u{00e9}", "a\tb", "\x7f" }) |uri| {
+        try std.testing.expectError(error.InvalidUri, doc.addLink(page, 0, 0, 10, 10, .{ .uri = uri }));
+    }
+    try std.testing.expectError(error.InvalidNumber, doc.addLink(page, 0, 0, 0, 10, .{ .page = ok }));
+    try std.testing.expectError(error.InvalidNumber, doc.addLink(page, std.math.nan(f64), 0, 10, 10, .{ .page = ok }));
+    try std.testing.expectError(error.InvalidNumber, doc.addLink(page, 0, 0, 10, 10, .{ .page = .{ .page_index = 7, .x = std.math.inf(f64), .y = 0 } }));
+    try std.testing.expectError(error.InvalidPage, doc.addLink(@fromBackingInt(@intCast(1)), 0, 0, 10, 10, .{ .page = ok }));
+    try std.testing.expectError(error.InvalidBookmark, doc.addBookmark(@fromBackingInt(@intCast(0)), "x", ok, true));
+    try std.testing.expectError(error.InvalidUtf8, doc.addBookmark(null, "\xff", ok, true));
+    try std.testing.expectError(error.InvalidNumber, doc.addBookmark(null, "x", .{ .page_index = 9, .x = 0, .y = std.math.nan(f64) }, true));
+    // None of them took a page's object number or left a link or bookmark.
+    try std.testing.expectEqual(0, doc.future_pages.count());
+    try std.testing.expectEqual(0, doc.open.?.links.items.len);
+    try std.testing.expectEqual(0, doc.bookmarks.items.len);
+    const next = doc.next_object;
+    // A link and a bookmark to page 3, in a document that will have two pages.
+    try doc.addLink(page, 0, 0, 10, 10, .{ .page = .{ .page_index = 3, .x = 0, .y = 0 } });
+    _ = try doc.addBookmark(null, "three", .{ .page_index = 3, .x = 0, .y = 0 }, true);
+    try std.testing.expectEqual(next + 1, doc.next_object);
+    try doc.endPage(page);
+    try doc.endPage(try doc.beginPage(612, 792));
+    try std.testing.expectError(error.MissingPage, doc.finish());
+    // Nothing was written: pages 2 and 3 can still come, and finish then succeeds.
+    try doc.endPage(try doc.beginPage(612, 792));
+    try std.testing.expectError(error.MissingPage, doc.finish());
+    try doc.endPage(try doc.beginPage(612, 792));
+    try doc.finish();
+    var parsed = try E2e.parse(gpa, td_doc.aw.written());
+    defer parsed.deinit(gpa);
+    try E2e.expectContains(try parsed.objectBody(2), "/Count 4 ");
 }
 
 test "addImage keeps none of an image's memory once it returns" {
@@ -2862,6 +3195,8 @@ test "every allocation failure in building and writing a document is OutOfMemory
     const images = try checkWriteAllocationFailures(&fonts, buildImageDoc, true);
     try std.testing.expect(images.failed > 10);
     const two_page = try checkWriteAllocationFailures(&fonts, buildTwoPageDoc, false);
+    const links = try checkWriteAllocationFailures(&fonts, buildLinkDoc, true);
+    try std.testing.expect(links.failed > 10);
     const long_page = try checkWriteAllocationFailures(&fonts, buildLongPageDoc, true);
     try std.testing.expect(one_word.failed > 20);
     try std.testing.expect(two_page.failed > 50);
@@ -3396,6 +3731,20 @@ const Trickle = struct {
 /// Two pages, three fonts, both pages ended. The first font is never drawn,
 /// and the first page draws the third font, so font object numbers follow
 /// first use on a finished page, not addFont order.
+/// Links to a URI and to a later page, and bookmarks in two levels, on two pages.
+fn buildLinkDoc(doc: *Document, fonts: *[3]zpdf.Font) !void {
+    const font = try doc.addFont(&fonts[1]);
+    const first = try doc.beginPage(612, 792);
+    try doc.drawText(first, font, 12, 72, 700, .black, "contents", .{});
+    try doc.addLink(first, 72, 700, 60, 12, .{ .page = .{ .page_index = 1, .x = 0, .y = 792 } });
+    try doc.addLink(first, 72, 680, 60, 12, .{ .uri = "https://example.com/" });
+    const top = try doc.addBookmark(null, "Contents", .{ .page_index = 0, .x = 0, .y = 792 }, true);
+    _ = try doc.addBookmark(top, "Chapter \u{00e9}", .{ .page_index = 1, .x = 0, .y = 792 }, false);
+    try doc.endPage(first);
+    const second = try doc.beginPage(612, 792);
+    try doc.drawText(second, font, 12, 72, 700, .black, "chapter", .{});
+}
+
 fn buildTwoPageDoc(doc: *Document, fonts: *[3]zpdf.Font) !void {
     _ = try doc.addFont(&fonts[0]);
     const roboto = try doc.addFont(&fonts[1]);
