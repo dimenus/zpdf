@@ -34,6 +34,8 @@ excused; each one is in the code beside the place it applies:
   a glyph's origin (both undone in pdfminer_pages), and has no Euro width for Helvetica (the
   glyphs after such a gap must then be off by one constant shift, which is counted).
 - mutool splits ligature characters unless asked not to (preserve-ligatures).
+- mutool draw leaves out text that the clip hides completely (FZ_STEXT_CLIP, set by mudraw.c
+  unless clip=no). zpdf gives all the text a page draws, so mutool is asked for it too (clip=no).
 - mutool maps a CID with no /ToUnicode through MuPDF's copy of Adobe's CID-to-Unicode table for
   the font's collection, which can be an older version than zpdf's (src/cid): MuPDF 1.28.5 has
   Adobe-Japan1-UCS2 8.004, zpdf 10.002. A page whose only text differences are pairs that the two
@@ -102,7 +104,8 @@ def mutool_pages(path):
     """(pages of (char, x, y) in device space, whether mutool reported damage), or (None, ...)
     when mutool cannot read the file."""
     # preserve-ligatures: mutool otherwise splits U+FB03 into "ffi", which is not what the file says.
-    p = subprocess.run(["mutool", "draw", "-q", "-F", "stext", "-O", "preserve-ligatures", "-o", "-", path], capture_output=True, timeout=120)
+    # clip=no: mutool otherwise leaves out text the clip hides; zpdf gives all the text drawn.
+    p = subprocess.run(["mutool", "draw", "-q", "-F", "stext", "-O", "preserve-ligatures,clip=no", "-o", "-", path], capture_output=True, timeout=120)
     damaged = b"repair" in p.stderr or b"broken" in p.stderr
     if p.returncode != 0:
         return None, damaged
