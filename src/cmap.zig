@@ -148,6 +148,9 @@ pub const Map = struct {
     /// The code at the start of `s`, which must not be empty.
     pub fn split(self: Map, s: []const u8) Code {
         std.debug.assert(s.len > 0);
+        // Identity's one range, <0000> to <FFFF>, matches any two bytes: the common case, taken
+        // without the loop below, which gives the same code.
+        if (self.identity() and s.len >= 2) return .{ .value = std.mem.readInt(u16, s[0..2], .big), .len = 2, .valid = true };
         const ranges = self.codespaceCount();
         const avail = @min(s.len, 4);
         for (1..avail + 1) |n| {
