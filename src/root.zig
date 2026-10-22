@@ -46,6 +46,7 @@ test {
     _ = block_cache;
     _ = @import("read_text.zig");
     _ = @import("crypt.zig");
+    _ = @import("cmap.zig");
 }
 
 pub const Direction = enum(u32) {

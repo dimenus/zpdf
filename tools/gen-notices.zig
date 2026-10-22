@@ -1,7 +1,7 @@
 //! Writes THIRD-PARTY-NOTICES.md: the notices of the third-party data and code built into
 //! libzpdf and zpdf.wasm, each copied from the file it covers, so nothing is retyped.
 //!
-//!     gen-notices <out> <src/read_tables.zig> <kb LICENSE> <src/cid/Adobe-*-UCS2 ...>
+//!     gen-notices <out> <src/read_tables.zig> <kb LICENSE> <src/cid/Adobe-*-UCS2 ...> -- <src/cmap/* ...>
 //!
 //! - Adobe's Core 14 AFM metrics and the Adobe Glyph List: read_tables.zig's `//!` header, which
 //!   tools/gen-read-tables.py writes from the AFM files and keeps Adobe's notices and terms in.
@@ -9,6 +9,8 @@
 //!   only, not in this repository; its terms are word for word the CMaps' below, with its own
 //!   copyright line.
 //! - Adobe's CID-to-Unicode CMaps: each file's `%%Copyright:` block.
+//! - Adobe's predefined CMaps (src/cmap): their `%%Copyright:` blocks, each different block once,
+//!   with the files that carry it.
 //! - kb_text_shape: its LICENSE.
 //!
 //! `zig build notices` rewrites the file; `zig build test` fails when it differs from this output.
@@ -56,7 +58,12 @@ pub fn main(init: std.process.Init) !void {
     if (header_lines < 10) fail("{s} has no notice header", .{args[2]});
     try w.writeAll("```\n\n");
 
-    const cmaps = args[4..];
+    const sep = for (args[4..], 4..) |a, i| {
+        if (std.mem.eql(u8, a, "--")) break i;
+    } else fail("no -- before src/cmap's files", .{});
+    const cmaps = args[4..sep];
+    const encodings = args[sep + 1 ..];
+    if (cmaps.len == 0 or encodings.len == 0) fail("no CMaps on one side of --", .{});
     // The glyph list's terms are the CMaps' terms: the first CMap's block after its copyright line.
     const first_block = try copyrightBlock(arena, io, cwd, cmaps[0]);
     const terms_at = std.mem.indexOf(u8, first_block, "\n\nRedistribution") orelse fail("{s}: no BSD terms", .{cmaps[0]});
@@ -81,6 +88,33 @@ pub fn main(init: std.process.Init) !void {
     );
     for (cmaps) |path| {
         try w.print("{s}:\n\n```\n{s}\n```\n\n", .{ std.fs.path.basename(path), try copyrightBlock(arena, io, cwd, path) });
+    }
+
+    try w.writeAll(
+        \\## Adobe predefined CMaps
+        \\
+        \\In src/cmap (from https://github.com/adobe-type-tools/cmap-resources), compiled into the text
+        \\reader as lookup tables. Each notice below is carried by the files listed before it.
+        \\
+        \\
+    );
+    var blocks: std.ArrayList(struct { text: []const u8, files: std.ArrayList([]const u8) }) = .empty;
+    for (encodings) |path| {
+        const block = try copyrightBlock(arena, io, cwd, path);
+        for (blocks.items) |*b| {
+            if (std.mem.eql(u8, b.text, block)) {
+                try b.files.append(arena, std.fs.path.basename(path));
+                break;
+            }
+        } else {
+            var files: std.ArrayList([]const u8) = .empty;
+            try files.append(arena, std.fs.path.basename(path));
+            try blocks.append(arena, .{ .text = block, .files = files });
+        }
+    }
+    for (blocks.items) |b| {
+        for (b.files.items, 0..) |f, i| try w.print("{s}{s}", .{ if (i == 0) "" else ", ", f });
+        try w.print(":\n\n```\n{s}\n```\n\n", .{b.text});
     }
 
     const kb = try cwd.readFileAlloc(io, args[3], arena, .limited(1 << 20));
