@@ -27,6 +27,8 @@ Per file, zpdf-read's JSON (src/zpdf-read.zig) is checked against:
 - "order", against pdfminer: the characters of the runs, white space included, must be
   pdfminer's, in order. The glyphs of ActualText runs are left out on both sides (pdfminer
   ignores ActualText; mutool's "text" checks those).
+- Annotation runs (the text of appearance streams, after the page's) are checked against mutool
+  only: pdfminer reads no annotation, so "glyphs", "order" and its "start" vote leave them out.
 
 Where an oracle deviates from ISO 32000-1, the deviation is undone or counted, never silently
 excused; each one is in the code beside the place it applies:
@@ -376,7 +378,7 @@ def check(path, verbose):
             if mu_page is not None and page["rotate"] == 0 and inside(r):
                 x, y = r["x"] - cx0, cy1 - r["y"]
                 votes["mutool"] = any(c == t[0] and abs(cx - x) < TOL and abs(cy - y) < TOL for c, cx, cy in mu_page)
-            if geom is not None:
+            if geom is not None and not r["annotation"]:
                 votes["pdfminer"] = any(c[:1] == t[0] and abs(u[0] - r["x"]) < TOL and abs(u[1] - r["y"]) < TOL for c, m, _ in geom["chars"] for u in [pdfminer_to_user(geom, (m[4], m[5]))])
             if not votes:
                 continue
@@ -392,6 +394,8 @@ def check(path, verbose):
         if geom is None:
             continue
         chars = geom["chars"]
+        # pdfminer reads the page's content stream only, never an annotation's appearance.
+        runs = [r for r in runs if not r["annotation"]]
         glyphs = [g for r in runs for g in r["glyphs"]]
         if len(glyphs) != len(chars):
             # pdfminer drops a code with no CID mapping (its CMap.decode yields nothing), where

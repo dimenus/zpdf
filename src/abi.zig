@@ -71,12 +71,12 @@ const is_wasm = builtin.target.cpu.arch == .wasm32;
 
 /// Changes when an export, a wire record or an error code changes. A caller checks it once,
 /// when it loads the library.
-pub const abi_version: u32 = 8;
+pub const abi_version: u32 = 9;
 
 /// The hash of the ABI that abi_version names (surfaceHash). The test "exports: the ABI surface
 /// is the one abi_version names" fails when they differ: then bump abi_version and set this to
 /// the hash the test prints.
-const abi_surface: u64 = 0x9645d39643ea65cd;
+const abi_surface: u64 = 0xd9a170196310e197;
 
 comptime {
     // The records are written with their in-memory bytes; every target zpdf builds for
@@ -215,12 +215,16 @@ pub const RunFlag = enum(u5) {
     /// Vertical writing (zpdf.read.TextRun.vertical): each glyph moves the text position along
     /// text space's y axis, and a glyph's position is its vertical origin.
     vertical = 1,
+    /// Drawn by an annotation's appearance stream (zpdf.read.TextRun.annotation), such as a form
+    /// field's value, not by the page's content stream.
+    annotation = 2,
 };
 
 fn runFlags(run: zpdf.read.TextRun) u32 {
     var flags: u32 = 0;
     if (run.actual_text) flags |= 1 << @backingInt(RunFlag.actual_text);
     if (run.vertical) flags |= 1 << @backingInt(RunFlag.vertical);
+    if (run.annotation) flags |= 1 << @backingInt(RunFlag.annotation);
     return flags;
 }
 
@@ -2177,8 +2181,8 @@ test "encodePageText: an unknown width is NaN, flags and counts are kept, a font
     const glyphs_a = [_]zpdf.read.Glyph{ .{ .x = 1, .y = 2, .text_at = 0 }, .{ .x = 3, .y = 4, .text_at = 1 } };
     const glyphs_b = [_]zpdf.read.Glyph{.{ .x = 5, .y = 6, .text_at = 0 }};
     const runs = [_]zpdf.read.TextRun{
-        .{ .text = "ab", .x = 1, .y = 2, .size = 10, .width = null, .font = "F", .unmapped = 1, .glyphs = &glyphs_a, .actual_text = false, .vertical = true },
-        .{ .text = "c", .x = 5, .y = 6, .size = 12, .width = 7, .font = "F", .unmapped = 0, .glyphs = &glyphs_b, .actual_text = true, .vertical = false },
+        .{ .text = "ab", .x = 1, .y = 2, .size = 10, .width = null, .font = "F", .unmapped = 1, .glyphs = &glyphs_a, .actual_text = false, .vertical = true, .annotation = true },
+        .{ .text = "c", .x = 5, .y = 6, .size = 12, .width = 7, .font = "F", .unmapped = 0, .glyphs = &glyphs_b, .actual_text = true, .vertical = false, .annotation = false },
     };
     const wire = try encodePageText(gpa, &runs, 2);
     defer gpa.free(wire);
@@ -2188,7 +2192,7 @@ test "encodePageText: an unknown width is NaN, flags and counts are kept, a font
     const b = readRecord(RunRecord, wire, @sizeOf(TextHeader) + @sizeOf(RunRecord));
     try std.testing.expect(std.math.isNan(a.width));
     try std.testing.expectEqual(@as(f64, 7), b.width);
-    try std.testing.expectEqual(@as(u32, 2), a.flags);
+    try std.testing.expectEqual(@as(u32, 2 | 4), a.flags);
     try std.testing.expectEqual(@as(u32, 1), b.flags);
     try std.testing.expectEqual(@as(u32, 1), a.unmapped);
     try std.testing.expectEqual(@as(u32, 0), a.first_glyph);

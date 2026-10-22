@@ -70,6 +70,9 @@ internal enum RunFlag : uint
     // Vertical writing (zpdf.read.TextRun.vertical): each glyph moves the text position along
     // text space's y axis, and a glyph's position is its vertical origin.
     Vertical = 1u << 1,
+    // Drawn by an annotation's appearance stream (zpdf.read.TextRun.annotation), such as a form
+    // field's value, not by the page's content stream.
+    Annotation = 1u << 2,
 }
 
 // zpdf_font_axes: one per axis, in fvar order.
@@ -217,7 +220,7 @@ internal unsafe struct GlyphRecord
 
 internal static unsafe partial class ZpdfAbi
 {
-    public const uint AbiVersion = 8;
+    public const uint AbiVersion = 9;
     public const string LibraryName = "zpdf";
 
     // abi_version. A caller checks it once, when it loads the library.

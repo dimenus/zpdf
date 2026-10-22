@@ -123,7 +123,8 @@ public sealed unsafe class PdfReader : IDisposable
                 double.IsNaN(run.width) ? null : run.width,
                 checked((int)run.unmapped),
                 (run.flags & (uint)RunFlag.ActualText) != 0,
-                (run.flags & (uint)RunFlag.Vertical) != 0);
+                (run.flags & (uint)RunFlag.Vertical) != 0,
+                (run.flags & (uint)RunFlag.Annotation) != 0);
         }
         return new PageText(runs, checked((int)header.unplaced_actual_text));
     }
@@ -174,6 +175,8 @@ public sealed record PdfPage(int Index, PdfBox MediaBox, PdfBox CropBox, int Rot
 /// <param name="IsVertical">Vertical writing (an /Identity-V font): each glyph moves the text
 /// position along the text's y axis, usually down the page, and a glyph's position is the text
 /// position it is drawn at, which is its vertical origin.</param>
+/// <param name="IsAnnotation">Drawn by an annotation's appearance stream, such as a form field's
+/// value or a stamp, not by the page's content stream. These runs follow the page's.</param>
 public sealed record TextRun(
     string Text,
     string Font,
@@ -183,7 +186,8 @@ public sealed record TextRun(
     double? Width,
     int UnmappedCodes,
     bool IsActualText,
-    bool IsVertical);
+    bool IsVertical,
+    bool IsAnnotation);
 
 /// <param name="Runs">In the order the page draws them.</param>
 /// <param name="UnplacedActualText">/ActualText spans that drew no glyph, so their text is in
