@@ -1043,7 +1043,8 @@ pub const Reader = struct {
         }
     }
 
-    fn rect(self: *Reader, obj: Object) Error![4]f64 {
+    /// A rectangle (7.9.5): four finite numbers, normalized so x0 <= x1 and y0 <= y1.
+    pub fn rect(self: *Reader, obj: Object) Error![4]f64 {
         const a = switch (obj) {
             .array => |a| a,
             else => return error.Malformed,

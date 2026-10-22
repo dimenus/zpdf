@@ -51,7 +51,7 @@ public sealed class ReaderTests
     }
 
     [Fact]
-    public void Rotation_crop_box_actual_text_unmapped_codes_and_vertical_text_read_as_the_file_says()
+    public void Rotation_crop_box_actual_text_unmapped_codes_vertical_text_and_annotations_read_as_the_file_says()
     {
         using var reader = PdfReader.Open(HandMadePdf.Write());
 
@@ -62,7 +62,7 @@ public sealed class ReaderTests
 
         var text = reader.ReadText(0);
         Assert.Equal(1, text.UnplacedActualText);
-        Assert.Equal(3, text.Runs.Count);
+        Assert.Equal(4, text.Runs.Count);
 
         var actual = text.Runs[0];
         Assert.Equal("Hello", actual.Text);
@@ -83,6 +83,13 @@ public sealed class ReaderTests
         Assert.True(vertical.IsVertical);
         Assert.False(vertical.IsActualText);
         Assert.Equal((300.0, 500.0, 20.0), (vertical.X, vertical.Y, vertical.Width));
+        Assert.All(text.Runs.Take(3), r => Assert.False(r.IsAnnotation));
+
+        var field = text.Runs[3];
+        Assert.Equal("Field", field.Text);
+        Assert.True(field.IsAnnotation);
+        Assert.False(field.IsActualText);
+        Assert.Equal((102.0, 105.0, 10.0), (field.X, field.Y, field.Size));
     }
 
     [Fact]

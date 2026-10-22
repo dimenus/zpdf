@@ -69,6 +69,9 @@ pub const TextRun = struct {
     /// position, which is the glyph's vertical origin, not the horizontal origin its outline is
     /// drawn from. An ActualText run is vertical when its first run was.
     vertical: bool,
+    /// Drawn by an annotation's appearance stream (12.5.5), such as a form field's value or a
+    /// stamp, not by the page's content stream. Its runs follow the page's.
+    annotation: bool,
 };
 
 pub const Glyph = struct {
@@ -1064,6 +1067,8 @@ const Interp = struct {
     /// The structure elements of the stream being run, by MCID: its /StructParents entry in the
     /// structure tree's /ParentTree (14.7.4.4). null when it has none.
     mcids: ?[]const Object = null,
+    /// The runs being drawn are an annotation's (TextRun.annotation).
+    annotation: bool = false,
 
     const Marked = struct {
         /// The span's /ActualText, as UTF-8, when it has one.
@@ -1281,6 +1286,7 @@ const Interp = struct {
                     .glyphs = &.{},
                     .actual_text = true,
                     .vertical = false,
+                    .annotation = self.annotation,
                 });
                 try self.ends.append(self.scratch, .{ b[2], b[1] });
             };
@@ -1361,6 +1367,12 @@ const Interp = struct {
         const subtype = (try self.r.getResolved(s.dict, "Subtype")) orelse return error.Malformed;
         if (subtype == .name and std.mem.eql(u8, subtype.name, "Image")) return self.noteImage();
         if (!(subtype == .name and std.mem.eql(u8, subtype.name, "Form"))) return;
+        try self.drawForm(ref, s, resources, depth);
+    }
+
+    /// Runs form XObject `s` (`ref` is how it was reached: a reference, or the stream itself),
+    /// with `resources` when it has none of its own.
+    fn drawForm(self: *Interp, ref: Object, s: read.Stream, resources: Dict, depth: u32) Error!void {
         if (depth >= 16) return error.TooDeep;
         if (ref == .ref) {
             for (self.forms.items) |n| if (n == ref.ref.num) return error.Malformed;
@@ -1413,6 +1425,109 @@ const Interp = struct {
             self.stack_floor, self.marked_floor = saved_floors;
         }
         try self.run(data, form_resources, depth + 1);
+    }
+
+    /// The text of the page's annotations, after its content, as a viewer draws them: each one's
+    /// normal appearance stream (/AP /N, or its /AS entry when /N holds one stream per state),
+    /// placed on its /Rect by the algorithm of 12.5.5. An annotation with no appearance draws
+    /// nothing; none is made up from /Contents or field values (MuPDF synthesises some, and
+    /// mutool then gives text the file does not draw). Left out, as a viewer leaves them out:
+    /// Hidden and NoView, Invisible on a type that is not standard (12.5.3), and Popup, which a
+    /// viewer shows only when asked.
+    fn drawAnnotations(self: *Interp, page: read.Page) Error!void {
+        const r = self.r;
+        const annots = switch ((try r.getResolved(page.dict, "Annots")) orelse return) {
+            .array => |a| a,
+            else => return error.Malformed,
+        };
+        for (annots) |ref| {
+            const annot = switch (try r.resolve(ref)) {
+                .dict => |d| d,
+                else => return error.Malformed,
+            };
+            const subtype = switch ((try r.getResolved(annot, "Subtype")) orelse return error.Malformed) {
+                .name => |n| n,
+                else => return error.Malformed,
+            };
+            if (std.mem.eql(u8, subtype, "Popup")) continue;
+            var flags: i64 = switch ((try r.getResolved(annot, "F")) orelse Object{ .integer = 0 }) {
+                .integer => |n| n,
+                else => return error.Malformed,
+            };
+            const invisible = 1 << 0;
+            const hidden = 1 << 1;
+            const no_zoom = 1 << 3;
+            const no_rotate = 1 << 4;
+            const no_view = 1 << 5;
+            if (flags & (hidden | no_view) != 0) continue;
+            if (flags & invisible != 0 and !standardAnnotation(subtype)) continue;
+            // A Text annotation (a note's icon) behaves as if NoZoom and NoRotate were set
+            // (12.5.6.4).
+            if (std.mem.eql(u8, subtype, "Text")) flags |= no_zoom | no_rotate;
+            const ap = switch ((try r.getResolved(annot, "AP")) orelse continue) {
+                .dict => |d| d,
+                else => return error.Malformed,
+            };
+            const n_ref = ap.get("N") orelse continue;
+            const form_ref, const form = switch (try r.resolve(n_ref)) {
+                .stream => |st| .{ n_ref, st },
+                .dict => |states| blk: {
+                    const as = switch ((try r.getResolved(annot, "AS")) orelse continue) {
+                        .name => |n| n,
+                        else => return error.Malformed,
+                    };
+                    const st_ref = states.get(as) orelse continue;
+                    break :blk switch (try r.resolve(st_ref)) {
+                        .stream => |st| .{ st_ref, st },
+                        else => return error.Malformed,
+                    };
+                },
+                else => return error.Malformed,
+            };
+            if (try r.getResolved(form.dict, "Subtype")) |st| {
+                if (!(st == .name and std.mem.eql(u8, st.name, "Form"))) return error.Malformed;
+            }
+            const bbox = try r.rect((try r.getResolved(form.dict, "BBox")) orelse return error.Malformed);
+            const matrix = if (try r.getResolved(form.dict, "Matrix")) |m| try matrixOf(r, m) else identity;
+            var rect = try r.rect((try r.getResolved(annot, "Rect")) orelse return error.Malformed);
+            // NoZoom: the appearance keeps its own size, from the rectangle's top-left corner.
+            // NoRotate: on a rotated page it stays upright, turned about that corner. As MuPDF
+            // places them (pdf_annot_display_rect, pdf_annot_transform).
+            if (flags & no_zoom != 0) rect = .{ rect[0], rect[3] - (bbox[3] - bbox[1]), rect[0] + (bbox[2] - bbox[0]), rect[3] };
+            const rotate: u16 = if (flags & no_rotate != 0) page.rotate else 0;
+            if (rotate != 0) {
+                const turn = mul(mul(.{ 1, 0, 0, 1, -rect[0], -rect[3] }, rotation(rotate)), .{ 1, 0, 0, 1, rect[0], rect[3] });
+                rect = boxOf(rect, turn);
+            }
+            // 12.5.5: the form's bounding box, transformed by its /Matrix, is mapped onto the
+            // rectangle by a scale and a translation (A); the form then runs with /Matrix × A.
+            const box = boxOf(bbox, matrix);
+            const w = box[2] - box[0];
+            const h = box[3] - box[1];
+            const upright: Matrix = switch (rotate) {
+                0 => identity,
+                90 => .{ 0, h / w, -w / h, 0, w, 0 },
+                180 => .{ -1, 0, 0, -1, w, h },
+                270 => .{ 0, -h / w, w / h, 0, 0, h },
+                else => unreachable,
+            };
+            const sx = if (w == 0) 0 else (rect[2] - rect[0]) / w;
+            const sy = if (h == 0) 0 else (rect[3] - rect[1]) / h;
+            const a_matrix = mul(upright, .{ sx, 0, 0, sy, rect[0] - box[0] * sx, rect[1] - box[1] * sy });
+            // Each appearance starts from the default graphics state, outside any span the page
+            // left open, with no structure of its own.
+            const saved_gs = self.gs;
+            const saved_mcids = self.mcids;
+            defer {
+                self.gs = saved_gs;
+                self.mcids = saved_mcids;
+                self.annotation = false;
+            }
+            self.gs = .{ .ctm = a_matrix };
+            self.mcids = null;
+            self.annotation = true;
+            try self.drawForm(form_ref, form, page.resources, 0);
+        }
     }
 
     /// One text-showing operator: strings and TJ adjustments, as one run.
@@ -1487,6 +1602,7 @@ const Interp = struct {
             .glyphs = glyphs.items,
             .actual_text = false,
             .vertical = font.vertical,
+            .annotation = self.annotation,
         });
     }
 
@@ -1624,6 +1740,50 @@ fn skipInlineImage(lx: *read.Lexer, arena: Allocator, max_depth: u32) Error!void
     if (!(ei == .keyword and std.mem.eql(u8, ei.keyword, "EI"))) return error.Malformed;
 }
 
+/// The standard annotation types (ISO 32000-1 Table 169): the Invisible flag hides only others.
+fn standardAnnotation(subtype: []const u8) bool {
+    const types = [_][]const u8{ "Text", "Link", "FreeText", "Line", "Square", "Circle", "Polygon", "PolyLine", "Highlight", "Underline", "Squiggly", "StrikeOut", "Stamp", "Caret", "Ink", "Popup", "FileAttachment", "Sound", "Movie", "Widget", "Screen", "PrinterMark", "TrapNet", "Watermark", "3D", "Redact" };
+    for (types) |t| if (std.mem.eql(u8, subtype, t)) return true;
+    return false;
+}
+
+/// A /Matrix entry: six finite numbers.
+fn matrixOf(r: *Reader, obj: Object) Error!Matrix {
+    const m = switch (obj) {
+        .array => |arr| arr,
+        else => return error.Malformed,
+    };
+    if (m.len != 6) return error.Malformed;
+    var mat: Matrix = undefined;
+    for (0..6) |i| {
+        mat[i] = (try r.resolve(m[i])).number() orelse return error.Malformed;
+        if (!std.math.isFinite(mat[i])) return error.Malformed;
+    }
+    return mat;
+}
+
+/// The bounding box of rectangle `b` transformed by `m`.
+fn boxOf(b: [4]f64, m: Matrix) [4]f64 {
+    var out: [4]f64 = .{ std.math.inf(f64), std.math.inf(f64), -std.math.inf(f64), -std.math.inf(f64) };
+    for ([_][2]f64{ .{ b[0], b[1] }, .{ b[2], b[1] }, .{ b[0], b[3] }, .{ b[2], b[3] } }) |c| {
+        const x = c[0] * m[0] + c[1] * m[2] + m[4];
+        const y = c[0] * m[1] + c[1] * m[3] + m[5];
+        out = .{ @min(out[0], x), @min(out[1], y), @max(out[2], x), @max(out[3], y) };
+    }
+    return out;
+}
+
+/// A turn of `degrees` (a multiple of 90) counterclockwise in user space.
+fn rotation(degrees: u16) Matrix {
+    return switch (degrees) {
+        0 => identity,
+        90 => .{ 0, 1, -1, 0, 0, 0 },
+        180 => .{ -1, 0, 0, -1, 0, 0 },
+        270 => .{ 0, -1, 1, 0, 0, 0 },
+        else => unreachable,
+    };
+}
+
 /// A page's runs as Reader.pageRuns leaves them, in the reader's work memory.
 pub const PageRuns = struct {
     runs: []const TextRun,
@@ -1641,6 +1801,7 @@ pub fn pageRuns(r: *Reader, index: usize) Error!PageRuns {
     var interp: Interp = .{ .r = r, .out = work, .scratch = work, .gpa = r.arena_state.child_allocator };
     interp.mcids = try structParents(r, page.dict);
     if (try r.pageContentsIn(work, page)) |content| try interp.run(content, page.resources, 0);
+    try interp.drawAnnotations(page);
     return .{ .runs = interp.runs.items, .unplaced_actual_text = interp.unplaced_actual_text };
 }
 
@@ -2418,6 +2579,73 @@ test "a word that starts like a number and is not one skips its operator, unless
     try testing.expectError(error.Malformed, r.pageText(gpa, 1));
     try testing.expectError(error.Malformed, r.pageText(gpa, 2));
     try testing.expectError(error.Malformed, r.pageText(gpa, 3));
+}
+
+test "annotations: each appearance on its /Rect (12.5.5), by /AS, with Hidden, NoView, Popup and Invisible left out" {
+    const gpa = testing.allocator;
+    const pdf = try read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R 20 0 R 23 0 R] /Count 3 /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Annots [6 0 R 8 0 R 11 0 R 13 0 R 14 0 R 15 0 R 17 0 R 18 0 R 19 0 R] >>",
+        // The character spacing the page leaves set does not reach an appearance.
+        streamObject("", "5 Tc BT /F1 10 Tf 50 50 Td (P) Tj ET"),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        // Scaled 2x across and 3x up onto its rectangle; no resources of its own, so the page's.
+        "<< /Type /Annot /Subtype /FreeText /Rect [100 500 300 560] /AP << /N 7 0 R >> >>",
+        streamObject("/Type /XObject /Subtype /Form /BBox [0 0 100 20]", "BT /F1 10 Tf 0 5 Td (A) Tj ET"),
+        // The /On state; a rectangle given by its other corners; a /Matrix and a box off 0, 0.
+        "<< /Type /Annot /Subtype /Widget /Rect [300 120 200 100] /AS /On /AP << /N << /On 9 0 R /Off 10 0 R >> >> >>",
+        streamObject("/Subtype /Form /BBox [10 0 110 20] /Matrix [1 0 0 1 10 0] /Resources << /Font << /G 5 0 R >> >>", "BT /G 10 Tf 15 2 Td (B) Tj ET"),
+        streamObject("/Subtype /Form /BBox [0 0 1 1]", "BT /F1 10 Tf (X) Tj ET"),
+        "<< /Type /Annot /Subtype /Square /F 2 /Rect [0 0 10 10] /AP << /N 12 0 R >> >>",
+        streamObject("/BBox [0 0 10 10]", "BT /F1 10 Tf (H) Tj ET"),
+        "<< /Type /Annot /Subtype /Square /F 32 /Rect [0 0 10 10] /AP << /N 12 0 R >> >>",
+        "<< /Type /Annot /Subtype /Popup /Rect [0 0 10 10] /AP << /N 12 0 R >> >>",
+        // Invisible hides only a type that is not standard.
+        "<< /Type /Annot /Subtype /Stamp /F 1 /Rect [0 0 10 10] /AP << /N 16 0 R >> >>",
+        streamObject("/BBox [0 0 10 10]", "BT /F1 10 Tf (S) Tj ET"),
+        "<< /Type /Annot /Subtype /Foo /F 1 /Rect [0 0 10 10] /AP << /N 12 0 R >> >>",
+        // No appearance; states but no /AS.
+        "<< /Type /Annot /Subtype /Square /Rect [0 0 10 10] >>",
+        "<< /Type /Annot /Subtype /Widget /Rect [0 0 10 10] /AP << /N << /On 12 0 R >> >> >>",
+        // A note on a page turned 90 degrees: its own size from the top-left corner (NoZoom),
+        // turned upright about it (NoRotate).
+        "<< /Type /Page /Parent 2 0 R /Rotate 90 /Annots [21 0 R] >>",
+        "<< /Type /Annot /Subtype /Text /Rect [100 100 300 140] /AP << /N 22 0 R >> >>",
+        streamObject("/BBox [0 0 20 20]", "BT /F1 10 Tf 2 3 Td (N) Tj ET"),
+        "<< /Type /Page /Parent 2 0 R /Annots [5] >>",
+    }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    var pt = try r.pageText(gpa, 0);
+    defer pt.deinit();
+    try testing.expectEqual(@as(usize, 4), pt.runs.len);
+    const want = [_]struct { text: []const u8, x: f64, y: f64, size: f64, annotation: bool }{
+        .{ .text = "P", .x = 50, .y = 50, .size = 10, .annotation = false },
+        .{ .text = "A", .x = 100, .y = 515, .size = 30, .annotation = true },
+        .{ .text = "B", .x = 205, .y = 102, .size = 10, .annotation = true },
+        .{ .text = "S", .x = 0, .y = 0, .size = 10, .annotation = true },
+    };
+    for (want, pt.runs) |w, run| {
+        try testing.expectEqualStrings(w.text, run.text);
+        try testing.expectApproxEqAbs(w.x, run.x, 1e-9);
+        try testing.expectApproxEqAbs(w.y, run.y, 1e-9);
+        try testing.expectApproxEqAbs(w.size, run.size, 1e-9);
+        try testing.expectEqual(w.annotation, run.annotation);
+    }
+    // Helvetica's A is 667 wide: 6.67 at 10 points, 2x across, and no Tc.
+    try testing.expectApproxEqAbs(@as(f64, 13.34), pt.runs[1].width.?, 1e-9);
+    // Rect [100 120 120 140] by NoZoom, turned about (100, 140) to [100 140 120 160]; the
+    // appearance turned with it: (2, 3) is at (100 + 20 - 3, 140 + 2).
+    var turned = try r.pageText(gpa, 1);
+    defer turned.deinit();
+    try testing.expectEqual(@as(usize, 1), turned.runs.len);
+    try testing.expectApproxEqAbs(@as(f64, 117), turned.runs[0].x, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 142), turned.runs[0].y, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 10), turned.runs[0].size, 1e-9);
+    // An /Annots entry that is not a dictionary.
+    try testing.expectError(error.Malformed, r.pageText(gpa, 2));
 }
 
 test "a PageText outlives its reader and the file's bytes" {
