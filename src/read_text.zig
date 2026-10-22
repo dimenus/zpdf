@@ -20,8 +20,9 @@
 //! /Widths or /W, and for the 14 standard fonts with no /Widths from Adobe's AFM metrics
 //! (read_tables.zig).
 //!
-//! Refused: a Type0 font whose /Encoding is not Identity-H (error.UnsupportedFont: without its
-//! CMap the codes cannot even be split into characters), and anything zpdf.read refuses.
+//! Refused: a Type0 font whose /Encoding is not Identity-H or Identity-V (error.UnsupportedFont:
+//! without its CMap the codes cannot even be split into characters), and anything zpdf.read
+//! refuses.
 
 const std = @import("std");
 const Allocator = std.mem.Allocator;
@@ -54,6 +55,11 @@ pub const TextRun = struct {
     /// map to; the run covers every glyph drawn inside the span. zpdf writes one around each
     /// cluster whose glyphs are not in text order (Indic reordering, marks).
     actual_text: bool,
+    /// Vertical writing (/Identity-V, 9.7.4.3): each glyph moves the text position along text
+    /// space's y axis, down for the usual negative displacement. A glyph's origin is that text
+    /// position, which is the glyph's vertical origin, not the horizontal origin its outline is
+    /// drawn from. An ActualText run is vertical when its first run was.
+    vertical: bool,
 };
 
 pub const Glyph = struct {
@@ -97,8 +103,10 @@ fn mul(m: Matrix, n: Matrix) Matrix {
 /// A font as text extraction needs it. Lives in the reader's arena, cached by object number.
 pub const Font = struct {
     base_font: []const u8,
-    /// Two-byte codes (Type0 with Identity-H); else one byte.
+    /// Two-byte codes (Type0 with Identity-H or Identity-V); else one byte.
     two_byte: bool,
+    /// Type0 with Identity-V.
+    vertical: bool,
     to_unicode: ?CMap,
     /// Type0 with an Adobe character collection: Adobe's CID-to-Unicode table for it, static
     /// data built from src/cid. With Identity-H the code is the CID.
@@ -111,23 +119,37 @@ pub const Font = struct {
     /// Type0: /W, as sorted ranges, and /DW.
     cid_widths: []const CidRange,
     default_width: f64,
+    /// Type0 with Identity-V: each CID's vertical displacement w1, from /W2 as sorted ranges, and
+    /// /DW2's (9.7.4.3). The position vectors in /W2 and /DW2 place the glyph's outline relative
+    /// to the text position and do not move it, so they are not kept.
+    cid_v_displacements: []const CidRange,
+    default_v_displacement: f64,
 
     const CidRange = struct { first: u32, last: u32, widths: []const f64 };
 
     fn width(self: *const Font, code: u32) ?f64 {
         if (!self.two_byte) return self.simple_widths[code];
+        return cidMetric(self.cid_widths, code) orelse self.default_width;
+    }
+
+    /// The vertical displacement w1 of a vertical font's code (a CID).
+    fn vDisplacement(self: *const Font, code: u32) f64 {
+        return cidMetric(self.cid_v_displacements, code) orelse self.default_v_displacement;
+    }
+
+    fn cidMetric(ranges: []const CidRange, code: u32) ?f64 {
         var lo: usize = 0;
-        var hi: usize = self.cid_widths.len;
+        var hi: usize = ranges.len;
         while (lo < hi) {
             const mid = (lo + hi) / 2;
-            const r = self.cid_widths[mid];
+            const r = ranges[mid];
             if (code < r.first) {
                 hi = mid;
             } else if (code > r.last) {
                 lo = mid + 1;
             } else return if (r.widths.len == 1) r.widths[0] else r.widths[code - r.first];
         }
-        return self.default_width;
+        return null;
     }
 
     fn unicode(self: *const Font, code: u32, code_len: u8, buf: *[max_chars]u21) ?[]const u21 {
@@ -445,12 +467,15 @@ pub fn loadFont(r: *Reader, ref: Object) Error!*const Font {
     f.* = .{
         .base_font = if (try r.getResolved(dict, "BaseFont")) |b| (if (b == .name) b.name else "") else "",
         .two_byte = false,
+        .vertical = false,
         .to_unicode = null,
         .cid_unicode = null,
         .encoding = @splat(null),
         .simple_widths = @splat(null),
         .cid_widths = &.{},
         .default_width = 1000,
+        .cid_v_displacements = &.{},
+        .default_v_displacement = -1000,
     };
     if (try r.getResolved(dict, "ToUnicode")) |tu| switch (tu) {
         .stream => |s| f.to_unicode = try parseCMap(a, r.arena_state.child_allocator, try r.streamData(s), r.options.max_depth),
@@ -603,9 +628,11 @@ fn orderingTable(r: *Reader, info: Dict) Error!?CidTable {
 }
 
 fn loadType0(r: *Reader, f: *Font, dict: Dict) Error!void {
-    const a = r.arenaAllocator();
     const enc = (try r.getResolved(dict, "Encoding")) orelse return error.Malformed;
-    if (!(enc == .name and std.mem.eql(u8, enc.name, "Identity-H"))) return error.UnsupportedFont;
+    if (enc != .name) return error.UnsupportedFont;
+    if (std.mem.eql(u8, enc.name, "Identity-V")) {
+        f.vertical = true;
+    } else if (!std.mem.eql(u8, enc.name, "Identity-H")) return error.UnsupportedFont;
     f.two_byte = true;
     const descendants = switch ((try r.getResolved(dict, "DescendantFonts")) orelse return error.Malformed) {
         .array => |arr| arr,
@@ -621,7 +648,26 @@ fn loadType0(r: *Reader, f: *Font, dict: Dict) Error!void {
         else => return error.Malformed,
     };
     if (try r.getResolved(cid, "DW")) |dw| f.default_width = dw.number() orelse return error.Malformed;
-    const w = switch ((try r.getResolved(cid, "W")) orelse return) {
+    if (try r.getResolved(cid, "W")) |w| f.cid_widths = try cidMetrics(r, w, 1);
+    if (!f.vertical) return;
+    // /DW2 [v_y w1] and /W2 groups of [w1 v_x v_y] (9.7.4.3).
+    if (try r.getResolved(cid, "DW2")) |dw2| {
+        const pair = switch (dw2) {
+            .array => |arr| arr,
+            else => return error.Malformed,
+        };
+        if (pair.len != 2) return error.Malformed;
+        f.default_v_displacement = (try r.resolve(pair[1])).number() orelse return error.Malformed;
+    }
+    if (try r.getResolved(cid, "W2")) |w2| f.cid_v_displacements = try cidMetrics(r, w2, 3);
+}
+
+/// /W or /W2 (9.7.4.3) as sorted ranges of each CID's first number: `c [n ...]` gives CIDs from
+/// c on, `stride` numbers each; `c_first c_last n ...` gives every CID in the range `stride`
+/// numbers.
+fn cidMetrics(r: *Reader, obj: Object, stride: usize) Error![]const Font.CidRange {
+    const a = r.arenaAllocator();
+    const w = switch (obj) {
         .array => |arr| arr,
         else => return error.Malformed,
     };
@@ -632,22 +678,24 @@ fn loadType0(r: *Reader, f: *Font, dict: Dict) Error!void {
         if (i + 1 >= w.len) return error.Malformed;
         switch (try r.resolve(w[i + 1])) {
             .array => |list| {
-                if (list.len == 0) {
+                if (list.len % stride != 0) return error.Malformed;
+                const n = list.len / stride;
+                if (n == 0) {
                     i += 2;
                     continue;
                 }
-                if (@as(u64, first) + list.len - 1 > 0xFFFF) return error.Malformed;
-                const ws = try a.alloc(f64, list.len);
-                for (list, 0..) |v, k| ws[k] = (try r.resolve(v)).number() orelse return error.Malformed;
-                try ranges.append(a, .{ .first = first, .last = first + @as(u32, @intCast(list.len)) - 1, .widths = ws });
+                if (@as(u64, first) + n - 1 > 0xFFFF) return error.Malformed;
+                const ws = try a.alloc(f64, n);
+                for (ws, 0..) |*v, k| v.* = try firstOfGroup(r, list[k * stride ..][0..stride]);
+                try ranges.append(a, .{ .first = first, .last = first + @as(u32, @intCast(n)) - 1, .widths = ws });
                 i += 2;
             },
             else => {
                 const last = try cidOf(r, w[i + 1]);
-                if (i + 2 >= w.len or last < first) return error.Malformed;
-                const v = (try r.resolve(w[i + 2])).number() orelse return error.Malformed;
+                if (i + 1 + stride >= w.len or last < first) return error.Malformed;
+                const v = try firstOfGroup(r, w[i + 2 ..][0..stride]);
                 try ranges.append(a, .{ .first = first, .last = last, .widths = try a.dupe(f64, &.{v}) });
-                i += 3;
+                i += 2 + stride;
             },
         }
     }
@@ -656,7 +704,13 @@ fn loadType0(r: *Reader, f: *Font, dict: Dict) Error!void {
             return x.first < y.first;
         }
     }.lt);
-    f.cid_widths = ranges.items;
+    return ranges.items;
+}
+
+/// The first of a group of numbers; the others must be numbers too.
+fn firstOfGroup(r: *Reader, group: []const Object) Error!f64 {
+    for (group[1..]) |x| _ = (try r.resolve(x)).number() orelse return error.Malformed;
+    return (try r.resolve(group[0])).number() orelse error.Malformed;
 }
 
 fn cidOf(r: *Reader, o: Object) Error!u32 {
@@ -1201,15 +1255,24 @@ const Interp = struct {
                         try appendUtf8(a, &text, std.unicode.replacement_character);
                         unmapped += 1;
                     }
-                    const w0 = font.width(code) orelse blk: {
-                        width_known = false;
-                        break :blk 0;
-                    };
                     const word: f64 = if (step == 1 and code == 32) self.gs.word_spacing else 0;
-                    self.advance((w0 / 1000 * self.gs.size + self.gs.char_spacing + word) * self.gs.h_scale);
+                    // 9.4.4: tx = (w0 Tfs + Tc + Tw) Th, or in vertical writing ty = w1 Tfs + Tc
+                    // + Tw, with no horizontal scaling.
+                    if (font.vertical) {
+                        self.advance(0, font.vDisplacement(code) / 1000 * self.gs.size + self.gs.char_spacing + word);
+                    } else {
+                        const w0 = font.width(code) orelse blk: {
+                            width_known = false;
+                            break :blk 0;
+                        };
+                        self.advance((w0 / 1000 * self.gs.size + self.gs.char_spacing + word) * self.gs.h_scale, 0);
+                    }
                 }
             },
-            .integer, .real => self.advance(-(part.number().?) / 1000 * self.gs.size * self.gs.h_scale),
+            .integer, .real => {
+                const adjust = -(part.number().?) / 1000 * self.gs.size;
+                if (font.vertical) self.advance(0, adjust) else self.advance(adjust * self.gs.h_scale, 0);
+            },
             else => return error.Malformed,
         };
         // The run starts at its first glyph, so a TJ adjustment before that glyph moves the start.
@@ -1237,11 +1300,12 @@ const Interp = struct {
             .unmapped = unmapped,
             .glyphs = glyphs.items,
             .actual_text = false,
+            .vertical = font.vertical,
         });
     }
 
-    fn advance(self: *Interp, tx: f64) void {
-        self.tm = mul(.{ 1, 0, 0, 1, tx, 0 }, self.tm);
+    fn advance(self: *Interp, tx: f64, ty: f64) void {
+        self.tm = mul(.{ 1, 0, 0, 1, tx, ty }, self.tm);
     }
 
     /// Where the next glyph's origin is, in user space: (0, rise) in text space (9.4.4).
@@ -1466,6 +1530,74 @@ fn streamObject(comptime dict: []const u8, comptime data: []const u8) []const u8
     return std.fmt.comptimePrint("<< {s} /Length {d} >>\nstream\n{s}\nendstream", .{ dict, data.len, data });
 }
 
+test "Identity-V: glyphs move by /W2 and /DW2's w1 and Tc along y, TJ along y, with no Tz or Tw" {
+    const gpa = testing.allocator;
+    // Tc 2, Tz 50 and Tw 3 hold for every run. By ISO 32000-1 9.4.4, a vertical glyph moves the
+    // text position by ty = w1 / 1000 * 10 + Tc, and a TJ number n by -n / 1000 * 10: Tz scales
+    // neither, and Tw applies to the one-byte code 32 only, never to the two-byte 0020.
+    const page =
+        \\BT /V1 10 Tf 50 Tz 2 Tc 3 Tw 100 700 Td [<0001> 500 <00200003> <0004> <0005>] TJ ET
+        \\BT /V2 10 Tf 200 500 Td <00010007> Tj ET
+        \\BT /H 10 Tf 300 300 Td <0001> Tj ET
+    ;
+    const pdf = try read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R 4 0 R 5 0 R 18 0 R] /Count 4 /MediaBox [0 0 612 792] /Resources << /Font << /V1 9 0 R /V2 10 0 R /H 11 0 R /V3 12 0 R /V4 13 0 R /H3 19 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 7 0 R >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 8 0 R >>",
+        streamObject("", page),
+        streamObject("", "BT /V3 10 Tf <0001> Tj ET"),
+        streamObject("", "BT /V4 10 Tf <0001> Tj ET"),
+        "<< /Type /Font /Subtype /Type0 /BaseFont /V1 /Encoding /Identity-V /DescendantFonts [14 0 R] >>",
+        "<< /Type /Font /Subtype /Type0 /BaseFont /V2 /Encoding /Identity-V /DescendantFonts [15 0 R] >>",
+        "<< /Type /Font /Subtype /Type0 /BaseFont /H /Encoding /Identity-H /DescendantFonts [14 0 R] >>",
+        "<< /Type /Font /Subtype /Type0 /BaseFont /V3 /Encoding /Identity-V /DescendantFonts [16 0 R] >>",
+        "<< /Type /Font /Subtype /Type0 /BaseFont /V4 /Encoding /Identity-V /DescendantFonts [17 0 R] >>",
+        // CIDs 3 and 4: w1 -500 and -1500 (an array); 5 and 6: -2000 (a range); others: /DW2's
+        // default -1000.
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /A /W2 [3 [-500 250 880 -1500 250 880] 5 6 -2000 500 880] >>",
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /B /DW2 [880 -900] >>",
+        // Malformed: /W2 groups are three numbers; /DW2 is two.
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /C /W2 [1 [-500 250]] >>",
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /D /DW2 [-900] >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 20 0 R >>",
+        // Horizontal writing never reads /W2, so C's malformed one does not stop it.
+        "<< /Type /Font /Subtype /Type0 /BaseFont /H3 /Encoding /Identity-H /DescendantFonts [16 0 R] >>",
+        streamObject("", "BT /H3 10 Tf <0001> Tj ET"),
+    }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    var pt = try r.pageText(gpa, 0);
+    defer pt.deinit();
+    try testing.expectEqual(@as(usize, 3), pt.runs.len);
+    // V1: 0001 at 700 moves -10 + 2; the TJ 500 moves -5; 0020 moves -10 + 2; 0003 -5 + 2; 0004
+    // -15 + 2; 0005 -20 + 2, ending at 645.
+    const v1 = pt.runs[0];
+    try testing.expect(v1.vertical);
+    try testing.expectEqual(@as(usize, 5), v1.glyphs.len);
+    for ([_]f64{ 700, 687, 679, 676, 663 }, v1.glyphs) |y, g| {
+        try testing.expectApproxEqAbs(@as(f64, 100), g.x, 1e-9);
+        try testing.expectApproxEqAbs(y, g.y, 1e-9);
+    }
+    try testing.expectApproxEqAbs(@as(f64, 55), v1.width.?, 1e-9);
+    // V2: /DW2's w1 -900: each glyph moves -9 + 2.
+    const v2 = pt.runs[1];
+    try testing.expect(v2.vertical);
+    try testing.expectApproxEqAbs(@as(f64, 493), v2.glyphs[1].y, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 14), v2.width.?, 1e-9);
+    // H, the same CIDFont with Identity-H: /W2 does not apply; (1000 / 1000 * 10 + 2) * 0.5.
+    const h = pt.runs[2];
+    try testing.expect(!h.vertical);
+    try testing.expectApproxEqAbs(@as(f64, 6), h.width.?, 1e-9);
+    try testing.expectError(error.Malformed, r.pageText(gpa, 1));
+    try testing.expectError(error.Malformed, r.pageText(gpa, 2));
+    var h3 = try r.pageText(gpa, 3);
+    defer h3.deinit();
+    try testing.expectEqual(@as(usize, 1), h3.runs.len);
+}
+
 test "text state, matrices, encodings, CMaps, inline images and forms give the runs ISO 32000-1 9.4 says" {
     const gpa = testing.allocator;
     const page1 =
@@ -1495,7 +1627,7 @@ test "text state, matrices, encodings, CMaps, inline images and forms give the r
         "<< /Type /Page /Parent 2 0 R >>",
         "<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+Helvetica /Encoding << /BaseEncoding /WinAnsiEncoding /Differences [65 /uni00C5 /f_i /eacute.sc 128 /bogusname] >> >>",
         "<< /Type /Font /Subtype /Type0 /BaseFont /Test /Encoding /Identity-H /DescendantFonts [15 0 R] /ToUnicode 16 0 R >>",
-        "<< /Type /Font /Subtype /Type0 /BaseFont /V /Encoding /Identity-V /DescendantFonts [15 0 R] >>",
+        "<< /Type /Font /Subtype /Type0 /BaseFont /V /Encoding /UniJIS-UCS2-H /DescendantFonts [15 0 R] >>",
         streamObject("/Type /XObject /Subtype /Form /BBox [0 0 612 792] /Matrix [1 0 0 1 300 0]", "BT /F1 8 Tf 0 0 Td (A\x80) Tj ET"),
         streamObject("/Type /XObject /Subtype /Form /BBox [0 0 1 1] /Resources << /XObject << /X2 11 0 R >> >>", "/X2 Do"),
         streamObject("", page1),

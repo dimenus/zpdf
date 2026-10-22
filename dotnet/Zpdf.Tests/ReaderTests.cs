@@ -51,7 +51,7 @@ public sealed class ReaderTests
     }
 
     [Fact]
-    public void Rotation_crop_box_actual_text_and_unmapped_codes_read_as_the_file_says()
+    public void Rotation_crop_box_actual_text_unmapped_codes_and_vertical_text_read_as_the_file_says()
     {
         using var reader = PdfReader.Open(HandMadePdf.Write());
 
@@ -62,11 +62,12 @@ public sealed class ReaderTests
 
         var text = reader.ReadText(0);
         Assert.Equal(1, text.UnplacedActualText);
-        Assert.Equal(2, text.Runs.Count);
+        Assert.Equal(3, text.Runs.Count);
 
         var actual = text.Runs[0];
         Assert.Equal("Hello", actual.Text);
         Assert.True(actual.IsActualText);
+        Assert.False(actual.IsVertical);
         Assert.Equal(0, actual.UnmappedCodes);
         Assert.Equal((100.0, 700.0, 12.0, "Helvetica"), (actual.X, actual.Y, actual.Size, actual.Font));
 
@@ -77,6 +78,11 @@ public sealed class ReaderTests
         Assert.Equal("Mystery", mystery.Font);
         // A font that is not standard and has no /Widths has no known advance.
         Assert.Null(mystery.Width);
+
+        var vertical = text.Runs[2];
+        Assert.True(vertical.IsVertical);
+        Assert.False(vertical.IsActualText);
+        Assert.Equal((300.0, 500.0, 20.0), (vertical.X, vertical.Y, vertical.Width));
     }
 
     [Fact]

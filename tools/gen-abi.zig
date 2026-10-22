@@ -3,7 +3,7 @@
 //!     gen-abi <src/abi.zig> <out zpdf.h> <out Zpdf.Abi.g.cs>
 //!
 //! The types come from the compiled module (zpdf.abi): each export's signature, each wire
-//! record's fields, the error codes. The compiled types do not carry parameter names or doc
+//! record's fields, the error codes, the RunFlag bits. The compiled types do not carry parameter names or doc
 //! comments, so those come from parsing src/abi.zig; a parameter count that differs between the
 //! two stops the tool. A Zig type with no C or C# mapping below is a compile error here, so a new
 //! export cannot reach the header with a guessed type.
@@ -105,6 +105,21 @@ fn snake(arena: Allocator, name: []const u8) ![]const u8 {
     for (name, 0..) |c, i| {
         if (std.ascii.isUpper(c) and i != 0) try out.append(arena, '_');
         try out.append(arena, std.ascii.toLower(c));
+    }
+    return out.items;
+}
+
+/// "actual_text" -> "ActualText".
+fn pascal(arena: Allocator, name: []const u8) ![]const u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var upper = true;
+    for (name) |c| {
+        if (c == '_') {
+            upper = true;
+            continue;
+        }
+        try out.append(arena, if (upper) std.ascii.toUpper(c) else c);
+        upper = false;
     }
     return out.items;
 }
@@ -281,6 +296,14 @@ fn header(arena: Allocator, w: *std.Io.Writer, src: *const Source) !void {
         try w.print("    ZPDF_ERROR_{s} = {d},\n", .{ upper, e[1] });
     }
     try w.print("    ZPDF_ERROR_UNKNOWN = {d},\n}};\n\n", .{abi.unknown_code});
+    try writeDoc(w, "", src.docs.get("RunFlag").?);
+    try w.writeAll("enum zpdf_run_flag {\n");
+    const flags = @typeInfo(abi.RunFlag).@"enum";
+    inline for (flags.field_names, flags.field_values) |name, value| {
+        try writeDoc(w, "    ", src.docs.get("RunFlag." ++ name).?);
+        try w.print("    ZPDF_RUN_FLAG_{s} = 1u << {d},\n", .{ try std.ascii.allocUpperString(arena, name), value });
+    }
+    try w.writeAll("};\n\n");
     inline for (records) |name| {
         const T = @field(abi, name);
         const c_name = try cType(arena, T);
@@ -365,6 +388,14 @@ fn csharp(arena: Allocator, w: *std.Io.Writer, src: *const Source) !void {
     );
     inline for (abi.error_codes) |e| try w.print("    {s} = {d},\n", .{ @errorName(e[0]), e[1] });
     try w.print("    Unknown = {d},\n}}\n\n", .{abi.unknown_code});
+    try writeDoc(w, "", src.docs.get("RunFlag").?);
+    try w.writeAll("[System.Flags]\ninternal enum RunFlag : uint\n{\n");
+    const flags = @typeInfo(abi.RunFlag).@"enum";
+    inline for (flags.field_names, flags.field_values) |name, value| {
+        try writeDoc(w, "    ", src.docs.get("RunFlag." ++ name).?);
+        try w.print("    {s} = 1u << {d},\n", .{ try pascal(arena, name), value });
+    }
+    try w.writeAll("}\n\n");
     inline for (records) |name| {
         const T = @field(abi, name);
         try writeDoc(w, "", src.docs.get(name) orelse &.{});
