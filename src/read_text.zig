@@ -3,7 +3,9 @@
 //! A run is one text-showing operator (Tj, TJ, ' or "), as drawn: its text in Unicode, where its
 //! first glyph's origin is (after any TJ adjustment before it), its size and its advance. An
 //! operator that shows no glyph makes no run. The glyphs inside a marked-content span with
-//! /ActualText make one run whose text is the ActualText. Runs come in content-stream order, which
+//! /ActualText make one run whose text is the ActualText; a span that draws no glyph but an image
+//! makes a run placed on the image, with no glyphs. The ActualText is the span's own, else that
+//! of the structure element its /MCID names (14.7.4.4). Runs come in content-stream order, which
 //! is not always reading order: readers that agree on the text disagree on its order (MuPDF
 //! keeps content order, Poppler sorts by position), so ordering is left to the caller. No space
 //! is invented between runs or for a large TJ gap; the caller decides what a gap means.
@@ -31,6 +33,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const read = @import("read.zig");
 const cmap = @import("cmap.zig");
+const cff = @import("cff.zig");
 const tables = @import("read_tables.zig");
 const winansi = @import("winansi.zig");
 const Reader = read.Reader;
@@ -45,6 +48,7 @@ pub const TextRun = struct {
     x: f64,
     y: f64,
     /// The text's height in user space: the font size scaled by the text and current matrices.
+    /// For an ActualText run placed on an image, the image's height.
     size: f64,
     /// From the first glyph's origin to where the next glyph would start, in user space. null
     /// when a glyph's width is unknown (a font with no width for one of its codes).
@@ -53,7 +57,8 @@ pub const TextRun = struct {
     font: []const u8,
     /// Codes with no Unicode mapping; each is U+FFFD in `text`.
     unmapped: u32,
-    /// Each glyph's origin, in default user space, in drawing order.
+    /// Each glyph's origin, in default user space, in drawing order. None for an ActualText run
+    /// placed on an image: its x and y are the image's bottom-left corner, its width the image's.
     glyphs: []const Glyph,
     /// The text is a marked-content span's /ActualText (14.9.4), which replaces what its glyphs
     /// map to; the run covers every glyph drawn inside the span. zpdf writes one around each
@@ -805,6 +810,30 @@ fn isEmbedded(r: *Reader, dict: Dict) Error!bool {
     return false;
 }
 
+/// The built-in encoding of an embedded CFF program (/FontFile3 with /Subtype /Type1C): the glyph
+/// name of each code (src/cff.zig), copied into the reader's arena. null when the font has no such
+/// program, or cff.zig reads none from it. The program itself is decoded into scratch memory and
+/// not kept.
+fn cffEncoding(r: *Reader, dict: Dict) Error!?[256]?[]const u8 {
+    const fd = (try r.getResolved(dict, "FontDescriptor")) orelse return null;
+    if (fd != .dict) return error.Malformed;
+    const program = switch ((try r.getResolved(fd.dict, "FontFile3")) orelse return null) {
+        .stream => |s| s,
+        else => return error.Malformed,
+    };
+    const subtype = (try r.getResolved(program.dict, "Subtype")) orelse return null;
+    if (!(subtype == .name and std.mem.eql(u8, subtype.name, "Type1C"))) return null;
+    var scratch: std.heap.ArenaAllocator = .init(r.arena_state.child_allocator);
+    defer scratch.deinit();
+    const data = try r.decodeStream(scratch.allocator(), program);
+    const names = (try cff.builtinEncoding(scratch.allocator(), data)) orelse return null;
+    var out: [256]?[]const u8 = @splat(null);
+    for (names, &out) |n, *o| if (n) |name| {
+        o.* = try r.arenaAllocator().dupe(u8, name);
+    };
+    return out;
+}
+
 /// The built-in encoding of an embedded Type 1 font program (/FontFile): the glyph name of each
 /// code, from the /Encoding in its cleartext part, `StandardEncoding` or the `dup <code> /<name>
 /// put` entries of an array (Adobe Type 1 Font Format, 2.3). null when the font has no Type 1
@@ -875,10 +904,11 @@ fn loadSimple(r: *Reader, f: *Font, dict: Dict, type3: bool) Error!void {
     const std_metrics = standardMetrics(f.base_font);
     // Base encoding: /Encoding's name or /BaseEncoding, else the font's built-in one (9.6.6.1):
     // for a standard font that is not embedded, Standard (or the symbol fonts' own); for an
-    // embedded Type 1 program, the /Encoding in its cleartext. Other embedded programs (CFF,
-    // TrueType) are not read yet, and Standard is not guessed for them: Ghostscript re-encodes
-    // its subsets, so the guess gives wrong letters with no sign of it. Such codes get no base:
-    // unmapped unless /ToUnicode or /Differences says.
+    // embedded Type 1 program, the /Encoding in its cleartext; for an embedded CFF program
+    // (/FontFile3 /Type1C), its own encoding and glyph names (src/cff.zig). An embedded TrueType
+    // program is not read, and Standard is not guessed for it or for a program these do not read:
+    // Ghostscript re-encodes its subsets, so the guess gives wrong letters with no sign of it.
+    // Such codes get no base: unmapped unless /ToUnicode or /Differences says.
     var names: [256]?[]const u8 = @splat(null);
     var is_winansi = false;
     var base: ?[]const u8 = null;
@@ -901,7 +931,9 @@ fn loadSimple(r: *Reader, f: *Font, dict: Dict, type3: bool) Error!void {
         }
         // MacExpertEncoding and unknown names: no base; /Differences may still say.
     } else if (try isEmbedded(r, dict)) {
-        if (try type1Encoding(r, dict)) |builtin| names = builtin;
+        if (try type1Encoding(r, dict)) |builtin| {
+            names = builtin;
+        } else if (try cffEncoding(r, dict)) |builtin| names = builtin;
     } else if (std_metrics == null and try isSymbolic(r, dict)) {
         // A symbolic font's built-in encoding is its own (9.6.6.2), not Standard: unknown too.
     } else if (std_metrics) |m| switch (m) {
@@ -1029,13 +1061,35 @@ const Interp = struct {
     operations: u32 = 0,
     glyph_count: u32 = 0,
     unplaced_actual_text: u32 = 0,
+    /// The structure elements of the stream being run, by MCID: its /StructParents entry in the
+    /// structure tree's /ParentTree (14.7.4.4). null when it has none.
+    mcids: ?[]const Object = null,
 
     const Marked = struct {
         /// The span's /ActualText, as UTF-8, when it has one.
         actual: ?[]const u8,
         /// The first run drawn inside it.
         first_run: usize,
+        /// The box, in user space, of the images drawn inside it: [x0, y0, x1, y1].
+        image_box: ?[4]f64 = null,
     };
+
+    /// An image is drawn, through the CTM's unit square (8.9.4): every open span's box grows to
+    /// hold it.
+    fn noteImage(self: *Interp) void {
+        const m = self.gs.ctm;
+        var box: [4]f64 = .{ std.math.inf(f64), std.math.inf(f64), -std.math.inf(f64), -std.math.inf(f64) };
+        for ([_][2]f64{ .{ 0, 0 }, .{ 1, 0 }, .{ 0, 1 }, .{ 1, 1 } }) |c| {
+            const x = c[0] * m[0] + c[1] * m[2] + m[4];
+            const y = c[0] * m[1] + c[1] * m[3] + m[5];
+            box = .{ @min(box[0], x), @min(box[1], y), @max(box[2], x), @max(box[3], y) };
+        }
+        if (!std.math.isFinite(box[0] + box[1] + box[2] + box[3])) return;
+        for (self.marked.items) |*mk| {
+            const b = mk.image_box orelse box;
+            mk.image_box = .{ @min(b[0], box[0]), @min(b[1], box[1]), @max(b[2], box[2]), @max(b[3], box[3]) };
+        }
+    }
 
     fn run(self: *Interp, content: []const u8, resources: Dict, depth: u32) Error!void {
         // Tokens and operands live until their operator returns: the arena is reset after each
@@ -1047,8 +1101,22 @@ const Interp = struct {
         var lx: read.Lexer = .{ .src = content, .pos = 0 };
         var p: read.Parser = .{ .lx = &lx, .arena = a, .max_depth = self.r.options.max_depth };
         var operands: std.ArrayList(Object) = .empty;
+        // A word that starts like a number but is not one (`0.00-30`), among the operands of the
+        // next operator. Writers make these in path coordinates; the operator is skipped, unless
+        // it is one this reader acts on, which then refuses the page rather than guess a value.
+        var bad_operand = false;
         while (true) {
-            const t = try lx.next(a);
+            lx.skipWhite();
+            const start = lx.pos;
+            const t = lx.next(a) catch |err| switch (err) {
+                // The lexer reads a word from a number's first character and fails only when
+                // the word is not a number; any other refusal (a string, a dictionary) stands.
+                error.Malformed => if (start < content.len and read.isNumberStart(content[start])) {
+                    bad_operand = true;
+                    continue;
+                } else return err,
+                else => return err,
+            };
             switch (t) {
                 .eof => break,
                 .keyword => |op| {
@@ -1061,7 +1129,11 @@ const Interp = struct {
                     if (self.operations > self.r.options.max_operations) return error.TooLarge;
                     if (eql(u8, op, "BI")) {
                         try skipInlineImage(&lx, a, self.r.options.max_depth);
+                        self.noteImage();
+                    } else if (bad_operand) {
+                        if (readsOperator(op)) return error.Malformed;
                     } else try self.operator(op, operands.items, resources, depth);
+                    bad_operand = false;
                     operands.clearRetainingCapacity();
                     _ = tokens.reset(.retain_capacity);
                 },
@@ -1080,7 +1152,17 @@ const Interp = struct {
         return v;
     }
 
+    /// The operators the interpreter acts on. operator() returns at once for any other, so an
+    /// operator added there and not here never runs, and its test fails.
+    fn readsOperator(op: []const u8) bool {
+        const ops = [_][]const u8{ "q", "Q", "cm", "BT", "Tf", "Tc", "Tw", "Tz", "TL", "Ts", "Td", "TD", "Tm", "T*", "Tj", "TJ", "'", "\"", "Do", "gs", "BMC", "BDC", "EMC" };
+        for (ops) |o| if (std.mem.eql(u8, op, o)) return true;
+        return false;
+    }
+
     fn operator(self: *Interp, op: []const u8, ops: []const Object, resources: Dict, depth: u32) Error!void {
+        // Every other operator (paths, painting, colour, line style) draws no text.
+        if (!readsOperator(op)) return;
         const eql = std.mem.eql;
         if (eql(u8, op, "q")) {
             if (self.stack.items.len >= 1024) return error.TooDeep;
@@ -1177,7 +1259,7 @@ const Interp = struct {
                 if (try self.r.getResolved(d, "ActualText")) |at| {
                     if (at != .string) return error.Malformed;
                     actual = try textString(self.scratch, at.string);
-                }
+                } else if (try self.elementActualText(d)) |at| actual = try textString(self.scratch, at);
             }
             try self.beginMarked(actual);
         } else if (eql(u8, op, "EMC")) {
@@ -1186,11 +1268,47 @@ const Interp = struct {
             if (self.marked.items.len <= self.marked_floor) return;
             const m = self.marked.pop().?;
             const actual = m.actual orelse return;
+            // A span that drew no glyph but an image: its text is placed on the image.
+            if (m.first_run >= self.runs.items.len) if (m.image_box) |b| {
+                try self.runs.append(self.scratch, .{
+                    .text = actual,
+                    .x = b[0],
+                    .y = b[1],
+                    .size = b[3] - b[1],
+                    .width = b[2] - b[0],
+                    .font = "",
+                    .unmapped = 0,
+                    .glyphs = &.{},
+                    .actual_text = true,
+                    .vertical = false,
+                });
+                try self.ends.append(self.scratch, .{ b[2], b[1] });
+            };
             // A nested span merges first; an enclosing one then merges that run with the rest,
             // so the outermost ActualText is the text.
             try self.mergeActual(m.first_run, actual);
         }
-        // Every other operator (paths, colour, images, marked content) draws no text.
+    }
+
+    /// The /ActualText of the structure element a marked-content sequence belongs to by its
+    /// /MCID (14.7.4.4, 14.9.4), when the sequence's own property list has none. The element is
+    /// the stream's /ParentTree array at the MCID, and counts only when its /K lists that MCID:
+    /// an array whose entries are out of place gives no text, rather than a guess at which entry
+    /// was meant.
+    fn elementActualText(self: *Interp, props: Dict) Error!?[]const u8 {
+        const mcids = self.mcids orelse return null;
+        const id = switch ((try self.r.getResolved(props, "MCID")) orelse return null) {
+            .integer => |n| n,
+            else => return null,
+        };
+        if (id < 0 or id >= mcids.len) return null;
+        const elem = switch (try self.r.resolve(mcids[@intCast(id)])) {
+            .dict => |d| d,
+            else => return null,
+        };
+        if (!try kHolds(self.r, (try self.r.getResolved(elem, "K")) orelse return null, id)) return null;
+        const at = (try self.r.getResolved(elem, "ActualText")) orelse return null;
+        return if (at == .string) at.string else null;
     }
 
     fn beginMarked(self: *Interp, actual: ?[]const u8) Error!void {
@@ -1241,6 +1359,7 @@ const Interp = struct {
             else => return error.Malformed,
         };
         const subtype = (try self.r.getResolved(s.dict, "Subtype")) orelse return error.Malformed;
+        if (subtype == .name and std.mem.eql(u8, subtype.name, "Image")) return self.noteImage();
         if (!(subtype == .name and std.mem.eql(u8, subtype.name, "Form"))) return;
         if (depth >= 16) return error.TooDeep;
         if (ref == .ref) {
@@ -1270,6 +1389,10 @@ const Interp = struct {
             for (0..6) |i| mat[i] = (try self.r.resolve(m[i])).number() orelse return error.Malformed;
             self.gs.ctm = mul(mat, self.gs.ctm);
         }
+        // A form's MCIDs are its own, by its /StructParents (14.7.4.4).
+        const saved_mcids = self.mcids;
+        defer self.mcids = saved_mcids;
+        self.mcids = try structParents(self.r, s.dict);
         const form_resources = if (try self.r.getResolved(s.dict, "Resources")) |res| switch (res) {
             .dict => |d| d,
             else => return error.Malformed,
@@ -1516,8 +1639,86 @@ pub fn pageRuns(r: *Reader, index: usize) Error!PageRuns {
     const work = r.work_state.allocator();
     const page = r.page(index);
     var interp: Interp = .{ .r = r, .out = work, .scratch = work, .gpa = r.arena_state.child_allocator };
+    interp.mcids = try structParents(r, page.dict);
     if (try r.pageContentsIn(work, page)) |content| try interp.run(content, page.resources, 0);
     return .{ .runs = interp.runs.items, .unplaced_actual_text = interp.unplaced_actual_text };
+}
+
+/// The structure elements, by MCID, of a page or form `dict`: the array its /StructParents names in
+/// the structure tree's /ParentTree (14.7.4.4). null when either is missing or not that shape: the
+/// page then has no structure-tree ActualText, and its text is its glyphs'.
+fn structParents(r: *Reader, dict: Dict) Error!?[]const Object {
+    const key = switch ((try r.getResolved(dict, "StructParents")) orelse return null) {
+        .integer => |n| n,
+        else => return null,
+    };
+    const root = switch ((try r.getResolved(r.trailerDict(), "Root")) orelse return null) {
+        .dict => |d| d,
+        else => return null,
+    };
+    const tree = switch ((try r.getResolved(root, "StructTreeRoot")) orelse return null) {
+        .dict => |d| d,
+        else => return null,
+    };
+    const parents = switch ((try r.getResolved(tree, "ParentTree")) orelse return null) {
+        .dict => |d| d,
+        else => return null,
+    };
+    return switch ((try numberTreeGet(r, parents, key, 0)) orelse return null) {
+        .array => |a| a,
+        else => null,
+    };
+}
+
+/// The value for `key` in a number tree (7.9.7), or null: /Nums pairs in a leaf, /Kids with
+/// /Limits above. A kid without /Limits is searched too.
+fn numberTreeGet(r: *Reader, node: Dict, key: i64, depth: u32) Error!?Object {
+    if (depth >= 32) return error.TooDeep;
+    if (try r.getResolved(node, "Nums")) |nums| {
+        if (nums != .array) return null;
+        var i: usize = 0;
+        while (i + 1 < nums.array.len) : (i += 2) {
+            const k = try r.resolve(nums.array[i]);
+            if (k == .integer and k.integer == key) return try r.resolve(nums.array[i + 1]);
+        }
+    }
+    const kids = (try r.getResolved(node, "Kids")) orelse return null;
+    if (kids != .array) return null;
+    for (kids.array) |kid_ref| {
+        const kid = switch (try r.resolve(kid_ref)) {
+            .dict => |d| d,
+            else => continue,
+        };
+        if (try r.getResolved(kid, "Limits")) |limits| {
+            if (limits == .array and limits.array.len == 2) {
+                const lo = try r.resolve(limits.array[0]);
+                const hi = try r.resolve(limits.array[1]);
+                if (lo == .integer and hi == .integer and (key < lo.integer or key > hi.integer)) continue;
+            }
+        }
+        if (try numberTreeGet(r, kid, key, depth + 1)) |v| return v;
+    }
+    return null;
+}
+
+/// Whether a structure element's /K lists marked-content id `id`: as an integer, a marked-content
+/// reference's /MCID, or either inside an array (14.7.2, Table 323).
+fn kHolds(r: *Reader, k: Object, id: i64) Error!bool {
+    switch (k) {
+        .integer => |n| return n == id,
+        .dict => |d| {
+            const m = (try r.getResolved(d, "MCID")) orelse return false;
+            return m == .integer and m.integer == id;
+        },
+        .array => |items| {
+            for (items) |item| {
+                const v = try r.resolve(item);
+                if (v != .array and try kHolds(r, v, id)) return true;
+            }
+            return false;
+        },
+        else => return false,
+    }
 }
 
 /// Reader.endPageRuns's work: the work arena reset down to max_retained_work (Options says why).
@@ -1684,6 +1885,99 @@ test "encoding CMaps, predefined and in the file: codes split by codespace, CIDs
     defer id.deinit();
     try testing.expectEqualStrings("\u{3042} ", id.runs[0].text);
     try testing.expect(id.runs[0].vertical);
+}
+
+test "ActualText from the structure tree by MCID, and on an image span with no glyph" {
+    const gpa = testing.allocator;
+    // MCIDs 0 to 3 on the page; MCID 0 in the form, which has its own /StructParents.
+    // 0: /K 0, ActualText "zero" over a glyph. 1: /K [1], ActualText "one" over an image.
+    // 2: /K << /MCID 2 >> (a reference), ActualText "two" over an inline image.
+    // 3: the element at index 3 lists /K 9, not 3: no ActualText, so the glyph's own text.
+    // A span with its own /ActualText and nothing drawn: unplaced, counted.
+    const page =
+        \\/Span <</MCID 0>> BDC BT /F1 10 Tf 10 700 Td (A) Tj ET EMC
+        \\/Span <</MCID 1>> BDC q 50 0 0 20 100 600 cm /Im1 Do Q EMC
+        \\/Span <</MCID 2>> BDC q 30 0 0 10 200 500 cm BI /W 1 /H 1 /BPC 8 /CS /G ID
+    ++ "\n\x00\nEI Q EMC\n" ++
+        \\/Span <</MCID 3>> BDC BT /F1 10 Tf 10 400 Td (B) Tj ET EMC
+        \\/Span <</ActualText (none)>> BDC EMC
+        \\/Fm1 Do
+    ;
+    const pdf = try read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R /StructTreeRoot 8 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /StructParents 7 /Resources << /Font << /F1 5 0 R >> /XObject << /Im1 6 0 R /Fm1 15 0 R >> >> >>",
+        streamObject("", page),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>",
+        streamObject("/Type /XObject /Subtype /Image /Width 1 /Height 1 /BitsPerComponent 8 /ColorSpace /DeviceGray", "\x00"),
+        "<< /Type /StructElem /S /Document >>",
+        // The parent tree: a root with two kids, the second holding keys 7 and 8.
+        "<< /Type /StructTreeRoot /ParentTree 9 0 R >>",
+        "<< /Kids [10 0 R 11 0 R] >>",
+        "<< /Limits [0 5] /Nums [0 [7 0 R]] >>",
+        "<< /Limits [7 8] /Nums [7 [12 0 R 13 0 R 14 0 R 16 0 R] 8 [17 0 R]] >>",
+        "<< /Type /StructElem /S /Span /P 7 0 R /K 0 /ActualText (zero) >>",
+        "<< /Type /StructElem /S /Span /P 7 0 R /K [1] /ActualText (one) >>",
+        "<< /Type /StructElem /S /Span /P 7 0 R /K << /Type /MCR /MCID 2 >> /ActualText (two) >>",
+        streamObject("/Type /XObject /Subtype /Form /BBox [0 0 612 792] /StructParents 8 /Resources << /Font << /F1 5 0 R >> >>", "/Span <</MCID 0>> BDC BT /F1 10 Tf 10 300 Td (C) Tj ET EMC"),
+        "<< /Type /StructElem /S /Span /P 7 0 R /K 9 /ActualText (wrong) >>",
+        "<< /Type /StructElem /S /Span /P 7 0 R /K 0 /ActualText (form) >>",
+    }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    var pt = try r.pageText(gpa, 0);
+    defer pt.deinit();
+    try testing.expectEqual(@as(usize, 5), pt.runs.len);
+    try testing.expectEqualStrings("zero", pt.runs[0].text);
+    try testing.expect(pt.runs[0].actual_text);
+    try testing.expectEqual(@as(usize, 1), pt.runs[0].glyphs.len);
+    // On the image: its bottom-left corner, its width, its height as the size, and no glyphs.
+    try testing.expectEqualStrings("one", pt.runs[1].text);
+    try testing.expectEqual(@as(usize, 0), pt.runs[1].glyphs.len);
+    try testing.expectEqual([4]f64{ 100, 600, 50, 20 }, [4]f64{ pt.runs[1].x, pt.runs[1].y, pt.runs[1].width.?, pt.runs[1].size });
+    try testing.expectEqualStrings("two", pt.runs[2].text);
+    try testing.expectEqual([4]f64{ 200, 500, 30, 10 }, [4]f64{ pt.runs[2].x, pt.runs[2].y, pt.runs[2].width.?, pt.runs[2].size });
+    try testing.expectEqualStrings("B", pt.runs[3].text);
+    try testing.expect(!pt.runs[3].actual_text);
+    try testing.expectEqualStrings("form", pt.runs[4].text);
+    try testing.expectEqual(@as(u32, 1), pt.unplaced_actual_text);
+}
+
+test "an embedded CFF program's own encoding is the base under /Differences, and a non-CFF one is not read" {
+    const gpa = testing.allocator;
+    const options = @import("build_options");
+    var buf: [512]u8 = undefined;
+    // custom-scattered.cff: code 3 is A, 65 is B, 200 is alpha.sc, 255 is x.alt.
+    const program = try std.Io.Dir.cwd().readFileAlloc(testing.io, try std.fmt.bufPrint(&buf, "{s}/cff/custom-scattered.cff", .{options.read_fixtures}), gpa, .limited(1 << 20));
+    defer gpa.free(program);
+    const stream = try std.fmt.allocPrint(gpa, "<< /Subtype /Type1C /Length {d} >>\nstream\n{s}\nendstream", .{ program.len, program });
+    defer gpa.free(stream);
+    const other = try std.fmt.allocPrint(gpa, "<< /Subtype /OpenType /Length {d} >>\nstream\n{s}\nendstream", .{ program.len, program });
+    defer gpa.free(other);
+    const pdf = try read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R /F2 7 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+        streamObject("", "BT /F1 10 Tf (\\003A\\310\\377) Tj /F2 10 Tf (\\003A) Tj ET"),
+        // /Differences changes 255 only; the rest is the program's: 3 A, 65 B, 200 alpha.sc.
+        "<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+ZpdfTest /FirstChar 0 /LastChar 255 /Encoding << /Differences [255 /Z] >> /FontDescriptor 6 0 R >>",
+        "<< /Type /FontDescriptor /FontName /ABCDEF+ZpdfTest /Flags 4 /FontFile3 8 0 R >>",
+        // The same program as /OpenType, which it is not: not read, so no base.
+        "<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+ZpdfTest /Encoding << /Differences [255 /Z] >> /FontDescriptor 9 0 R >>",
+        stream,
+        "<< /Type /FontDescriptor /FontName /ABCDEF+ZpdfTest /Flags 4 /FontFile3 10 0 R >>",
+        other,
+    }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    var pt = try r.pageText(gpa, 0);
+    defer pt.deinit();
+    // alpha.sc is the AGL's alpha with a suffix (U+03B1); x.alt is overridden by /Z.
+    try testing.expectEqualStrings("AB\u{03B1}Z", pt.runs[0].text);
+    try testing.expectEqual(@as(u32, 0), pt.runs[0].unmapped);
+    try testing.expectEqualStrings("\u{FFFD}\u{FFFD}", pt.runs[1].text);
 }
 
 test "Identity-V: glyphs move by /W2 and /DW2's w1 and Tc along y, TJ along y, with no Tz or Tw" {
@@ -2086,6 +2380,44 @@ test "the interpreter: budgets, finite results, forms keep their q/Q and BMC/EMC
     var few_glyphs = try Reader.open(gpa, pdf, .{ .max_page_glyphs = 2 });
     defer few_glyphs.deinit();
     try testing.expectError(error.TooLarge, few_glyphs.pageText(gpa, 0));
+}
+
+test "a word that starts like a number and is not one skips its operator, unless the reader acts on it" {
+    const gpa = testing.allocator;
+    const pdf = try read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R 9 0 R] /Count 4 /MediaBox [0 0 612 792] /Resources << /Font << /F1 10 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+        // A path's and a colour's operators skipped; an inline image after a bad word is still
+        // skipped to its EI, so its "(" is not read as a string.
+        streamObject("",
+            \\0.00-30 5 m 10 0.00-30 l 10 20 0.00-30 5 re S 1.-2 g 3-4 BI /W 1 /H 1 /CS /G /BPC 8 ID ( EI
+            \\BT /F1 10 Tf 7 8 Td (A) Tj ET
+        ),
+        "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>",
+        // Td still has two numbers without the bad word; it is refused all the same.
+        streamObject("", "BT /F1 10 Tf 1 0.00-30 5 Td (A) Tj ET"),
+        "<< /Type /Page /Parent 2 0 R /Contents 8 0 R >>",
+        // Inside an array the word is part of an object, which is refused.
+        streamObject("", "BT /F1 10 Tf [(A) 1-2 (B)] TJ ET"),
+        "<< /Type /Page /Parent 2 0 R /Contents 11 0 R >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        // A refusal that is not a word: a stray ")".
+        streamObject("", ") 0 0 m BT /F1 10 Tf (A) Tj ET"),
+    }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    var pt = try r.pageText(gpa, 0);
+    defer pt.deinit();
+    try testing.expectEqual(@as(usize, 1), pt.runs.len);
+    try testing.expectEqualStrings("A", pt.runs[0].text);
+    try testing.expectApproxEqAbs(@as(f64, 7), pt.runs[0].x, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 8), pt.runs[0].y, 1e-9);
+    // Td's operand has no value to guess.
+    try testing.expectError(error.Malformed, r.pageText(gpa, 1));
+    try testing.expectError(error.Malformed, r.pageText(gpa, 2));
+    try testing.expectError(error.Malformed, r.pageText(gpa, 3));
 }
 
 test "a PageText outlives its reader and the file's bytes" {

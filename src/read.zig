@@ -11,6 +11,8 @@
 //! entry for an object wins), and hybrid files (/XRefStm). Stream filters: FlateDecode and
 //! LZWDecode (with PNG and TIFF predictors), ASCIIHexDecode, ASCII85Decode. The page tree is walked from the
 //! catalog; /Count is not trusted, and /Resources, /MediaBox, /CropBox and /Rotate are inherited.
+//! A file whose %PDF- header is within its first 1024 bytes but not at byte 0 is read from the
+//! header (Reader.headerAt).
 //!
 //! Encrypted files (7.6): the standard security handler, RC4 and AES (src/crypt.zig says which
 //! revisions), opened with Options.password, which is empty unless given: the empty user password
@@ -172,12 +174,22 @@ pub const Reader = struct {
             return err;
         };
         work_state.* = .init(gpa);
-        var self: Reader = .{ .arena_state = arena_state, .work_state = work_state, .bytes = bytes, .options = options };
+        var self: Reader = .{ .arena_state = arena_state, .work_state = work_state, .bytes = bytes[headerAt(bytes)..], .options = options };
         errdefer self.deinit();
         try self.readXref();
         try self.openEncryption();
         try self.readPages();
         return self;
+    }
+
+    /// Where the file starts: at its %PDF- header when that is not at byte 0 but within the first
+    /// 1024 bytes, as Adobe's readers allow (PDF 1.7 Reference, Appendix H, note 13), else 0. A web
+    /// server that writes a tag or a byte order mark before a PDF leaves the PDF's own offsets
+    /// counted from its header, so they are read from there. When they are not, the xref does not
+    /// read, and the file is Malformed as before.
+    fn headerAt(bytes: []const u8) usize {
+        if (std.mem.startsWith(u8, bytes, "%PDF-")) return 0;
+        return std.mem.indexOf(u8, bytes[0..@min(bytes.len, 1024)], "%PDF-") orelse 0;
     }
 
     pub fn deinit(self: *Reader) void {
@@ -1284,7 +1296,7 @@ pub const Lexer = struct {
     }
 };
 
-fn isNumberStart(c: u8) bool {
+pub fn isNumberStart(c: u8) bool {
     return std.ascii.isDigit(c) or c == '+' or c == '-' or c == '.';
 }
 
@@ -1316,6 +1328,12 @@ pub const Parser = struct {
         return self.fromToken(try self.lx.next(self.arena), depth);
     }
 
+    fn notRef(self: *Parser, err: Error, save: usize, i: i64) Error!Object {
+        if (err != error.Malformed) return err;
+        self.lx.pos = save;
+        return .{ .integer = i };
+    }
+
     pub fn fromToken(self: *Parser, t: Token, depth: u32) Error!Object {
         switch (t) {
             .eof, .array_close, .dict_close => return error.Malformed,
@@ -1323,11 +1341,13 @@ pub const Parser = struct {
             .string => |s| return .{ .string = s },
             .name => |n| return .{ .name = n },
             .integer => |i| {
-                // "n g R" is a reference; anything else leaves the lexer where it was.
+                // "n g R" is a reference; anything else leaves the lexer where it was. A token
+                // that does not lex is not a reference either: its caller reads it again and
+                // decides, so a content stream can skip `1 0.00-30 m` (read_text's Interp.run).
                 const save = self.lx.pos;
-                const g = try self.lx.next(self.arena);
+                const g = self.lx.next(self.arena) catch |err| return self.notRef(err, save, i);
                 if (g == .integer) {
-                    const r = try self.lx.next(self.arena);
+                    const r = self.lx.next(self.arena) catch |err| return self.notRef(err, save, i);
                     if (r == .keyword and std.mem.eql(u8, r.keyword, "R")) {
                         if (i <= 0 or i > std.math.maxInt(u32) or g.integer < 0 or g.integer > 65535) return error.Malformed;
                         return .{ .ref = .{ .num = @intCast(i), .gen = @intCast(g.integer) } };
@@ -1536,6 +1556,30 @@ fn loadFixture(name: []const u8) ![]u8 {
     var buf: [512]u8 = undefined;
     const path = try std.fmt.bufPrint(&buf, "{s}/{s}", .{ options.read_fixtures, name });
     return std.Io.Dir.cwd().readFileAlloc(testing.io, path, testing.allocator, .limited(1 << 24));
+}
+
+test "bytes before the %PDF header: within 1024 bytes the file is read from its header" {
+    const gpa = testing.allocator;
+    const base = try loadFixture("base.pdf");
+    defer gpa.free(base);
+    // A tag a web server wrote before the file, and two UTF-8 byte order marks: both seen in files
+    // from the web, whose offsets count from %PDF.
+    for ([_][]const u8{ "<meta name=\"robots\" content=\"noindex\" />", "\xEF\xBB\xBF\xEF\xBB\xBF" }) |junk| {
+        const file = try std.mem.concat(gpa, u8, &.{ junk, base });
+        defer gpa.free(file);
+        var r = try Reader.open(gpa, file, .{});
+        defer r.deinit();
+        try testing.expectEqual(@as(usize, 3), r.pageCount());
+        var pt = try r.pageText(gpa, 2);
+        defer pt.deinit();
+        try testing.expect(pt.runs.len > 0);
+    }
+    // Past 1024 bytes the header is not looked for: the offsets then count from byte 0, and fail.
+    const far = try gpa.alloc(u8, 1025 + base.len);
+    defer gpa.free(far);
+    @memset(far[0..1025], ' ');
+    @memcpy(far[1025..], base);
+    try testing.expectError(error.Malformed, Reader.open(gpa, far, .{}));
 }
 
 test "zpdf's file and qpdf's object-stream and linearized rewrites read as the same 3 pages" {

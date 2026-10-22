@@ -21,6 +21,8 @@ What it writes:
   from fontTools, which is Mac OS Roman with the old 0xDB "currency": PDF's MacRomanEncoding
   lacks 15 of its glyphs (the math and Greek ones, and the Apple logo), which a PDF font using
   this encoding would not use.
+- cff_standard_strings: the 391 strings a CFF font program names glyphs by without storing
+  them (Adobe Technical Note 5176, Appendix A), from fontTools' cffLib.
 - For the 12 text fonts, the advance width (1/1000 em) of each glyph by code point, and the AFM's
   Ascender and Descender; for Symbol and ZapfDingbats, widths by code in their built-in encoding.
 """
@@ -30,6 +32,7 @@ import pathlib
 import re
 import sys
 
+from fontTools.cffLib import cffStandardStrings
 from fontTools.encodings.MacRoman import MacRoman
 
 TEXT_FONTS = [
@@ -119,6 +122,16 @@ def main():
     names_table("standard_encoding", "StandardEncoding: glyph name per code.", {c: n for c, _, n in helv if c >= 0})
     names_table("mac_roman_encoding", "MacRomanEncoding: glyph name per code.",
                 {c: n for c, n in enumerate(MacRoman) if n and n != ".notdef" and c >= 32})
+
+    # 391 strings, SID 0 to 390, ".notdef" first and "Semibold" last (TN 5176, Appendix A).
+    assert len(cffStandardStrings) == 391 and cffStandardStrings[0] == ".notdef" and cffStandardStrings[390] == "Semibold"
+    o.append("")
+    o.append("/// CFF's standard strings by SID (Adobe TN 5176, Appendix A): a SID below 391 names one of")
+    o.append("/// these; a larger one names a string in the font's own String INDEX.")
+    o.append("pub const cff_standard_strings = [391][]const u8{")
+    for name in cffStandardStrings:
+        o.append(f'    "{name}",')
+    o.append("};")
 
     o.append("")
     o.append("pub const CodePointWidth = struct { cp: u21, width: u16 };")
