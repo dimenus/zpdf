@@ -8,8 +8,8 @@
 //!
 //! What it reads (ISO 32000-1 7.5): the cross-reference data as a classic `xref` table or as a
 //! cross-reference stream, object streams, incremental updates (every /Prev section; the newest
-//! entry for an object wins), and hybrid files (/XRefStm). Stream filters: FlateDecode (with PNG
-//! and TIFF predictors), ASCIIHexDecode, ASCII85Decode. The page tree is walked from the
+//! entry for an object wins), and hybrid files (/XRefStm). Stream filters: FlateDecode and
+//! LZWDecode (with PNG and TIFF predictors), ASCIIHexDecode, ASCII85Decode. The page tree is walked from the
 //! catalog; /Count is not trusted, and /Resources, /MediaBox, /CropBox and /Rotate are inherited.
 //!
 //! Encrypted files (7.6): the standard security handler, RC4 and AES (src/crypt.zig says which
@@ -348,6 +348,16 @@ pub const Reader = struct {
             const inflated = try inflate(allocator, data, max);
             return try self.unpredict(allocator, params, inflated);
         }
+        if (std.mem.eql(u8, name, "LZWDecode") or std.mem.eql(u8, name, "LZW")) {
+            const early_change = switch (params) {
+                .dict => |d| try self.intParam(d, "EarlyChange", 1),
+                .null => 1,
+                else => return error.Malformed,
+            };
+            if (early_change != 0 and early_change != 1) return error.Malformed;
+            const decoded = try lzw(allocator, data, early_change == 1, max);
+            return try self.unpredict(allocator, params, decoded);
+        }
         if (std.mem.eql(u8, name, "ASCIIHexDecode") or std.mem.eql(u8, name, "AHx")) return asciiHex(allocator, data, max);
         if (std.mem.eql(u8, name, "ASCII85Decode") or std.mem.eql(u8, name, "A85")) return ascii85(allocator, data, max);
         if (std.mem.eql(u8, name, "Crypt")) return data;
@@ -387,7 +397,7 @@ pub const Reader = struct {
         return h.decrypt(a, method, stream.ref.num, stream.ref.gen, stream.raw);
     }
 
-    /// FlateDecode's /Predictor (7.4.4.4): 1 none, 2 TIFF, 10 to 15 PNG (each row says its own).
+    /// FlateDecode's and LZWDecode's /Predictor (7.4.4.4): 1 none, 2 TIFF, 10 to 15 PNG (each row says its own).
     fn unpredict(self: *Reader, allocator: Allocator, params: Object, data: []const u8) Error![]const u8 {
         const p = switch (params) {
             .dict => |d| d,
@@ -1371,6 +1381,78 @@ fn inflate(allocator: Allocator, data: []const u8, max: usize) Error![]u8 {
     };
 }
 
+/// LZWDecode (7.4.4.2): codes of 9 to 12 bits, most significant bit first. 256 clears the
+/// table and 257 ends the data; the end code is required. Each code after the first adds a table
+/// entry: the previous code's string and the first byte of this one's (of the previous one's when
+/// the code is the entry being added). The code width grows when the next entry needs a wider
+/// code, one entry early with /EarlyChange 1. A full table (4096 entries) must be cleared; one code
+/// before the clear is read without adding an entry, as MuPDF reads it.
+fn lzw(allocator: Allocator, data: []const u8, early_change: bool, max: usize) Error![]u8 {
+    const Table = struct { prev: [4096]u16, last: [4096]u8, first: [4096]u8, len: [4096]u16 };
+    const t = try allocator.create(Table);
+    defer allocator.destroy(t);
+    for (0..256) |i| {
+        t.prev[i] = 0;
+        t.last[i] = @intCast(i);
+        t.first[i] = @intCast(i);
+        t.len[i] = 1;
+    }
+    var out: std.ArrayList(u8) = .empty;
+    var bits: u5 = 9;
+    var next: u32 = 258;
+    var prev: ?u16 = null;
+    var full_code_read = false;
+    var acc: u32 = 0;
+    var held: u5 = 0;
+    var pos: usize = 0;
+    while (true) {
+        while (held < bits) {
+            if (pos == data.len) return error.Malformed;
+            acc = acc << 8 | data[pos];
+            pos += 1;
+            held += 8;
+        }
+        held -= bits;
+        const code: u16 = @intCast(acc >> held);
+        acc &= (@as(u32, 1) << held) - 1;
+        if (code == 257) break;
+        if (code == 256) {
+            bits = 9;
+            next = 258;
+            prev = null;
+            full_code_read = false;
+            continue;
+        }
+        if (prev) |p| {
+            if (next == 4096) {
+                if (full_code_read) return error.Malformed;
+                full_code_read = true;
+            } else {
+                if (code > next) return error.Malformed;
+                t.prev[next] = p;
+                t.first[next] = t.first[p];
+                t.len[next] = t.len[p] + 1;
+                // When the code is this entry, its first byte is the one just set.
+                t.last[next] = t.first[code];
+                next += 1;
+                if (bits < 12 and next + @intFromBool(early_change) >= @as(u32, 1) << bits) bits += 1;
+            }
+        } else if (code > 255) return error.Malformed;
+        const n = t.len[code];
+        if (out.items.len + n > max) return error.TooLarge;
+        const s = try out.addManyAsSlice(allocator, n);
+        var c = code;
+        var i: usize = n;
+        while (i > 0) {
+            i -= 1;
+            s[i] = t.last[c];
+            c = t.prev[c];
+        }
+        prev = code;
+    }
+    return out.items;
+}
+
 fn asciiHex(allocator: Allocator, data: []const u8, max: usize) Error![]u8 {
     var out: std.ArrayList(u8) = .empty;
     var half: ?u8 = null;
@@ -1910,6 +1992,111 @@ test "ASCIIHex, ASCII85 and the TIFF predictor decode known vectors" {
     } } };
     // Each byte after the first in a row adds the byte before it.
     try testing.expectEqualSlices(u8, &.{ 1, 3, 6, 10, 10, 11 }, try r.unpredict(a, params, &.{ 1, 2, 3, 10, 0, 1 }));
+}
+
+/// LZW codes since a clear, packed as an encoder would: 9 bits wide at first, wider when the
+/// decoder's next table entry needs it (7.4.4.2). For data no encoder in tests/read/lzw writes.
+fn packLzw(a: Allocator, codes: []const u16) ![]u8 {
+    var out: std.ArrayList(u8) = .empty;
+    var acc: u64 = 0;
+    var held: u6 = 0;
+    var bits: u6 = 9;
+    var since_clear: u32 = 0;
+    for (codes) |code| {
+        acc = acc << bits | code;
+        held += bits;
+        while (held >= 8) {
+            held -= 8;
+            try out.append(a, @truncate(acc >> held));
+        }
+        if (code == 256) {
+            bits = 9;
+            since_clear = 0;
+            continue;
+        }
+        since_clear += 1;
+        // After its first code, the decoder adds an entry per code; /EarlyChange 1.
+        const decoder_next = 257 + since_clear;
+        if (bits < 12 and decoder_next + 1 >= @as(u32, 1) << @intCast(bits)) bits += 1;
+    }
+    if (held > 0) try out.append(a, @truncate(acc << @intCast(8 - held)));
+    return out.items;
+}
+
+test "LZWDecode: libtiff's data and the standard's example, at both /EarlyChange values" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    var r: Reader = undefined;
+    r.options = .{};
+    r.arena_state = &arena_state;
+    r.cache = .empty;
+    r.xref = .empty;
+    r.loading = .empty;
+
+    // ISO 32000-1 7.4.4.2, Example: codes 256 45 258 258 65 259 66 257.
+    const example = "\x80\x0b\x60\x50\x22\x0c\x0c\x85\x01";
+    try testing.expectEqualStrings("-----A---B", try r.applyFilter(a, "LZWDecode", .null, example));
+    // With /Predictor 2 (TIFF), in rows of 5: each byte adds the one before it.
+    const tiff: Object = .{ .dict = .{ .entries = &.{
+        .{ .key = "Predictor", .value = .{ .integer = 2 } },
+        .{ .key = "Columns", .value = .{ .integer = 5 } },
+    } } };
+    try testing.expectEqualSlices(u8, &.{ 45, 90, 135, 180, 225, 65, 110, 155, 200, 10 }, try r.applyFilter(a, "LZW", tiff, example));
+
+    // base.pdf, encoded by libtiff (EarlyChange 1) and by tools/lzw-fixtures.py (EarlyChange 0);
+    // both fill the code table and clear it.
+    const plain = try loadFixture("base.pdf");
+    defer testing.allocator.free(plain);
+    const ec1 = try loadFixture("lzw/early-change-1.lzw");
+    defer testing.allocator.free(ec1);
+    const ec0 = try loadFixture("lzw/early-change-0.lzw");
+    defer testing.allocator.free(ec0);
+    const early: [2]Object = .{
+        .{ .dict = .{ .entries = &.{.{ .key = "EarlyChange", .value = .{ .integer = 0 } }} } },
+        .{ .dict = .{ .entries = &.{.{ .key = "EarlyChange", .value = .{ .integer = 1 } }} } },
+    };
+    try testing.expectEqualSlices(u8, plain, try r.applyFilter(a, "LZW", .null, ec1));
+    try testing.expectEqualSlices(u8, plain, try r.applyFilter(a, "LZWDecode", early[1], ec1));
+    try testing.expectEqualSlices(u8, plain, try r.applyFilter(a, "LZWDecode", early[0], ec0));
+    // Read with the other /EarlyChange, the widths go wrong and the data with them.
+    try testing.expectError(error.Malformed, r.applyFilter(a, "LZWDecode", early[0], ec1));
+    try testing.expectError(error.Malformed, r.applyFilter(a, "LZWDecode", early[1], ec0));
+    const two: Object = .{ .dict = .{ .entries = &.{.{ .key = "EarlyChange", .value = .{ .integer = 2 } }} } };
+    try testing.expectError(error.Malformed, r.applyFilter(a, "LZWDecode", two, example));
+    try testing.expectError(error.TooLarge, lzw(a, ec1, true, plain.len - 1));
+}
+
+test "LZWDecode refuses what no encoder writes, and reads one code at a full table as MuPDF does" {
+    var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena_state.deinit();
+    const a = arena_state.allocator();
+    const max = 1 << 20;
+    try testing.expectEqualStrings("AB", try lzw(a, try packLzw(a, &.{ 256, 65, 66, 257 }), true, max));
+    // No end code: the data stops after B.
+    try testing.expectError(error.Malformed, lzw(a, try packLzw(a, &.{ 256, 65, 66 }), true, max));
+    // 259 is not in the table yet: only 258 (A + the next code's first byte) is being added.
+    try testing.expectError(error.Malformed, lzw(a, try packLzw(a, &.{ 256, 65, 259, 257 }), true, max));
+    // The first code after a clear has no previous string to extend, so it is a byte.
+    try testing.expectError(error.Malformed, lzw(a, try packLzw(a, &.{ 256, 258, 257 }), true, max));
+
+    // 3839 codes fill the table to 4096 entries; then one more code is read and adds none, and a
+    // second is refused. A clear starts the table and the code width again (258 is "zz"), and the
+    // next full table may have its one code too.
+    var codes: std.ArrayList(u16) = .empty;
+    try codes.append(a, 256);
+    try codes.appendNTimes(a, 'x', 3839);
+    const full = codes.items.len;
+    try codes.appendSlice(a, &.{ 'y', 256, 'z', 'z', 258 });
+    try codes.appendNTimes(a, 'x', 3836);
+    try codes.appendSlice(a, &.{ 'y', 256, 257 });
+    const out = try lzw(a, try packLzw(a, codes.items), true, max);
+    try testing.expectEqual(@as(usize, 3839 + 5 + 3836 + 1), out.len);
+    try testing.expectEqualStrings("xyzzzzx", out[3838..][0..7]);
+    try testing.expectEqualStrings("xy", out[out.len - 2 ..]);
+    codes.items.len = full;
+    try codes.appendSlice(a, &.{ 'y', 'y', 256, 257 });
+    try testing.expectError(error.Malformed, lzw(a, try packLzw(a, codes.items), true, max));
 }
 
 /// Builds a PDF from numbered objects, then an xref the test writes with `xref`, which gets the
