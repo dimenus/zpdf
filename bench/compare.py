@@ -45,6 +45,7 @@ import argparse
 import html
 import json
 import os
+import random
 import re
 import statistics
 import subprocess
@@ -57,7 +58,10 @@ FONT_SIZE = 12.0
 
 # Words are joined until a line reaches LINE_CP codepoints. Each sample exercises the
 # script's shaping: ligatures and kerning, conjuncts and reordered vowel signs, joining
-# forms and lam-alef, and Hebrew with niqqud.
+# forms and lam-alef, and Hebrew with niqqud. The words are picked in a seeded random order,
+# so no two lines are the same text: zpdf keeps each font's shaped lines by their text
+# (src/pdf.zig, EmbeddedFont.shapes), so repeated lines would cost it almost nothing, and
+# no other tool here keeps one. make_lines refuses a repeated line.
 SCRIPTS = {
     "latin": ("Roboto-Regular.ttf", "office affine AVATAR Tolkien waffle The quick brown fox jumps over"),
     "devanagari": ("NotoSansDevanagari-Regular.ttf", "हिन्दी भाषा में किसी क्षेत्र की स्थिति कि क्ष त्र श्र"),
@@ -72,13 +76,15 @@ def make_lines(sample: str, n_lines: int, tiny: bool) -> list[str]:
     words = sample.split()
     if tiny:
         return [words[0]]
-    lines, wi = [], 0
+    rng = random.Random(n_lines)
+    lines = []
     for _ in range(n_lines):
         line = ""
         while len(line) < LINE_CP:
-            line = (line + " " + words[wi % len(words)]).strip()
-            wi += 1
+            line = (line + " " + rng.choice(words)).strip()
         lines.append(line)
+    if len(set(lines)) != len(lines):
+        sys.exit(f"bench: {len(lines) - len(set(lines))} repeated lines; a repeated line is shaped from zpdf's cache")
     return lines
 
 
@@ -215,7 +221,8 @@ def main() -> None:
     fonts = fonts_dir(repo)
 
     prefix = out / "prefix"
-    subprocess.run(["zig", "build", "-Doptimize=ReleaseFast", "--prefix", str(prefix)], cwd=repo, check=True)
+    # tools/zig: the zig this checkout builds with (zig on PATH can be another version).
+    subprocess.run([str(repo / "tools" / "zig"), "build", "-Doptimize=ReleaseFast", "--prefix", str(prefix)], cwd=repo, check=True)
     exe = str(prefix / "bin" / "zpdf-text")
 
     tools = ["zpdf", "hb-view", "pymupdf", "mutool"]
