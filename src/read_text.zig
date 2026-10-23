@@ -217,7 +217,15 @@ pub const CMap = struct {
     }
 
     /// The characters of `code`, from its latest definition; a range's are computed into `buf`.
+    /// A definition of U+0000 alone is null, as if the code had none: producers write <0000> for
+    /// a glyph with no character, and a NUL in the text would hide that the glyph is unmapped.
     pub fn lookup(self: *const CMap, code: u32, len: u8, buf: *[max_chars]u21) ?[]const u21 {
+        const u = self.latest(code, len, buf) orelse return null;
+        if (u.len == 1 and u[0] == 0) return null;
+        return u;
+    }
+
+    fn latest(self: *const CMap, code: u32, len: u8, buf: *[max_chars]u21) ?[]const u21 {
         const single = self.chars.get(key(code, len));
         // The latest range holding the code: ranges are kept in definition order.
         var i = self.ranges.len;
@@ -2222,7 +2230,7 @@ test "text state, matrices, encodings, CMaps, inline images and forms give the r
     const to_unicode =
         \\/CIDInit /ProcSet findresource begin 12 dict begin begincmap
         \\1 begincodespacerange <0000> <FFFF> endcodespacerange
-        \\2 beginbfchar <0001> <0041> <0003> <D83DDE00> endbfchar
+        \\3 beginbfchar <0001> <0041> <0002> <0000> <0003> <D83DDE00> endbfchar
         \\3 beginbfrange
         \\<000A> <0014> <0061>
         \\<0100> <FFFF> <4E00>
@@ -2265,9 +2273,10 @@ test "text state, matrices, encodings, CMaps, inline images and forms give the r
         .{ .text = "\u{c5} \u{c5}", .x = 100, .y = 704, .size = 10, .width = 60.24, .unmapped = 0 },
         // TL 15: T* to 685, then ' to 670 (rise 4). é 556: (5.56 + 2) * 2.
         .{ .text = "\u{e9}", .x = 100, .y = 674, .size = 10, .width = 15.12, .unmapped = 0 },
-        // Identity-H: 0001 bfchar A; 0002 none; 000A small range a; 0101 large range U+4E01;
-        // 0020 and 0021 an array range; 0005 none; 0003 a surrogate pair. /W: 500 600 for 1
-        // and 2, 250 for 10 to 20, /DW 1000 else: 6350 / 1000 * 12.
+        // Identity-H: 0001 bfchar A; 0002 bfchar U+0000, which is no character; 000A small
+        // range a; 0101 large range U+4E01; 0020 and 0021 an array range; 0005 none; 0003 a
+        // surrogate pair. /W: 500 600 for 1 and 2, 250 for 10 to 20, /DW 1000 else: 6350 /
+        // 1000 * 12.
         .{ .text = "A\u{fffd}a\u{4e01}XYY\u{fffd}\u{1f600}", .x = 50, .y = 400, .size = 12, .width = 76.2, .unmapped = 2 },
         // The inline image's data holds "EI" with white space on both sides, then "(Z) Tj": its
         // /W, /H and /BPC say where the data really ends, so no Z is drawn.
@@ -2426,6 +2435,15 @@ test "CMaps: codes up to 0xFFFFFFFF, the latest definition wins, and limits are 
     try testing.expectEqualSlices(u21, &.{'b'}, later_range.lookup(1, 2, &buf).?);
     const later_char = try parseCMap(a, testing.allocator, "1 beginbfrange <0000> <FFFF> <0061> endbfrange 1 beginbfchar <0001> <0041> endbfchar", 16);
     try testing.expectEqualSlices(u21, &.{'A'}, later_char.lookup(1, 2, &buf).?);
+    // U+0000 alone is no character: a later <0000> takes the code from a range, a range starting
+    // at <0000> loses only its first code, and U+0000 inside a longer destination stays.
+    const nul = try parseCMap(a, testing.allocator, "1 beginbfrange <0000> <00FF> <0061> <0105> <0107> <0000> endbfrange 3 beginbfchar <0001> <0000> <0002> <00410000> <0004> <00000041> endbfchar", 16);
+    try testing.expectEqual(@as(?[]const u21, null), nul.lookup(1, 2, &buf));
+    try testing.expectEqualSlices(u21, &.{ 'A', 0 }, nul.lookup(2, 2, &buf).?);
+    try testing.expectEqualSlices(u21, &.{ 0, 'A' }, nul.lookup(4, 2, &buf).?);
+    try testing.expectEqualSlices(u21, &.{'d'}, nul.lookup(3, 2, &buf).?);
+    try testing.expectEqual(@as(?[]const u21, null), nul.lookup(0x105, 2, &buf));
+    try testing.expectEqualSlices(u21, &.{1}, nul.lookup(0x106, 2, &buf).?);
     // A destination of 33 characters is refused, not dropped.
     const long = comptime l: {
         const codes: [33][4]u8 = @splat("0041".*);

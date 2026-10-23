@@ -444,7 +444,9 @@ def check(path, verbose):
                 notes.append(f"p{i} glyph at ({g['x']:.3f}, {g['y']:.3f}); pdfminer ({u[0]:.3f}, {u[1]:.3f}); {len(bad)} differ")
         # The text in order, white space included; ActualText glyphs left out on both sides.
         ours = "".join(r["text"] for r in runs if not r["actual_text"])
-        theirs = "".join(c for j, (c, _, _) in enumerate(chars) if j not in actual_glyphs)
+        # pdfminer gives a ToUnicode destination of U+0000 as it is; zpdf reads it as no
+        # character (U+FFFD, counted unmapped), as producers mean it.
+        theirs = "".join(c for j, (c, _, _) in enumerate(chars) if j not in actual_glyphs).replace("\x00", "\ufffd")
         if ours == theirs:
             res["order ok"] += 1
         else:
