@@ -6,21 +6,21 @@
 #   <out dir>/run.sh                      # on the Linux machine (or a Mac with Docker)
 #   ZPDF_DOCKER="sudo docker" ./run.sh    # where the user cannot use the Docker socket
 #
-# The bundle holds libzpdf as it ships (ReleaseSafe, a shared library that links no libc),
+# The bundle holds libzpdf as it ships (ReleaseSafe, a shared library that links no libc) except
+# that Zig's valgrind support is on (`zig build abi-valgrind`; build.zig nativeModule says why),
 # tests/abi/abi-test.c built against it twice, for glibc and for musl, the inputs abi-test reads,
 # and run.sh. run.sh runs both under memcheck, in Debian (glibc) and in Alpine (musl): the one .so
 # must load and pass in each. Containers, because valgrind needs debug symbols for a dynamic
 # program's ld.so, which a host like Arch strips. run.sh prints "valgrind clean (libzpdf under
 # abi-test, <arch>, glibc and musl)" and exits 0 only when both finished and valgrind reported
-# nothing. tools/test-valgrind.sh runs the aarch64 bundle.
+# nothing. tools/test-valgrind.sh runs the bundle where Docker works.
 #
 # The canary. With no libc there is no malloc for valgrind to replace, so it sees libzpdf's heap
 # only through the marks libzpdf makes itself (src/counting.zig, src/block_cache.zig, through
 # src/valgrind_marks.zig). Before abi-test, run.sh runs tools/valgrind-canary.zig, built with
-# libzpdf's module options, and fails unless valgrind reports its two planted reads that go through
-# those marks. Without the marks, a planted read in libzpdf went unreported and the run said clean.
-# The canary's heap and stack reads are not required here: they rely on Zig marking `undefined`
-# values, which libzpdf's build leaves off.
+# libzpdf's module options, and fails unless valgrind reports all five of its planted reads.
+# Without counting.zig's marks, a planted read in libzpdf went unreported and the run said clean;
+# without Zig's valgrind support, so did a read of output libzpdf never wrote.
 set -euo pipefail
 
 here="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
@@ -42,7 +42,7 @@ if [ "${#fonts[@]}" -ne 1 ] || [ ! -f "${fonts[0]}" ]; then
 fi
 
 rm -rf "$out"
-"$zig" build abi abi-canary -Dtarget="$arch-linux-gnu" -Dcpu=baseline --prefix "$out"
+"$zig" build abi-valgrind abi-canary -Dtarget="$arch-linux-gnu" -Dcpu=baseline --prefix "$out"
 mv "$out/canary/valgrind-canary" "$out/valgrind-canary"
 rmdir "$out/canary"
 for libc in gnu musl; do
@@ -87,14 +87,14 @@ run_in() {
   fi
 }
 run_in debian:bookworm-slim "apt-get update -qq >/dev/null && apt-get install -y -qq valgrind >/dev/null 2>&1" abi-test-gnu canary
-for fn in canaryReusedBlockRead canaryContextRead; do
+for fn in canaryHeapRead canaryStackRead canaryReusedBlockRead canaryContextRead canaryContextAllocRead; do
   if ! grep -A1 'depends on uninitialised' canary.log | grep -q "\$fn"; then
     cat canary.log >&2
     echo "FATAL: valgrind did not report the uninitialised read in \$fn, so the clean run above proves nothing." >&2
     exit 1
   fi
 done
-echo "canary: the block cache and context reads reported"
+echo "canary: all five reads reported"
 run_in alpine:3.21 "apk add --no-cache valgrind >/dev/null 2>&1" abi-test-musl
 echo "valgrind clean (libzpdf under abi-test, $arch, glibc and musl)"
 EOF

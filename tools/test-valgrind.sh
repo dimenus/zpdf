@@ -18,7 +18,8 @@
 #
 # The canary. Before the suite, tools/valgrind-canary.zig, built the same way, reads uninitialised
 # memory on purpose: on the heap, on the stack, in a large block libzpdf's block cache hands out
-# again, and in a block a libzpdf context allocates. The run fails unless valgrind reports all four.
+# again, and twice in blocks a libzpdf context allocates. The run fails unless valgrind reports all
+# five.
 # Without it a build in which valgrind cannot see uninitialised memory passes clean: Zig's
 # self-hosted x86_64 backend was one, and the heap read went unreported (2026-10-21).
 #
@@ -92,16 +93,21 @@ fi
 log="$(mktemp -t zpdf-valgrind.XXXXXX)"
 trap 'rm -f "$log"' EXIT
 
+# Runs a canary under valgrind and fails unless valgrind reports all five planted reads.
+check_canary() {
+  run_valgrind --suppressions=tools/valgrind.supp "./$1" > "$log" 2>&1 || true
+  for fn in canaryHeapRead canaryStackRead canaryReusedBlockRead canaryContextRead canaryContextAllocRead; do
+    if ! grep -A1 'depends on uninitialised' "$log" | grep -q "$fn"; then
+      cat "$log" >&2
+      echo "FATAL: valgrind did not report the uninitialised read in $fn of $1, so a clean run after it would prove nothing." >&2
+      exit 1
+    fi
+  done
+  echo "canary: all five reads reported"
+}
+
 echo "== canary: valgrind must report the planted heap, stack, reused-block and context reads"
-run_valgrind --suppressions=tools/valgrind.supp "./$canary" > "$log" 2>&1 || true
-for fn in canaryHeapRead canaryStackRead canaryReusedBlockRead canaryContextRead; do
-  if ! grep -A1 'depends on uninitialised' "$log" | grep -q "$fn"; then
-    cat "$log" >&2
-    echo "FATAL: valgrind did not report the uninitialised read in $fn, so a clean run below would prove nothing." >&2
-    exit 1
-  fi
-done
-echo "canary: all four reads reported"
+check_canary "$canary"
 
 echo "== valgrind (memcheck, error-exitcode=97)"
 vg_status=0
@@ -138,17 +144,47 @@ if [ "$vg_status" -ne 0 ]; then
   exit 1
 fi
 
-# libzpdf as it ships (ReleaseSafe, a shared library with no libc), called by tests/abi/abi-test.c
-# from several threads, on glibc and on musl, through the same bundle another machine runs
-# (tools/valgrind-abi-bundle.sh, which has its own canary). The test binary above cannot stand in
-# for it: it is a static Debug build, compiled differently, on one thread. A report that only this
-# run made is in the git log (2026-10-16, read_text's run start). The bundle runs in containers,
-# because valgrind needs debug symbols for the container's ld.so; on a Linux machine with no usable
-# Docker it is not run, and the last line says so.
+# libzpdf, called by tests/abi/abi-test.c from several threads. The test binary above cannot stand
+# in for it: it is a Debug build of other code (the tests), compiled differently, on one thread. A
+# report that only this run made is in the git log (2026-10-16, read_text's run start). Both forms
+# below build libzpdf as it ships (ReleaseSafe, no libc) with Zig's valgrind support on (build.zig
+# nativeModule says why), and each runs its canary first.
+#
+# On Linux: abi-test and libzpdf linked into one static musl executable (zig build abi-test-static),
+# run by this machine's valgrind. A static executable needs no ld.so, so this runs with no Docker.
+# Where Docker works (always on macOS): the shared library, loaded by glibc's and musl's ld.so, in
+# containers (tools/valgrind-abi-bundle.sh), because valgrind needs debug symbols for the ld.so of a
+# dynamic program.
+abi_runs=()
+if [ "$mode" = host ]; then
+  static="$out/abi-static"
+  echo "== libzpdf under abi-test, linked statically, on this machine's valgrind"
+  "$zig" build abi-test-static abi-canary -Dtarget="$arch-linux-musl" -Dcpu=baseline --prefix "$here/$static"
+  check_canary "$static/canary/valgrind-canary"
+  fonts=("$here"/zig-pkg/*/test/subset/data/fonts/Roboto-Regular.ttf)
+  if [ "${#fonts[@]}" -ne 1 ] || [ ! -f "${fonts[0]}" ]; then
+    echo "FATAL: expected one Roboto-Regular.ttf in the harfbuzz package, found: ${fonts[*]}" >&2
+    exit 1
+  fi
+  abi_status=0
+  run_valgrind --quiet --error-exitcode=97 --leak-check=full --errors-for-leak-kinds=definite \
+    --suppressions=tools/valgrind.supp "./$static/bin/abi-test-static" \
+    "${fonts[0]}" tests/read/objstm.pdf tests/images/exif/orient-6.jpg 2>&1 | tee "$log" || abi_status=$?
+  if ! grep -qx 'abi-test: ok' "$log"; then
+    echo "FATAL: abi-test-static did not finish (exit $abi_status); read above." >&2
+    exit 1
+  fi
+  reports="$(grep -cE '==[0-9]+== [A-Z]' "$log" || true)"
+  if [ "$reports" -gt 0 ] || [ "$abi_status" -ne 0 ]; then
+    echo "FATAL: valgrind reported $reports finding(s) in static libzpdf (exit $abi_status); the full report is above." >&2
+    exit 1
+  fi
+  abi_runs+=("static on musl")
+fi
 if [ "$mode" = docker ] || docker info >/dev/null 2>&1; then
   "$here/tools/valgrind-abi-bundle.sh" "$arch" "$here/$out/abi"
   "$here/$out/abi/run.sh"
-  echo "valgrind clean ($ran tests, and libzpdf under abi-test)"
-else
-  echo "valgrind clean ($ran tests; libzpdf under abi-test NOT run: no usable Docker on this machine)"
+  abi_runs+=("shared on glibc and musl")
 fi
+printf -v joined '%s, ' "${abi_runs[@]}"
+echo "valgrind clean ($ran tests, and libzpdf under abi-test: ${joined%, })"

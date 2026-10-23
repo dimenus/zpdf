@@ -12,8 +12,8 @@
   you mean to make is a hand edit of its lines, explained in the commit.
 - On any change that touches memory, also run `tools/test-valgrind.sh` (uninitialised reads in Zig and
   in kb's C; Docker on macOS, the machine's own valgrind on Linux). It must print `valgrind clean (N
-  tests, and libzpdf under abi-test)`; on Linux with no usable Docker the line says the abi-test part
-  did NOT run. A canary must be reported first, or it fails. Do not read its status through a pipe.
+  tests, and libzpdf under abi-test: ...)`, which names `static on musl` on Linux (no Docker needed) and
+  `shared on glibc and musl` where Docker works. Each canary must be reported first, or it fails. Do not read its status through a pipe.
 - libzpdf under valgrind on another Linux machine (x86_64, say): `tools/valgrind-abi-bundle.sh
   x86_64 <dir>`, copy `<dir>` there (`COPYFILE_DISABLE=1 tar`), and run `<dir>/run.sh`.
 - Linux x86_64 and Windows x64 without CI: `tools/test-platforms.sh linux <machine> <pane> windows

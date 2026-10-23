@@ -8,10 +8,12 @@
 # written. std says so there: "For `b == 0` this is fine since v is specified
 # to be undefined." zpdf's tests inflate every compressed stream and compare it
 # with the uncompressed one, which would fail if an undefined code were used.
+# The first frame is "*huffman.buildValues" in a Debug build and "buildValues" in libzpdf
+# (ReleaseSafe, where it is inlined into huffman.build).
 {
    std-flate-huffman-code-of-unused-symbol
    Memcheck:Cond
-   fun:*huffman.buildValues
+   fun:*buildValues
    fun:*huffman.build
 }
 
