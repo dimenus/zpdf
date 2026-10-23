@@ -7,8 +7,14 @@
 
 mutants.json is a list of [path, old, new, step]: `old` must occur exactly once in `path`; it is
 replaced by `new`, `zig build <step>` runs (step "test", "web-test", "image-test" or "dotnet-test"), and the file is restored,
-also when the run is interrupted. Write mutants that compile: a mutant that does not is reported
-as COMPILE ERROR and proves nothing.
+also when the run is stopped by Ctrl-C or SIGTERM. SIGKILL cannot be caught: after one, check the
+file with `git diff`, because the mutant is still in it. Write mutants that compile: a mutant that
+does not is reported as COMPILE ERROR and proves nothing.
+
+Nothing else may edit a mutated file during a run. If its content is not the mutant's when the
+mutant's build ends, the run stops: the file is restored to what it was before the mutant, and
+what was found in it is saved beside it as <path>.changed-during-mutation, so neither the other
+edit nor a mutant is lost silently.
 
 Each line of output is one mutant:
     <index> killed <the first failing test, or the check program that failed>
@@ -28,6 +34,7 @@ Exit status: 1 when any mutant survived or did not compile.
 
 import json
 import re
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +44,9 @@ ZIG = str(Path(__file__).resolve().parent / "zig")
 
 
 def main():
+    # A stop by SIGTERM (what a task runner sends) becomes SystemExit, which runs the `finally`
+    # that restores the file.
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
     mutants = json.load(open(sys.argv[1]))
     only = {int(a) for a in sys.argv[2:]}
     bad = 0
@@ -47,9 +57,11 @@ def main():
         if orig.count(old) != 1:
             sys.exit(f"mutant {i}: the text to replace occurs {orig.count(old)} times in {path}, not once")
         open(path, "w").write(orig.replace(old, new))
+        mutated = orig.replace(old, new)
         try:
             if path.endswith(".zig"):
                 subprocess.run([ZIG, "fmt", path], capture_output=True)
+                mutated = open(path).read()
             # errors="replace": a failing test can print any bytes (freed memory, poisoned as 0xaa).
             try:
                 p = subprocess.run([ZIG, "build", step], capture_output=True, text=True, errors="replace", timeout=900)
@@ -81,7 +93,12 @@ def main():
                 bad += 1
             print(i, verdict, why[:200], flush=True)
         finally:
+            found = open(path).read()
             open(path, "w").write(orig)
+            if found != mutated:
+                side = path + ".changed-during-mutation"
+                open(side, "w").write(found)
+                sys.exit(f"mutant {i}: {path} changed during its run; it is restored to what it was before the mutant, and what was in it is in {side}")
     sys.exit(1 if bad else 0)
 
 
