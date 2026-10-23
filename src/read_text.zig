@@ -383,22 +383,25 @@ fn utf16be(arena: Allocator, bytes: []const u8) Error![]const u21 {
     return out.items;
 }
 
-/// The characters a glyph name stands for: the Adobe Glyph List, then uniXXXX (one or more
-/// groups of four), uXXXX to uXXXXXX, then ligatures (a_b) and variants (a.sc) by their parts.
-/// Into `arena`: the result is a list's items, and parts of a failed name are left there.
-fn glyphNameChars(arena: Allocator, name: []const u8, depth: u32) Error!?[]const u21 {
+/// The characters a glyph name stands for: for a ZapfDingbats font, the ITC Zapf Dingbats Glyph
+/// List first (the AGL Specification's order, so its a1 to a191 are dingbats); then the Adobe
+/// Glyph List, then uniXXXX (one or more groups of four), uXXXX to uXXXXXX, then ligatures (a_b)
+/// and variants (a.sc) by their parts. Into `arena`: the result is a list's items, and parts of a
+/// failed name are left there.
+fn glyphNameChars(arena: Allocator, name: []const u8, zapf_dingbats: bool, depth: u32) Error!?[]const u21 {
     const a = arena;
     if (depth > 4) return null;
-    if (aglLookup(name)) |cp| return try a.dupe(u21, &.{cp});
+    if (zapf_dingbats) if (nameLookup(&tables.zapf_dingbats_names, name)) |cp| return try a.dupe(u21, &.{cp});
+    if (nameLookup(&tables.glyph_names, name)) |cp| return try a.dupe(u21, &.{cp});
     if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
         if (dot == 0) return null;
-        return glyphNameChars(a, name[0..dot], depth + 1);
+        return glyphNameChars(a, name[0..dot], zapf_dingbats, depth + 1);
     }
     if (std.mem.indexOfScalar(u8, name, '_') != null) {
         var out: std.ArrayList(u21) = .empty;
         var parts = std.mem.splitScalar(u8, name, '_');
         while (parts.next()) |part| {
-            const u = (try glyphNameChars(a, part, depth + 1)) orelse return null;
+            const u = (try glyphNameChars(a, part, zapf_dingbats, depth + 1)) orelse return null;
             try out.appendSlice(a, u);
         }
         return out.items;
@@ -427,15 +430,15 @@ fn isUpperHex(s: []const u8) bool {
     return s.len > 0;
 }
 
-fn aglLookup(name: []const u8) ?u21 {
+fn nameLookup(table: []const tables.GlyphName, name: []const u8) ?u21 {
     var lo: usize = 0;
-    var hi: usize = tables.glyph_names.len;
+    var hi: usize = table.len;
     while (lo < hi) {
         const mid = (lo + hi) / 2;
-        switch (std.mem.order(u8, tables.glyph_names[mid].name, name)) {
+        switch (std.mem.order(u8, table[mid].name, name)) {
             .lt => lo = mid + 1,
             .gt => hi = mid,
-            .eq => return tables.glyph_names[mid].cp,
+            .eq => return table[mid].cp,
         }
     }
     return null;
@@ -1029,8 +1032,9 @@ fn loadSimple(r: *Reader, f: *Font, dict: Dict, type3: bool) Error!void {
         },
         else => return error.Malformed,
     };
+    const zapf_dingbats = if (std_metrics) |m| m == .symbolic and std.mem.eql(u8, m.symbolic.name, "ZapfDingbats") else false;
     for (0..256) |c| {
-        if (names[c]) |n| f.encoding[c] = try glyphNameChars(a, n, 0);
+        if (names[c]) |n| f.encoding[c] = try glyphNameChars(a, n, zapf_dingbats, 0);
     }
 
     // Widths: /Widths from /FirstChar, scaled by /FontMatrix for Type3; else the standard
@@ -2565,6 +2569,33 @@ test "CMaps: codes up to 0xFFFFFFFF, the latest definition wins, and limits are 
     try testing.expectError(error.TooLarge, parseCMap(a, testing.allocator, many.written(), 16));
 }
 
+test "ZapfDingbats glyph names by the ITC Zapf Dingbats Glyph List, in that font only" {
+    const gpa = testing.allocator;
+    const pdf = try read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /Resources << /Font << /Z 5 0 R /S 6 0 R /H 7 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+        // Z: the built-in encoding's 4 (a20), space (not in the list: the AGL's) and l (a71).
+        // S: a subset, by /Differences: a12, a variant of a71, and a20 and a71 joined. H:
+        // Helvetica with the same names in /Differences; the AGL has none of them.
+        streamObject("", "BT /Z 10 Tf 0 700 Td (4 l) Tj ET BT /S 10 Tf 0 600 Td (ABC) Tj ET BT /H 10 Tf 0 500 Td (A) Tj ET"),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /ZapfDingbats >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+ZapfDingbats /Encoding << /Differences [65 /a12 /a71.alt /a20_a71] >> >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Differences [65 /a12] >> >>",
+    }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    var pt = try r.pageText(gpa, 0);
+    defer pt.deinit();
+    try testing.expectEqual(@as(usize, 3), pt.runs.len);
+    try testing.expectEqualStrings("\u{2714} \u{25cf}", pt.runs[0].text);
+    try testing.expectEqual(@as(u32, 0), pt.runs[0].unmapped);
+    try testing.expectEqualStrings("\u{261e}\u{25cf}\u{2714}\u{25cf}", pt.runs[1].text);
+    try testing.expectEqualStrings("\u{fffd}", pt.runs[2].text);
+    try testing.expectEqual(@as(u32, 1), pt.runs[2].unmapped);
+}
+
 test "fonts: /FirstChar out of range, Symbol widths by glyph name, no guessed encoding for a symbolic font" {
     const gpa = testing.allocator;
     const content =
@@ -2832,13 +2863,13 @@ test "glyph names: uniXXXX and uXXXX[XX] take uppercase hex and real characters 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expectEqualSlices(u21, &.{0xE9}, (try glyphNameChars(a, "uni00E9", 0)).?);
-    try testing.expectEqualSlices(u21, &.{ 0x66, 0x69 }, (try glyphNameChars(a, "uni00660069", 0)).?);
-    try testing.expectEqualSlices(u21, &.{0x1F600}, (try glyphNameChars(a, "u1F600", 0)).?);
+    try testing.expectEqualSlices(u21, &.{0xE9}, (try glyphNameChars(a, "uni00E9", false, 0)).?);
+    try testing.expectEqualSlices(u21, &.{ 0x66, 0x69 }, (try glyphNameChars(a, "uni00660069", false, 0)).?);
+    try testing.expectEqualSlices(u21, &.{0x1F600}, (try glyphNameChars(a, "u1F600", false, 0)).?);
     // Lowercase hex, a surrogate, and a value past U+10FFFF name no character.
-    try testing.expectEqual(@as(?[]const u21, null), try glyphNameChars(a, "uni00e9", 0));
-    try testing.expectEqual(@as(?[]const u21, null), try glyphNameChars(a, "uniD800", 0));
-    try testing.expectEqual(@as(?[]const u21, null), try glyphNameChars(a, "u110000", 0));
+    try testing.expectEqual(@as(?[]const u21, null), try glyphNameChars(a, "uni00e9", false, 0));
+    try testing.expectEqual(@as(?[]const u21, null), try glyphNameChars(a, "uniD800", false, 0));
+    try testing.expectEqual(@as(?[]const u21, null), try glyphNameChars(a, "u110000", false, 0));
 }
 
 test "text strings: UTF-16BE surrogate pairs decode, and a lone half is U+FFFD" {
