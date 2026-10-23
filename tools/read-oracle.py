@@ -43,6 +43,10 @@ excused; each one is in the code beside the place it applies:
   and the text MuPDF places on an image for an ActualText span with no glyph
   (fz_stext_end_metatext) is missing from the output, though txt has it. zpdf gives both, so
   mutool is asked without styles (collect-styles=no).
+- mutool leaves out a glyph whose character equals the previous one when it starts less than 0.1
+  times the size from where that one started (MuPDF's fake-bold rule that runs without
+  collect-styles). zpdf gives every glyph drawn; a page whose only differences are such glyphs is
+  counted, not failed (mupdf_fake_bold_drops).
 - mutool maps a CID with no /ToUnicode through MuPDF's copy of Adobe's CID-to-Unicode table for
   the font's collection, which can be an older version than zpdf's (src/cid): MuPDF 1.28.5 has
   Adobe-Japan1-UCS2 8.004, zpdf 10.002. A page whose only text differences are pairs that the two
@@ -58,6 +62,7 @@ says, not what its name or folder suggests.
 import collections
 import functools
 import json
+import math
 import pathlib
 import re
 import subprocess
@@ -213,6 +218,38 @@ def nonwhite(s):
     return "".join(s.split())
 
 
+# MuPDF's always-on fake-bold rule (source/fitz/stext-device.c, fz_add_stext_char_imp, 1.28.5):
+# a glyph whose character equals the previous one, starting less than FAKE_BOLD_MAX_DIST times the
+# size from where the previous one started, is not added; that previous glyph stays the one the
+# next is measured from. Unlike check_for_fake_bold, it runs without collect-styles.
+MUPDF_FAKE_BOLD_MAX_DIST = 0.1
+
+
+def mupdf_fake_bold_drops(runs):
+    """The characters mutool leaves out of zpdf's runs by MuPDF's always-on fake-bold rule, as a
+    multiset. zpdf's runs are in drawing order, as MuPDF's characters are. An ActualText run, or a
+    glyph of more than one character, starts over: what MuPDF does there is not modelled, so no
+    drop is assumed, which can only fail a page, never excuse one."""
+    drops = collections.Counter()
+    prev = None
+    for r in runs:
+        if r["actual_text"]:
+            prev = None
+            continue
+        ends = [g["text_at"] for g in r["glyphs"][1:]] + [len(r["text"])]
+        for g, end in zip(r["glyphs"], ends):
+            c = r["text"][g["text_at"]:end]
+            if len(c) != 1 or r["size"] <= 0:
+                prev = None
+                continue
+            if (prev is not None and prev[0] == c and prev[3] == r["vertical"]
+                    and math.hypot(g["x"] - prev[1], g["y"] - prev[2]) / r["size"] < MUPDF_FAKE_BOLD_MAX_DIST):
+                drops[c] += 1
+                continue
+            prev = (c, g["x"], g["y"], r["vertical"])
+    return drops
+
+
 def zero_width_gap(c, adv):
     """pdfminer gave a printable, non-combining character no width: a gap in its metric tables
     (Helvetica's Euro), not the font's (Adobe's AFM and mutool give 556)."""
@@ -362,6 +399,8 @@ def check(path, verbose):
                 # A Type0 font's code with no CID mapping draws CID 0's glyph (ISO 32000-1
                 # 9.7.6.3), which zpdf gives as U+FFFD; MuPDF drops the code (pdf_show_string).
                 res["text: only U+FFFD more than mutool (codes with no CID mapping)"] += 1
+            elif not missing and not extra - collections.Counter(nonwhite(as_mutool_reads("".join(mupdf_fake_bold_drops(runs).elements())))):
+                res["text: only glyphs MuPDF drops as drawn again where the previous one was"] += 1
             else:
                 res["text FAIL"] += 1
                 if verbose:
