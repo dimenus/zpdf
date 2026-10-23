@@ -40,6 +40,22 @@ excused; each one is in the code beside the place it applies:
 - mutool splits ligature characters unless asked not to (preserve-ligatures).
 - mutool draw leaves out text that the clip hides completely (FZ_STEXT_CLIP, set by mudraw.c
   unless clip=no). zpdf gives all the text a page draws, so mutool is asked for it too (clip=no).
+  mutool draw also records the page in a display list first, and playing the list back skips
+  every command that lies fully outside the clip (fz_run_display_list, list-device.c), whatever
+  the text options say; -D draws the page without the list. Without it, text drawn with render
+  mode 4 to 6 reaches the text device twice, filled and as clip text; as many clip copies of each
+  character are left out as pdfminer drew glyphs of it in those modes (counted).
+- mutool replaces an unsigned signature field's appearance with MuPDF's own arrow labelled SIGN
+  (pdf-appearance.c); those four letters are left out of its text (counted).
+- mutool's text includes what a soft mask's group draws (MuPDF runs it through the same device,
+  and its text device has no mask handler). A page whose only extra text in mutool is text drawn
+  inside soft masks (its trace device, run on that page only) is counted (mutool_mask_text).
+- MuPDF reads a code's character by rules of its own (mupdf_glyph_texts, mupdf_glyph_char): it
+  ignores a ToUnicode value that is a control character, cuts glyph names at '_' but for five f
+  ligatures, adds TeX's glyph names, and guesses from names AGL does not define (a20 as 20, G41
+  through code page 437, g as a TrueType glyph index, digits as decimal). A page whose
+  differences go when zpdf's glyphs are read by those rules is counted. Those glyphs' text is
+  then checked against pdfminer only ("order"), which follows the AGL.
 - mutool draw -F stext collects styles (FZ_STEXT_COLLECT_STYLES, set by mudraw.c for every text
   format but txt). With it, a glyph drawn twice at one place is given once (taken as fake bold),
   and the text MuPDF places on an image for an ActualText span with no glyph
@@ -63,6 +79,7 @@ says, not what its name or folder suggests.
 
 import collections
 import functools
+import html
 import json
 import math
 import pathlib
@@ -95,6 +112,9 @@ def xml_allows(cp):
 # gives for a code, so it never matches a U+FFFD that a reader reported for an unmapped code.
 XML_FORBIDDEN = 0x10FFFD
 
+# fz_stext_char's flag for text the device received as clip text (structured-text.h).
+STEXT_CLIPPED = 64
+
 
 def xml_safe(text):
     """mutool writes characters XML 1.0 forbids (control characters, surrogates) as numeric
@@ -115,24 +135,26 @@ def as_mutool_reads(text):
 
 
 def mutool_pages(path):
-    """(pages of (char, x, y) in device space, whether mutool reported damage), or (None, ...)
-    when mutool cannot read the file."""
+    """(pages of ([(char, x, y)] in device space, [the same for characters flagged CLIPPED]),
+    whether mutool reported damage), or (None, ...) when mutool cannot read the file."""
     # preserve-ligatures: mutool otherwise splits U+FB03 into "ffi", which is not what the file says.
     # clip=no: mutool otherwise leaves out text the clip hides; zpdf gives all the text drawn.
+    # -D: without it, the display list drops text fully outside the clip before clip=no applies.
     # collect-styles=no: mutool otherwise drops a glyph drawn twice, and an image's ActualText.
-    p = subprocess.run(["mutool", "draw", "-q", "-F", "stext", "-O", "preserve-ligatures,clip=no,collect-styles=no", "-o", "-", path], capture_output=True, timeout=120)
+    p = subprocess.run(["mutool", "draw", "-q", "-D", "-F", "stext", "-O", "preserve-ligatures,clip=no,collect-styles=no", "-o", "-", path], capture_output=True, timeout=120)
     damaged = b"repair" in p.stderr or b"broken" in p.stderr
     if p.returncode != 0:
         return None, damaged
     root = ET.fromstring(xml_safe(p.stdout.decode("utf-8", "replace")))
     pages = []
     for page in root.iter("page"):
-        chars = []
+        chars, clipped = [], []
         for ch in page.iter("char"):
             c = ch.get("c")
             if c is not None:
-                chars.append((c, float(ch.get("x")), float(ch.get("y"))))
-        pages.append(chars)
+                (clipped if int(ch.get("flags", "0")) & STEXT_CLIPPED else chars).append((c, float(ch.get("x")), float(ch.get("y"))))
+        # The characters the text device received as clip text, apart: see without_clip_copies.
+        pages.append((chars, clipped))
     return pages, damaged
 
 
@@ -140,11 +162,14 @@ def pdfminer_pages(path):
     """(pages of {"media_box", "rotate", "chars": [(text, origin matrix, advance)]}, error)."""
     # Not high_level.extract_pages: it replaces laparams=None with LAParams(), whose layout
     # analysis reorders characters. The aggregator with no laparams keeps content order.
-    from pdfminer.converter import PDFPageAggregator
+    from pdfminer.converter import PDFLayoutAnalyzer, PDFPageAggregator
+    from pdfminer.pdffont import PDFSimpleFont
     from pdfminer.layout import LTChar
     from pdfminer.pdfdevice import PDFTextDevice
     from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
     from pdfminer.pdfpage import PDFPage
+    from pdfminer.pdftypes import resolve1
+    from pdfminer.psparser import LIT, literal_name
 
     # pdfminer adds the character spacing (Tc) before every glyph but an operator's first, so the
     # Tc after an operator's last glyph is never added (pdfdevice.render_string_horizontal,
@@ -174,16 +199,95 @@ def pdfminer_pages(path):
         LTChar.__init__ = keep_rise
         LTChar._zpdf_rise = 0
 
-    def walk(item, out):
+    # Each character's font and code, for mupdf_glyph_texts: which /Differences name the code has
+    # and what the font's ToUnicode gives it.
+    if not hasattr(PDFLayoutAnalyzer, "_zpdf_code"):
+        render = PDFLayoutAnalyzer.render_char
+
+        def keep_code(self, matrix, font, fontsize, scaling, rise, cid, *rest):
+            adv = render(self, matrix, font, fontsize, scaling, rise, cid, *rest)
+            self.cur_item._objs[-1]._zpdf_code = (font, cid)
+            self.cur_item._objs[-1]._zpdf_mode = getattr(self, "_zpdf_mode", 0)
+            return adv
+
+        # The text render mode of each character, for without_clip_copies.
+        render_string = PDFTextDevice.render_string
+
+        def keep_mode(self, textstate, *rest):
+            self._zpdf_mode = textstate.render
+            return render_string(self, textstate, *rest)
+
+        PDFTextDevice.render_string = keep_mode
+
+        PDFLayoutAnalyzer.render_char = keep_code
+        PDFLayoutAnalyzer._zpdf_code = True
+        simple = PDFSimpleFont.__init__
+
+        def keep_spec(self, descriptor, widths, spec):
+            simple(self, descriptor, widths, spec)
+            self._zpdf_spec = spec
+
+        PDFSimpleFont.__init__ = keep_spec
+
+    def walk(item, out, codes, modes):
         if isinstance(item, LTChar):
             text = item.get_text()
             a, b, c, d, e, f = item.matrix
             r = item._zpdf_rise
             origin = (a, b, c, d, e + c * r, f + d * r)
             out.append((re.sub(r"\(cid:\d+\)", "�", text), origin, item.adv))
+            codes.append(code_info(*item._zpdf_code))
+            modes.append(item._zpdf_mode)
         elif hasattr(item, "__iter__"):
             for child in item:
-                walk(child, out)
+                walk(child, out, codes, modes)
+
+    differences = {}
+
+    def code_info(font, cid):
+        """(its /Differences name or None, its ToUnicode value or None) for one drawn code."""
+        if id(font) not in differences:
+            names, code = {}, None
+            enc = resolve1(getattr(font, "_zpdf_spec", {}).get("Encoding"))
+            for d in (resolve1(enc.get("Differences")) or []) if isinstance(enc, dict) else []:
+                d = resolve1(d)
+                if isinstance(d, int):
+                    code = d
+                elif code is not None:
+                    names[code] = literal_name(d)
+                    code += 1
+            differences[id(font)] = (font, names)
+        to_unicode = None
+        if getattr(font, "unicode_map", None) is not None:
+            try:
+                to_unicode = font.unicode_map.get_unichr(cid)
+            except KeyError:
+                pass
+        return differences[id(font)][1].get(cid), to_unicode
+
+    def inherited(d, key):
+        for _ in range(32):
+            if not isinstance(d, dict):
+                return None
+            if key in d:
+                return resolve1(d[key])
+            d = resolve1(d.get("Parent"))
+        return None
+
+    def unsigned_signature_rects(page):
+        """The /Rect of each unsigned signature field's widget, in default user space: MuPDF draws
+        its own "SIGN" arrow over these (without_signature_labels)."""
+        rects = []
+        for a in resolve1(page.annots) or []:
+            a = resolve1(a)
+            if not isinstance(a, dict) or literal_name(inherited(a, "FT")) != "Sig":
+                continue
+            v = inherited(a, "V")
+            signed = isinstance(v, dict) and literal_name(v.get("Type", LIT("Sig"))) == "Sig"
+            rect = [float(resolve1(n)) for n in resolve1(a.get("Rect")) or []]
+            if not signed and len(rect) == 4:
+                rects.append((min(rect[0], rect[2]), min(rect[1], rect[3]), max(rect[0], rect[2]), max(rect[1], rect[3])))
+        return rects
 
     pages = []
     try:
@@ -193,9 +297,9 @@ def pdfminer_pages(path):
         with open(path, "rb") as f:
             for page in PDFPage.get_pages(f):
                 interp.process_page(page)
-                out = []
-                walk(device.get_result(), out)
-                pages.append({"media_box": [float(v) for v in page.mediabox], "rotate": page.rotate % 360, "chars": out})
+                out, codes, modes = [], [], []
+                walk(device.get_result(), out, codes, modes)
+                pages.append({"media_box": [float(v) for v in page.mediabox], "rotate": page.rotate % 360, "chars": out, "codes": codes, "modes": modes, "unsigned_signatures": unsigned_signature_rects(page)})
     except Exception as e:  # pdfminer refuses some files; they are left out
         return None, str(e)[:120]
     return pages, None
@@ -256,6 +360,43 @@ def mupdf_fake_bold_drops(runs):
                 continue
             prev = (c, g["x"], g["y"], r["vertical"])
     return drops
+
+
+def without_clip_copies(clipped, pm_page):
+    """mutool's clip-text characters without the copies MuPDF makes of text drawn with render mode
+    4, 5 or 6: without the display list (-D) such text reaches the text device twice, filled and
+    again as clip text, a separate fz_text, which the device's repeat check (text == lasttext,
+    stext-device.c) does not catch. For each character, as many clip copies are left out as
+    pdfminer drew glyphs of it in those modes on the page; which ones does not matter to a check
+    of multisets. Text drawn only as clip (mode 7), or drawn again by the file, keeps its
+    characters; so does every clip character where pdfminer has no page."""
+    if not clipped or pm_page is None:
+        return list(clipped)
+    drawn = collections.Counter(c[0] for (c, _, _), mode in zip(pm_page["chars"], pm_page["modes"]) if mode in (4, 5, 6) and c)
+    kept = []
+    for c, x, y in clipped:
+        if drawn[c] > 0:
+            drawn[c] -= 1
+        else:
+            kept.append((c, x, y))
+    return kept
+
+
+def without_signature_labels(chars, rects, crop_box):
+    """mutool's characters on an unrotated page without the "SIGN" MuPDF draws on each unsigned
+    signature field: it replaces such a widget's appearance, blank or not, with its own arrow
+    labelled SIGN (pdf_update_appearance, pdf-appearance.c), text the file does not have. Only
+    the four letters, in that order and inside the field's rectangle, are left out."""
+    cx0, _, _, cy1 = crop_box
+    out = list(chars)
+    for x0, y0, x1, y1 in rects:
+        left, top, right, bottom = x0 - cx0, cy1 - y1, x1 - cx0, cy1 - y0
+        for k in range(len(out) - 3):
+            label = out[k:k + 4]
+            if "".join(c for c, _, _ in label) == "SIGN" and all(left <= x <= right and top <= y <= bottom for _, x, y in label):
+                del out[k:k + 4]
+                break
+    return out
 
 
 def zero_width_gap(c, adv):
@@ -322,6 +463,206 @@ def table_pairs():
     return [(collections.Counter(dict(z)), collections.Counter(dict(m))) for z, m in reduced if z or m]
 
 
+def cached_download(url, name):
+    """A file from `url`, kept in .cache/zpdf-oracle in the home folder under `name`. None, with a
+    note, when it cannot be had."""
+    path = pathlib.Path.home() / ".cache" / "zpdf-oracle" / name
+    if not path.exists():
+        try:
+            data = urllib.request.urlopen(url, timeout=60).read()
+        except OSError as e:
+            print(f"note: {url}: {e}")
+            return None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(data)
+    return path.read_text(encoding="utf-8")
+
+
+# Adobe's ITC Zapf Dingbats Glyph List, at a fixed commit of its repository.
+AGL_COMMIT = "4036a9ca80a62f64f9de4f7321a9a045ad0ecfd6"
+
+
+@functools.cache
+def mupdf_glyph_tables():
+    """What MuPDF's fz_unicode_from_glyph_name reads, for the installed mutool's version, from
+    its source tree: the glyph names it knows (glyphlist.h: the Adobe Glyph List, then TeX's
+    texglyphlist.txt), and its code page 437 and TrueType glyph index tables (encodings.h). Plus
+    Adobe's Zapf Dingbats list, name by character. None when any cannot be had: glyph-name
+    differences then fail."""
+    v = subprocess.run(["mutool", "-v"], capture_output=True, text=True)
+    version = re.search(r"version (\S+)", v.stdout + v.stderr)
+    if not version:
+        return None
+    base = f"https://raw.githubusercontent.com/ArtifexSoftware/mupdf/{version.group(1)}/source/fitz/"
+    glyphs = cached_download(base + "glyphlist.h", f"mupdf-{version.group(1)}/glyphlist.h")
+    encodings = cached_download(base + "encodings.h", f"mupdf-{version.group(1)}/encodings.h")
+    zapf = cached_download(f"https://raw.githubusercontent.com/adobe-type-tools/agl-aglfn/{AGL_COMMIT}/zapfdingbats.txt", f"agl-{AGL_COMMIT}/zapfdingbats.txt")
+    if glyphs is None or encodings is None or zapf is None:
+        return None
+
+    def array(text, start):
+        body = text[text.index(start):]
+        return body[body.index("{") + 1:body.index("};")]
+
+    names = re.findall(r'"([^"]*)"', array(glyphs, "single_name_list[]"))
+    codes = [int(c, 16) for c in re.findall(r"0x([0-9a-fA-F]+)", array(glyphs, "single_code_list[]"))]
+    assert len(names) == len(codes), (len(names), len(codes))
+    dos437 = [int(c) for c in re.findall(r"\d+", array(encodings, "fz_unicode_from_dos_437[256]"))]
+    tt_index = [int(c) for c in re.findall(r"\d+", array(encodings, "fz_unicode_from_true_type_glyph_index[]"))]
+    assert len(dos437) == 256 and len(tt_index) >= 258, (len(dos437), len(tt_index))
+    zapf_names = {}
+    for line in zapf.splitlines():
+        if line and not line.startswith("#"):
+            name, code = line.split(";")
+            zapf_names[chr(int(code, 16))] = name
+    return dict(zip(names, codes)), dos437, tt_index, zapf_names
+
+
+def mupdf_glyph_char(name):
+    """MuPDF's character for a glyph name (fz_unicode_from_glyph_name, encodings.c), which
+    differs from the AGL Specification: the name is cut at its first '.'; f_f, f_f_i, f_f_l, f_i
+    and f_l become the ligatures ff, ffi, ffl, fi, fl (U+FB00 to U+FB04), and any other name with
+    a '_' is cut there; then its glyph list, which adds TeX's names; then uniXXXX (seven
+    characters only), u and hex digits of any length, a and decimal digits, G and hex (code page
+    437), g and hex (a TrueType glyph index), or decimal digits alone; else U+FFFD."""
+    names, dos437, tt_index, _ = mupdf_glyph_tables()
+    buf = name[:63].split(".", 1)[0]
+    if "_" in buf:
+        buf = buf.replace("_", "") if buf in ("f_f", "f_f_i", "f_f_l", "f_i", "f_l") else buf.split("_", 1)[0]
+    if buf in names:
+        return chr(names[buf])
+
+    def num(digits, base):
+        # strtol over the whole rest, as read_num does: an empty rest is 0.
+        if not digits:
+            return 0
+        try:
+            return int(digits, base) if "_" not in digits else 0
+        except ValueError:
+            return 0
+
+    if buf.startswith("uni") and len(buf) == 7:
+        code = num(buf[3:], 16)
+    elif buf.startswith("u"):
+        code = num(buf[1:], 16)
+    elif buf.startswith("a") and len(buf) >= 3:
+        code = num(buf[1:], 10)
+    elif buf.startswith("G"):
+        code = num(buf[1:], 16)
+        code = dos437[code] if 0 < code < 256 else 0
+    elif buf.startswith("g"):
+        code = num(buf[1:], 16)
+        code = tt_index[code] if 0 < code < 258 else 0
+    else:
+        code = num(buf, 10)
+    return chr(code) if 0 < code <= 0x10FFFF else "\ufffd"
+
+
+def mupdf_glyph_texts(runs, codes):
+    """zpdf's runs' text as MuPDF would give it, where the two readers' rules for a code's
+    character differ, or None when MuPDF's tables cannot be had. codes: pdfminer's (/Differences
+    name, ToUnicode value) for each glyph of the page's content runs, in zpdf's glyph order, or
+    None when the two do not have the same glyphs (an annotation's glyphs have none: pdfminer
+    reads no annotation).
+
+    MuPDF's character for a code (pdf_show_char, pdf-op-run.c): the ToUnicode value; a single
+    value from U+0008 to U+000D is a space, and one below U+0020 or from U+007F to U+009F is
+    ignored for the glyph name's character, as is no value; U+0000 is U+FFFD. A glyph name is
+    read by mupdf_glyph_char. A ZapfDingbats glyph with no /Differences name has its name from
+    zpdf's character through Adobe's Zapf Dingbats list (the built-in encoding's names, which
+    zpdf reads by that list). ActualText runs are left as they are: their text is not their
+    glyphs'. pdfminer's ToUnicode stands in for MuPDF's in telling which codes have a value."""
+    tables = mupdf_glyph_tables()
+    if tables is None:
+        return None
+    zapf_names = tables[3]
+    out, j = [], 0
+    for r in runs:
+        texts = glyph_texts(r)
+        if r["actual_text"]:
+            out.append(r["text"])
+            if not r["annotation"]:
+                j += len(texts)
+            continue
+        # zpdf-read gives a /BaseFont that is not UTF-8 as its bytes, a list.
+        zapf = isinstance(r["font"], str) and r["font"].split("+", 1)[-1] == "ZapfDingbats"
+        text = []
+        for t in texts:
+            name, to_unicode = (None, None)
+            if not r["annotation"]:
+                if codes is not None:
+                    name, to_unicode = codes[j]
+                j += 1
+            if zapf and name is None and t in zapf_names:
+                name = zapf_names[t]
+            if to_unicode is not None and len(to_unicode) == 1 and 8 <= ord(to_unicode) <= 13:
+                t = " "
+            elif to_unicode is not None and not (len(to_unicode) == 1 and (ord(to_unicode) < 0x20 or 0x7F <= ord(to_unicode) < 0xA0)):
+                pass
+            elif name is not None:
+                t = mupdf_glyph_char(name)
+            elif to_unicode is not None:
+                t = "\ufffd"
+            text.append(t)
+        out.append("".join(text))
+    return out
+
+
+def mutool_mask_text(path, index):
+    """The characters mutool draws inside soft masks on page `index` (0-based), as a multiset of
+    non-white-space characters, from its trace device: a soft mask's group is run through the same
+    device as the page (begin_softmask, pdf-op-run.c), and MuPDF's text device has no mask
+    handler, so mask text is in mutool's page text. The trace writes a mask's content between
+    <clip_mask> and </clip_mask> (trace-device.c). None when mutool fails."""
+    p = subprocess.run(["mutool", "draw", "-q", "-D", "-F", "trace", "-o", "-", path, str(index + 1)], capture_output=True, timeout=300)
+    if p.returncode != 0:
+        return None
+    depth, chars = 0, []
+    for m in re.finditer(rb"<(/?)clip_mask\b|<g unicode=\"([^\"]*)\"", p.stdout):
+        if m.group(1) is not None and m.group(2) is None:
+            depth += -1 if m.group(1) == b"/" else 1
+        elif depth > 0:
+            chars.append(html.unescape(m.group(2).decode("utf-8", "replace")))
+    return collections.Counter(nonwhite(as_mutool_reads("".join(chars))))
+
+
+def text_explanations(path, index, runs, pm_page, mu_page, inside):
+    """The deviations of MuPDF's that together leave no difference between zpdf's text and
+    mutool's on a page, as their labels, or None; and the differences left after them (mutool's
+    extra, zpdf's extra inside the page). Applied in turn, each only when it changes something:
+    zpdf's glyphs read as MuPDF reads a code (mupdf_glyph_texts); mutool's soft-mask text taken
+    out (mutool_mask_text, traced only when mutool still has more); the glyphs MuPDF's fake-bold
+    rule drops (mupdf_fake_bold_drops)."""
+    labels = []
+    content = sum(len(r["glyphs"]) for r in runs if not r["annotation"])
+    codes = pm_page["codes"] if pm_page is not None and len(pm_page["codes"]) == content else None
+    texts = mupdf_glyph_texts(runs, codes)
+    if texts is not None and texts != [r["text"] for r in runs]:
+        labels.append("text: only where MuPDF reads a code's character its own way (glyph names, control characters)")
+    else:
+        texts = [r["text"] for r in runs]
+
+    def counted(chars):
+        return collections.Counter(nonwhite(as_mutool_reads("".join(chars))))
+
+    theirs = counted(c for c, _, _ in mu_page)
+    ours, ours_inside = counted(texts), counted(t for t, r in zip(texts, runs) if inside(r))
+    if theirs - ours:
+        masked = theirs - (mutool_mask_text(path, index) or collections.Counter())
+        if masked != theirs:
+            labels.append("text: only text mutool takes from soft masks")
+            theirs = masked
+    missing, extra = theirs - ours, ours_inside - theirs
+    if extra:
+        # Only zpdf's extra characters are taken: the rule can predict a drop that mutool did
+        # not make, and taking it from zpdf's text would then fail a character both have.
+        dropped = extra - counted(mupdf_fake_bold_drops(runs).elements())
+        if dropped != extra:
+            labels.append("text: only glyphs MuPDF drops as drawn again where the previous one was")
+            extra = dropped
+    return (labels if not missing and not extra else None), (missing, extra)
+
+
 def explained_by_tables(missing, extra):
     """Whether the text check's differences (missing: mutool has, zpdf not; extra: zpdf has,
     mutool not) are all pairs table_pairs gives: each pair is taken out of both while it fits."""
@@ -376,7 +717,17 @@ def check(path, verbose):
             continue
         runs = page["runs"]
         res["runs"] += len(runs)
-        mu_page = mu[i] if mu is not None and i < len(mu) else None
+        mu_page, clipped = mu[i] if mu is not None and i < len(mu) else (None, [])
+        if mu_page is not None:
+            kept = without_clip_copies(clipped, pm[i] if pm is not None and i < len(pm) else None)
+            if len(kept) != len(clipped):
+                res["mutool: clip-text copies left out"] += len(clipped) - len(kept)
+            mu_page = mu_page + kept
+        if mu_page is not None and pm is not None and i < len(pm) and pm[i]["unsigned_signatures"] and page["rotate"] == 0:
+            n = len(mu_page)
+            mu_page = without_signature_labels(mu_page, pm[i]["unsigned_signatures"], page["crop_box"])
+            if n != len(mu_page):
+                res["mutool: MuPDF's SIGN labels left out"] += (n - len(mu_page)) // 4
         geom = pm[i] if pm is not None and i < len(pm) else None
         if geom is not None:
             same_box = all(abs(a - b) < 1e-6 for a, b in zip(geom["media_box"], page["media_box"]))
@@ -423,14 +774,24 @@ def check(path, verbose):
                 # A Type0 font's code with no CID mapping draws CID 0's glyph (ISO 32000-1
                 # 9.7.6.3), which zpdf gives as U+FFFD; MuPDF drops the code (pdf_show_string).
                 res["text: only U+FFFD more than mutool (codes with no CID mapping)"] += 1
-            elif not missing and not extra - collections.Counter(nonwhite(as_mutool_reads("".join(mupdf_fake_bold_drops(runs).elements())))):
-                res["text: only glyphs MuPDF drops as drawn again where the previous one was"] += 1
             else:
-                res["text FAIL"] += 1
-                if verbose:
-                    notes.append(f"p{i} text: mutool has, zpdf not {dict(list(missing.items())[:8])}; zpdf has inside the page, mutool not {dict(list(extra.items())[:8])}")
+                labels, left = text_explanations(path, i, runs, pm[i] if pm is not None and i < len(pm) else None, mu_page, inside)
+                if labels is not None:
+                    for label in labels:
+                        res[label] += 1
+                else:
+                    res["text FAIL"] += 1
+                    if verbose:
+                        notes.append(f"p{i} text: mutool has, zpdf not {dict(list(missing.items())[:8])}; zpdf has inside the page, mutool not {dict(list(extra.items())[:8])}")
+                        notes.append(f"p{i} text, after every explanation: mutool has, zpdf not {dict(list(left[0].items())[:8])}; zpdf has, mutool not {dict(list(left[1].items())[:8])}")
 
-        for r in runs:
+        # mutool's vote takes MuPDF's character for the run's first glyph too (mupdf_glyph_texts):
+        # the vote is on where the run starts, and MuPDF can read that glyph's code as another
+        # character.
+        content = sum(len(r["glyphs"]) for r in runs if not r["annotation"])
+        pm_codes = pm[i]["codes"] if pm is not None and i < len(pm) and len(pm[i]["codes"]) == content else None
+        mupdf_texts = mupdf_glyph_texts(runs, pm_codes) if mu_page is not None else None
+        for k, r in enumerate(runs):
             t = r["text"]
             if not t or t[0] == "�" or t[0].isspace():
                 continue
@@ -440,7 +801,8 @@ def check(path, verbose):
             votes = {}
             if mu_page is not None and page["rotate"] == 0 and inside(r):
                 x, y = r["x"] - cx0, cy1 - r["y"]
-                votes["mutool"] = any(c == t[0] and abs(cx - x) < TOL and abs(cy - y) < TOL for c, cx, cy in mu_page)
+                first = {t[0], as_mutool_reads(mupdf_texts[k][:1])} if mupdf_texts and mupdf_texts[k] else {t[0]}
+                votes["mutool"] = any(c in first and abs(cx - x) < TOL and abs(cy - y) < TOL for c, cx, cy in mu_page)
             if geom is not None and not r["annotation"]:
                 votes["pdfminer"] = any(c[:1] == t[0] and abs(u[0] - r["x"]) < TOL and abs(u[1] - r["y"]) < TOL for c, m, _ in geom["chars"] for u in [pdfminer_to_user(geom, (m[4], m[5]))])
             if not votes:
