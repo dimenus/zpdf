@@ -1132,20 +1132,23 @@ const Interp = struct {
             };
             switch (t) {
                 .eof => break,
-                .keyword => |op| {
-                    const eql = std.mem.eql;
-                    if (eql(u8, op, "true") or eql(u8, op, "false") or eql(u8, op, "null")) {
+                .keyword => |word| {
+                    const op = op_words.get(word);
+                    if (op) |o| if (o == .true or o == .false or o == .null) {
                         try operands.append(self.scratch, try p.fromToken(t, 0));
                         continue;
-                    }
+                    };
                     self.operations += 1;
                     if (self.operations > self.r.options.max_operations) return error.TooLarge;
-                    if (eql(u8, op, "BI")) {
-                        try skipInlineImage(&lx, a, self.r.options.max_depth);
-                        self.noteImage();
-                    } else if (bad_operand) {
-                        if (readsOperator(op)) return error.Malformed;
-                    } else try self.operator(op, operands.items, resources, depth);
+                    // Every other operator (paths, painting, colour, line style) draws no text.
+                    if (op) |o| {
+                        if (o == .BI) {
+                            try skipInlineImage(&lx, a, self.r.options.max_depth);
+                            self.noteImage();
+                        } else if (bad_operand) {
+                            return error.Malformed;
+                        } else try self.operator(o, operands.items, resources, depth);
+                    }
                     bad_operand = false;
                     operands.clearRetainingCapacity();
                     _ = tokens.reset(.retain_capacity);
@@ -1165,142 +1168,164 @@ const Interp = struct {
         return v;
     }
 
-    /// The operators the interpreter acts on. operator() returns at once for any other, so an
-    /// operator added there and not here never runs, and its test fails.
-    fn readsOperator(op: []const u8) bool {
-        const ops = [_][]const u8{ "q", "Q", "cm", "BT", "Tf", "Tc", "Tw", "Tz", "TL", "Ts", "Td", "TD", "Tm", "T*", "Tj", "TJ", "'", "\"", "Do", "gs", "BMC", "BDC", "EMC" };
-        for (ops) |o| if (std.mem.eql(u8, op, o)) return true;
-        return false;
-    }
+    /// The content-stream words the interpreter acts on, each spelled as its field name: the
+    /// operators operator() runs, BI, and the keywords that are operands, found with one lookup
+    /// per word (op_words, built at compile time from the names) instead of a string compare per
+    /// name.
+    const Op = enum { q, Q, cm, BT, Tf, Tc, Tw, Tz, TL, Ts, Td, TD, Tm, @"T*", Tj, TJ, @"'", @"\"", Do, gs, BMC, BDC, EMC, BI, true, false, null };
+    const op_words = std.StaticStringMap(Op).initEnum();
 
-    fn operator(self: *Interp, op: []const u8, ops: []const Object, resources: Dict, depth: u32) Error!void {
-        // Every other operator (paths, painting, colour, line style) draws no text.
-        if (!readsOperator(op)) return;
-        const eql = std.mem.eql;
-        if (eql(u8, op, "q")) {
-            if (self.stack.items.len >= 1024) return error.TooDeep;
-            try self.stack.append(self.scratch, self.gs);
-        } else if (eql(u8, op, "Q")) {
-            // An unbalanced Q is common and harmless: the state stays. A form's Q cannot pop
-            // what the page saved.
-            if (self.stack.items.len > self.stack_floor) self.gs = self.stack.pop().?;
-        } else if (eql(u8, op, "cm")) {
-            if (ops.len != 6) return error.Malformed;
-            var m: Matrix = undefined;
-            for (0..6) |i| m[i] = try num(ops, i);
-            self.gs.ctm = mul(m, self.gs.ctm);
-        } else if (eql(u8, op, "BT")) {
-            self.tm = identity;
-            self.tlm = identity;
-        } else if (eql(u8, op, "Tf")) {
-            if (ops.len != 2 or ops[0] != .name) return error.Malformed;
-            const fonts = switch ((try self.r.getResolved(resources, "Font")) orelse return error.Malformed) {
-                .dict => |d| d,
-                else => return error.Malformed,
-            };
-            self.gs.font = try loadFont(self.r, fonts.get(ops[0].name) orelse return error.Malformed);
-            self.gs.size = try num(ops, 1);
-        } else if (eql(u8, op, "Tc")) {
-            self.gs.char_spacing = try num(ops, 0);
-        } else if (eql(u8, op, "Tw")) {
-            self.gs.word_spacing = try num(ops, 0);
-        } else if (eql(u8, op, "Tz")) {
-            self.gs.h_scale = try num(ops, 0) / 100;
-        } else if (eql(u8, op, "TL")) {
-            self.gs.leading = try num(ops, 0);
-        } else if (eql(u8, op, "Ts")) {
-            self.gs.rise = try num(ops, 0);
-        } else if (eql(u8, op, "Td")) {
-            self.moveLine(try num(ops, 0), try num(ops, 1));
-        } else if (eql(u8, op, "TD")) {
-            self.gs.leading = -(try num(ops, 1));
-            self.moveLine(try num(ops, 0), try num(ops, 1));
-        } else if (eql(u8, op, "Tm")) {
-            if (ops.len != 6) return error.Malformed;
-            for (0..6) |i| self.tm[i] = try num(ops, i);
-            self.tlm = self.tm;
-        } else if (eql(u8, op, "T*")) {
-            self.moveLine(0, -self.gs.leading);
-        } else if (eql(u8, op, "Tj")) {
-            if (ops.len != 1 or ops[0] != .string) return error.Malformed;
-            try self.show(&.{ops[0]});
-        } else if (eql(u8, op, "TJ")) {
-            if (ops.len != 1 or ops[0] != .array) return error.Malformed;
-            try self.show(ops[0].array);
-        } else if (eql(u8, op, "'")) {
-            if (ops.len != 1 or ops[0] != .string) return error.Malformed;
-            self.moveLine(0, -self.gs.leading);
-            try self.show(&.{ops[0]});
-        } else if (eql(u8, op, "\"")) {
-            if (ops.len != 3 or ops[2] != .string) return error.Malformed;
-            self.gs.word_spacing = try num(ops, 0);
-            self.gs.char_spacing = try num(ops, 1);
-            self.moveLine(0, -self.gs.leading);
-            try self.show(&.{ops[2]});
-        } else if (eql(u8, op, "Do")) {
-            if (ops.len != 1 or ops[0] != .name) return error.Malformed;
-            try self.drawXObject(ops[0].name, resources, depth);
-        } else if (eql(u8, op, "gs")) {
-            // An ExtGState can set the font and size, as Tf does (8.4.5, /Font).
-            if (ops.len != 1 or ops[0] != .name) return error.Malformed;
-            const states = (try self.r.getResolved(resources, "ExtGState")) orelse return error.Malformed;
-            if (states != .dict) return error.Malformed;
-            const state = (try self.r.getResolved(states.dict, ops[0].name)) orelse return error.Malformed;
-            if (state != .dict) return error.Malformed;
-            if (try self.r.getResolved(state.dict, "Font")) |f| {
-                if (f != .array or f.array.len != 2) return error.Malformed;
-                self.gs.font = try loadFont(self.r, f.array[0]);
-                self.gs.size = (try self.r.resolve(f.array[1])).number() orelse return error.Malformed;
-            }
-        } else if (eql(u8, op, "BMC")) {
-            try self.beginMarked(null);
-        } else if (eql(u8, op, "BDC")) {
-            if (ops.len != 2) return error.Malformed;
-            const props: ?Dict = switch (ops[1]) {
-                .dict => |d| d,
-                // A name is a key in the resources' /Properties (14.6.2).
-                .name => |n| blk: {
-                    const all = (try self.r.getResolved(resources, "Properties")) orelse break :blk null;
-                    if (all != .dict) return error.Malformed;
-                    const v = (try self.r.getResolved(all.dict, n)) orelse break :blk null;
-                    break :blk if (v == .dict) v.dict else null;
-                },
-                else => return error.Malformed,
-            };
-            var actual: ?[]const u8 = null;
-            if (props) |d| {
-                if (try self.r.getResolved(d, "ActualText")) |at| {
-                    if (at != .string) return error.Malformed;
-                    actual = try textString(self.scratch, at.string);
-                } else if (try self.elementActualText(d)) |at| actual = try textString(self.scratch, at);
-            }
-            try self.beginMarked(actual);
-        } else if (eql(u8, op, "EMC")) {
-            // An unbalanced EMC is ignored, as an unbalanced Q is, and a form's cannot close
-            // what the page opened.
-            if (self.marked.items.len <= self.marked_floor) return;
-            const m = self.marked.pop().?;
-            const actual = m.actual orelse return;
-            // A span that drew no glyph but an image: its text is placed on the image.
-            if (m.first_run >= self.runs.items.len) if (m.image_box) |b| {
-                try self.runs.append(self.scratch, .{
-                    .text = actual,
-                    .x = b[0],
-                    .y = b[1],
-                    .size = b[3] - b[1],
-                    .width = b[2] - b[0],
-                    .font = "",
-                    .unmapped = 0,
-                    .glyphs = &.{},
-                    .actual_text = true,
-                    .vertical = false,
-                    .annotation = self.annotation,
-                });
-                try self.ends.append(self.scratch, .{ b[2], b[1] });
-            };
-            // A nested span merges first; an enclosing one then merges that run with the rest,
-            // so the outermost ActualText is the text.
-            try self.mergeActual(m.first_run, actual);
+    fn operator(self: *Interp, op: Op, ops: []const Object, resources: Dict, depth: u32) Error!void {
+        switch (op) {
+            // run() handles these itself.
+            .BI, .true, .false, .null => unreachable,
+            .q => {
+                if (self.stack.items.len >= 1024) return error.TooDeep;
+                try self.stack.append(self.scratch, self.gs);
+            },
+            .Q => {
+                // An unbalanced Q is common and harmless: the state stays. A form's Q cannot pop
+                // what the page saved.
+                if (self.stack.items.len > self.stack_floor) self.gs = self.stack.pop().?;
+            },
+            .cm => {
+                if (ops.len != 6) return error.Malformed;
+                var m: Matrix = undefined;
+                for (0..6) |i| m[i] = try num(ops, i);
+                self.gs.ctm = mul(m, self.gs.ctm);
+            },
+            .BT => {
+                self.tm = identity;
+                self.tlm = identity;
+            },
+            .Tf => {
+                if (ops.len != 2 or ops[0] != .name) return error.Malformed;
+                const fonts = switch ((try self.r.getResolved(resources, "Font")) orelse return error.Malformed) {
+                    .dict => |d| d,
+                    else => return error.Malformed,
+                };
+                self.gs.font = try loadFont(self.r, fonts.get(ops[0].name) orelse return error.Malformed);
+                self.gs.size = try num(ops, 1);
+            },
+            .Tc => {
+                self.gs.char_spacing = try num(ops, 0);
+            },
+            .Tw => {
+                self.gs.word_spacing = try num(ops, 0);
+            },
+            .Tz => {
+                self.gs.h_scale = try num(ops, 0) / 100;
+            },
+            .TL => {
+                self.gs.leading = try num(ops, 0);
+            },
+            .Ts => {
+                self.gs.rise = try num(ops, 0);
+            },
+            .Td => {
+                self.moveLine(try num(ops, 0), try num(ops, 1));
+            },
+            .TD => {
+                self.gs.leading = -(try num(ops, 1));
+                self.moveLine(try num(ops, 0), try num(ops, 1));
+            },
+            .Tm => {
+                if (ops.len != 6) return error.Malformed;
+                for (0..6) |i| self.tm[i] = try num(ops, i);
+                self.tlm = self.tm;
+            },
+            .@"T*" => {
+                self.moveLine(0, -self.gs.leading);
+            },
+            .Tj => {
+                if (ops.len != 1 or ops[0] != .string) return error.Malformed;
+                try self.show(&.{ops[0]});
+            },
+            .TJ => {
+                if (ops.len != 1 or ops[0] != .array) return error.Malformed;
+                try self.show(ops[0].array);
+            },
+            .@"'" => {
+                if (ops.len != 1 or ops[0] != .string) return error.Malformed;
+                self.moveLine(0, -self.gs.leading);
+                try self.show(&.{ops[0]});
+            },
+            .@"\"" => {
+                if (ops.len != 3 or ops[2] != .string) return error.Malformed;
+                self.gs.word_spacing = try num(ops, 0);
+                self.gs.char_spacing = try num(ops, 1);
+                self.moveLine(0, -self.gs.leading);
+                try self.show(&.{ops[2]});
+            },
+            .Do => {
+                if (ops.len != 1 or ops[0] != .name) return error.Malformed;
+                try self.drawXObject(ops[0].name, resources, depth);
+            },
+            .gs => {
+                // An ExtGState can set the font and size, as Tf does (8.4.5, /Font).
+                if (ops.len != 1 or ops[0] != .name) return error.Malformed;
+                const states = (try self.r.getResolved(resources, "ExtGState")) orelse return error.Malformed;
+                if (states != .dict) return error.Malformed;
+                const state = (try self.r.getResolved(states.dict, ops[0].name)) orelse return error.Malformed;
+                if (state != .dict) return error.Malformed;
+                if (try self.r.getResolved(state.dict, "Font")) |f| {
+                    if (f != .array or f.array.len != 2) return error.Malformed;
+                    self.gs.font = try loadFont(self.r, f.array[0]);
+                    self.gs.size = (try self.r.resolve(f.array[1])).number() orelse return error.Malformed;
+                }
+            },
+            .BMC => {
+                try self.beginMarked(null);
+            },
+            .BDC => {
+                if (ops.len != 2) return error.Malformed;
+                const props: ?Dict = switch (ops[1]) {
+                    .dict => |d| d,
+                    // A name is a key in the resources' /Properties (14.6.2).
+                    .name => |n| blk: {
+                        const all = (try self.r.getResolved(resources, "Properties")) orelse break :blk null;
+                        if (all != .dict) return error.Malformed;
+                        const v = (try self.r.getResolved(all.dict, n)) orelse break :blk null;
+                        break :blk if (v == .dict) v.dict else null;
+                    },
+                    else => return error.Malformed,
+                };
+                var actual: ?[]const u8 = null;
+                if (props) |d| {
+                    if (try self.r.getResolved(d, "ActualText")) |at| {
+                        if (at != .string) return error.Malformed;
+                        actual = try textString(self.scratch, at.string);
+                    } else if (try self.elementActualText(d)) |at| actual = try textString(self.scratch, at);
+                }
+                try self.beginMarked(actual);
+            },
+            .EMC => {
+                // An unbalanced EMC is ignored, as an unbalanced Q is, and a form's cannot close
+                // what the page opened.
+                if (self.marked.items.len <= self.marked_floor) return;
+                const m = self.marked.pop().?;
+                const actual = m.actual orelse return;
+                // A span that drew no glyph but an image: its text is placed on the image.
+                if (m.first_run >= self.runs.items.len) if (m.image_box) |b| {
+                    try self.runs.append(self.scratch, .{
+                        .text = actual,
+                        .x = b[0],
+                        .y = b[1],
+                        .size = b[3] - b[1],
+                        .width = b[2] - b[0],
+                        .font = "",
+                        .unmapped = 0,
+                        .glyphs = &.{},
+                        .actual_text = true,
+                        .vertical = false,
+                        .annotation = self.annotation,
+                    });
+                    try self.ends.append(self.scratch, .{ b[2], b[1] });
+                };
+                // A nested span merges first; an enclosing one then merges that run with the rest,
+                // so the outermost ActualText is the text.
+                try self.mergeActual(m.first_run, actual);
+            },
         }
     }
 
@@ -2568,9 +2593,11 @@ test "a word that starts like a number and is not one skips its operator, unless
         "<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R 9 0 R] /Count 4 /MediaBox [0 0 612 792] /Resources << /Font << /F1 10 0 R >> >> >>",
         "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
         // A path's and a colour's operators skipped; an inline image after a bad word is still
-        // skipped to its EI, so its "(" is not read as a string.
+        // skipped to its EI, so its "(" is not read as a string. true, false and null are
+        // operands (of sh, which is skipped), not operators.
         streamObject("",
             \\0.00-30 5 m 10 0.00-30 l 10 20 0.00-30 5 re S 1.-2 g 3-4 BI /W 1 /H 1 /CS /G /BPC 8 ID ( EI
+            \\true false null /Sh0 sh
             \\BT /F1 10 Tf 7 8 Td (A) Tj ET
         ),
         "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>",
