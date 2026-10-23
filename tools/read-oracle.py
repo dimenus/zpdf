@@ -23,7 +23,9 @@ Per file, zpdf-read's JSON (src/zpdf-read.zig) is checked against:
   ActualText runs are left out: their characters have no glyph each.
 - "glyphs", against pdfminer with no layout analysis (one character per code drawn, in content
   order, as zpdf's glyphs are): every glyph's origin must be pdfminer's character's, to
-  0.02 pt. This checks advances, Tc, Tw, Tz and TJ adjustments glyph by glyph.
+  0.02 pt. This checks advances, Tc, Tw, Tz and TJ adjustments glyph by glyph. A glyph pdfminer
+  places elsewhere but mutool has at its origin (same character) is counted as "only mutool
+  agrees", as in "start".
 - "order", against pdfminer: the characters of the runs, white space included, must be
   pdfminer's, in order. The glyphs of ActualText runs are left out on both sides (pdfminer
   ignores ActualText; mutool's "text" checks those).
@@ -218,6 +220,14 @@ def nonwhite(s):
     return "".join(s.split())
 
 
+def glyph_texts(r):
+    """Each glyph's characters in run r. A glyph's text_at is a UTF-8 byte offset into the run's
+    text (src/read_text.zig, Glyph), not a character index."""
+    b = r["text"].encode("utf-8")
+    ats = [g["text_at"] for g in r["glyphs"]] + [len(b)]
+    return [b[ats[n]:ats[n + 1]].decode("utf-8") for n in range(len(r["glyphs"]))]
+
+
 # MuPDF's always-on fake-bold rule (source/fitz/stext-device.c, fz_add_stext_char_imp, 1.28.5):
 # a glyph whose character equals the previous one, starting less than FAKE_BOLD_MAX_DIST times the
 # size from where the previous one started, is not added; that previous glyph stays the one the
@@ -236,9 +246,7 @@ def mupdf_fake_bold_drops(runs):
         if r["actual_text"]:
             prev = None
             continue
-        ends = [g["text_at"] for g in r["glyphs"][1:]] + [len(r["text"])]
-        for g, end in zip(r["glyphs"], ends):
-            c = r["text"][g["text_at"]:end]
+        for g, c in zip(r["glyphs"], glyph_texts(r)):
             if len(c) != 1 or r["size"] <= 0:
                 prev = None
                 continue
@@ -386,6 +394,22 @@ def check(path, verbose):
             xs, ys = sorted((r["x"], x_end)), sorted((r["y"], y_end))
             return cx0 + r["size"] <= xs[0] and xs[1] <= cx1 - r["size"] and cy0 + r["size"] <= ys[0] and ys[1] <= cy1 - r["size"]
 
+        # mutool's characters by (character, cell) on a TOL grid, for the glyph check's vote.
+        mu_cells = None
+        if mu_page is not None and page["rotate"] == 0:
+            mu_cells = collections.defaultdict(list)
+            for c, cx, cy in mu_page:
+                mu_cells[(c, round(cx / TOL), round(cy / TOL))].append((cx, cy))
+
+        def mutool_has(c, g, r):
+            """Whether mutool has character c within TOL of glyph g's origin (r's glyph)."""
+            if mu_cells is None or not c or not inside(r):
+                return False
+            x, y = g["x"] - cx0, cy1 - g["y"]
+            bx, by = round(x / TOL), round(y / TOL)
+            return any(abs(cx - x) < TOL and abs(cy - y) < TOL
+                       for dx in (-1, 0, 1) for dy in (-1, 0, 1) for cx, cy in mu_cells.get((c, bx + dx, by + dy), ()))
+
         if mu_page is not None:
             theirs = collections.Counter(nonwhite("".join(c for c, _, _ in mu_page)))
             all_ours = collections.Counter(nonwhite(as_mutool_reads("".join(r["text"] for r in runs))))
@@ -440,7 +464,7 @@ def check(path, verbose):
             # pdfminer drops a code with no CID mapping (its CMap.decode yields nothing), where
             # zpdf draws CID 0 (9.7.6.3) as U+FFFD: counted when zpdf's extra glyphs are exactly
             # its U+FFFD glyphs beyond pdfminer's. The page's positions are then not compared.
-            ours_fffd = sum(1 for r in runs if not r["actual_text"] for g in r["glyphs"] if r["text"][g["text_at"] : g["text_at"] + 1] == "\ufffd")
+            ours_fffd = sum(1 for r in runs if not r["actual_text"] for t in glyph_texts(r) if t[:1] == "\ufffd")
             theirs_fffd = sum(1 for c, _, _ in chars if c == "\ufffd")
             if len(glyphs) > len(chars) and len(glyphs) - len(chars) == ours_fffd - theirs_fffd:
                 res["glyph count: pdfminer drops codes with no CID mapping (page not compared)"] += 1
@@ -457,6 +481,7 @@ def check(path, verbose):
         actual_glyphs = set()
         for r in runs:
             gap, shift = False, None
+            texts = glyph_texts(r)
             for j in range(k, k + len(r["glyphs"])):
                 if r["actual_text"]:
                     actual_glyphs.add(j)
@@ -469,17 +494,26 @@ def check(path, verbose):
                         shift = d
                         shifted += 1
                     else:
-                        bad.append((g, u))
+                        bad.append((g, u, r, as_mutool_reads(texts[j - k])[:1]))
                 if zero_width_gap(c, adv):
                     gap, shift = True, None
             k += len(r["glyphs"])
+        # A glyph pdfminer places elsewhere is still right when mutool has its character at the
+        # glyph's origin: pdfminer, not zpdf, is then the one that differs (it gives some
+        # non-embedded fonts the standard 14's AFM widths instead of the file's /Widths, so its
+        # glyphs drift from mutool's and zpdf's). Like "start", it fails only when every oracle
+        # that can measure it disagrees; an ActualText glyph, or one mutool cannot measure, fails.
+        mutool_agrees = [b for b in bad if not b[2]["actual_text"] and mutool_has(b[3], b[0], b[2])]
+        bad = [b for b in bad if b[2]["actual_text"] or not mutool_has(b[3], b[0], b[2])]
         if shifted:
             res["glyphs shifted by a pdfminer width gap"] += shifted
-        res["glyphs ok"] += len(glyphs) - len(bad) - shifted
+        if mutool_agrees:
+            res["glyphs: only mutool agrees"] += len(mutool_agrees)
+        res["glyphs ok"] += len(glyphs) - len(bad) - shifted - len(mutool_agrees)
         if bad:
             res["glyphs FAIL"] += len(bad)
             if verbose:
-                g, u = bad[0]
+                g, u = bad[0][:2]
                 notes.append(f"p{i} glyph at ({g['x']:.3f}, {g['y']:.3f}); pdfminer ({u[0]:.3f}, {u[1]:.3f}); {len(bad)} differ")
         # The text in order, white space included; ActualText glyphs left out on both sides.
         ours = "".join(r["text"] for r in runs if not r["actual_text"])
