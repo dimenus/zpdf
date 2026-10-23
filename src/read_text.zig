@@ -55,7 +55,8 @@ pub const TextRun = struct {
     width: ?f64,
     /// The font's /BaseFont, or "" when it has none.
     font: []const u8,
-    /// Codes with no Unicode mapping; each is U+FFFD in `text`.
+    /// Codes with no Unicode mapping, or whose /ToUnicode gives half of a UTF-16 surrogate pair
+    /// that the next code does not complete; each is U+FFFD in `text`.
     unmapped: u32,
     /// Each glyph's origin, in default user space, in drawing order. None for an ActualText run
     /// placed on an image: its x and y are the image's bottom-left corner, its width the image's.
@@ -359,9 +360,10 @@ fn stringOf(o: Object) ?[]const u8 {
     return if (o == .string) o.string else null;
 }
 
-/// UTF-16BE to code points; an unpaired surrogate half is kept (it becomes U+FFFD when written
-/// through appendUtf8). Into `arena`: the result
-/// is a list's items, not a single allocation a caller could free.
+/// UTF-16BE to code points; an unpaired surrogate half is kept: Interp.show joins a ToUnicode
+/// high half with the next glyph's low half and counts any other half as unmapped, and a text
+/// string's half becomes U+FFFD through appendUtf8. Into `arena`: the result is a list's items,
+/// not a single allocation a caller could free.
 fn utf16be(arena: Allocator, bytes: []const u8) Error![]const u21 {
     const a = arena;
     var out: std.ArrayList(u21) = .empty;
@@ -383,22 +385,25 @@ fn utf16be(arena: Allocator, bytes: []const u8) Error![]const u21 {
     return out.items;
 }
 
-/// The characters a glyph name stands for: the Adobe Glyph List, then uniXXXX (one or more
-/// groups of four), uXXXX to uXXXXXX, then ligatures (a_b) and variants (a.sc) by their parts.
-/// Into `arena`: the result is a list's items, and parts of a failed name are left there.
-fn glyphNameChars(arena: Allocator, name: []const u8, depth: u32) Error!?[]const u21 {
+/// The characters a glyph name stands for: for a ZapfDingbats font, the ITC Zapf Dingbats Glyph
+/// List first (the AGL Specification's order, so its a1 to a191 are dingbats); then the Adobe
+/// Glyph List, then uniXXXX (one or more groups of four), uXXXX to uXXXXXX, then ligatures (a_b)
+/// and variants (a.sc) by their parts. Into `arena`: the result is a list's items, and parts of a
+/// failed name are left there.
+fn glyphNameChars(arena: Allocator, name: []const u8, zapf_dingbats: bool, depth: u32) Error!?[]const u21 {
     const a = arena;
     if (depth > 4) return null;
-    if (aglLookup(name)) |cp| return try a.dupe(u21, &.{cp});
+    if (zapf_dingbats) if (nameLookup(&tables.zapf_dingbats_names, name)) |cp| return try a.dupe(u21, &.{cp});
+    if (nameLookup(&tables.glyph_names, name)) |cp| return try a.dupe(u21, &.{cp});
     if (std.mem.indexOfScalar(u8, name, '.')) |dot| {
         if (dot == 0) return null;
-        return glyphNameChars(a, name[0..dot], depth + 1);
+        return glyphNameChars(a, name[0..dot], zapf_dingbats, depth + 1);
     }
     if (std.mem.indexOfScalar(u8, name, '_') != null) {
         var out: std.ArrayList(u21) = .empty;
         var parts = std.mem.splitScalar(u8, name, '_');
         while (parts.next()) |part| {
-            const u = (try glyphNameChars(a, part, depth + 1)) orelse return null;
+            const u = (try glyphNameChars(a, part, zapf_dingbats, depth + 1)) orelse return null;
             try out.appendSlice(a, u);
         }
         return out.items;
@@ -427,15 +432,15 @@ fn isUpperHex(s: []const u8) bool {
     return s.len > 0;
 }
 
-fn aglLookup(name: []const u8) ?u21 {
+fn nameLookup(table: []const tables.GlyphName, name: []const u8) ?u21 {
     var lo: usize = 0;
-    var hi: usize = tables.glyph_names.len;
+    var hi: usize = table.len;
     while (lo < hi) {
         const mid = (lo + hi) / 2;
-        switch (std.mem.order(u8, tables.glyph_names[mid].name, name)) {
+        switch (std.mem.order(u8, table[mid].name, name)) {
             .lt => lo = mid + 1,
             .gt => hi = mid,
-            .eq => return tables.glyph_names[mid].cp,
+            .eq => return table[mid].cp,
         }
     }
     return null;
@@ -702,7 +707,9 @@ fn loadType0(r: *Reader, f: *Font, dict: Dict) Error!void {
 
 /// /W or /W2 (9.7.4.3) as sorted ranges of each CID's first number: `c [n ...]` gives CIDs from
 /// c on, `stride` numbers each; `c_first c_last n ...` gives every CID in the range `stride`
-/// numbers.
+/// numbers. A CID the array gives more than once takes its last value, as a ToUnicode code
+/// defined twice does (CMap.lookup): pdfminer and pdf.js read /W the same way; which one MuPDF
+/// keeps depends on how its unstable sort orders the two.
 fn cidMetrics(r: *Reader, obj: Object, stride: usize) Error![]const Font.CidRange {
     const a = r.arenaAllocator();
     const w = switch (obj) {
@@ -737,12 +744,67 @@ fn cidMetrics(r: *Reader, obj: Object, stride: usize) Error![]const Font.CidRang
             },
         }
     }
-    std.mem.sort(Font.CidRange, ranges.items, {}, struct {
-        fn lt(_: void, x: Font.CidRange, y: Font.CidRange) bool {
-            return x.first < y.first;
+    // Writers almost always give the entries in order with no overlap; those are kept as they
+    // are, with no work beyond this check, and only the others are swept.
+    const in_order = for (ranges.items[@min(1, ranges.items.len)..], 0..) |e, k| {
+        if (e.first <= ranges.items[k].last) break false;
+    } else true;
+    if (in_order) return ranges.items;
+    var scratch: std.heap.ArenaAllocator = .init(r.arena_state.child_allocator);
+    defer scratch.deinit();
+    return disjointLatest(a, scratch.allocator(), ranges.items);
+}
+
+/// `entries`, in the order the file gives them, as ranges that do not overlap, sorted by first
+/// CID, where each CID keeps the value of the last entry that covers it (Font.cidMetric's binary
+/// search needs both). The result and the width lists it points into are in `arena`; `scratch`
+/// holds the work. A sweep over the entries' ends with the covering entries in a heap by
+/// position, so a hostile array costs n log n, not one shift of the list per entry.
+fn disjointLatest(arena: Allocator, scratch: Allocator, entries: []const Font.CidRange) Error![]const Font.CidRange {
+    // Every place where the entry in force can change: each first CID and each CID after a last.
+    const bounds = try scratch.alloc(u32, entries.len * 2);
+    for (entries, 0..) |e, k| {
+        bounds[2 * k] = e.first;
+        bounds[2 * k + 1] = e.last + 1;
+    }
+    std.mem.sort(u32, bounds, {}, std.sort.asc(u32));
+    const by_first = try scratch.alloc(u32, entries.len);
+    for (by_first, 0..) |*o, k| o.* = @intCast(k);
+    std.mem.sort(u32, by_first, entries, struct {
+        fn lt(es: []const Font.CidRange, x: u32, y: u32) bool {
+            return es[x].first < es[y].first;
         }
     }.lt);
-    return ranges.items;
+    // The entries that cover the current CID, the latest on top.
+    var covering: std.PriorityQueue(u32, void, struct {
+        fn later(_: void, x: u32, y: u32) std.math.Order {
+            return std.math.order(y, x);
+        }
+    }.later) = .empty;
+    var out: std.ArrayList(Font.CidRange) = .empty;
+    var next: usize = 0;
+    var b: usize = 0;
+    while (b < bounds.len) {
+        const at = bounds[b];
+        var end = b + 1;
+        while (end < bounds.len and bounds[end] == at) end += 1;
+        if (end == bounds.len) break;
+        // Every first CID is a bound, so an entry joins at its own first CID.
+        while (next < by_first.len and entries[by_first[next]].first == at) : (next += 1) try covering.push(scratch, by_first[next]);
+        while (covering.peek()) |top| {
+            if (entries[top].last >= at) break;
+            _ = covering.pop();
+        }
+        // The top covers all of at up to the next bound: its own last + 1 is a bound too.
+        if (covering.peek()) |top| {
+            const e = entries[top];
+            const last = bounds[end] - 1;
+            const widths = if (e.widths.len == 1) e.widths else e.widths[at - e.first .. last - e.first + 1];
+            try out.append(arena, .{ .first = at, .last = last, .widths = widths });
+        }
+        b = end;
+    }
+    return out.items;
 }
 
 /// The first of a group of numbers; the others must be numbers too.
@@ -977,8 +1039,9 @@ fn loadSimple(r: *Reader, f: *Font, dict: Dict, type3: bool) Error!void {
         },
         else => return error.Malformed,
     };
+    const zapf_dingbats = if (std_metrics) |m| m == .symbolic and std.mem.eql(u8, m.symbolic.name, "ZapfDingbats") else false;
     for (0..256) |c| {
-        if (names[c]) |n| f.encoding[c] = try glyphNameChars(a, n, 0);
+        if (names[c]) |n| f.encoding[c] = try glyphNameChars(a, n, zapf_dingbats, 0);
     }
 
     // Widths: /Widths from /FirstChar, scaled by /FontMatrix for Type3; else the standard
@@ -1114,9 +1177,10 @@ const Interp = struct {
         var lx: read.Lexer = .{ .src = content, .pos = 0 };
         var p: read.Parser = .{ .lx = &lx, .arena = a, .max_depth = self.r.options.max_depth };
         var operands: std.ArrayList(Object) = .empty;
-        // A word that starts like a number but is not one (`0.00-30`), among the operands of the
+        // A word that starts like a number but is not one (`1.5-30`), among the operands of the
         // next operator. Writers make these in path coordinates; the operator is skipped, unless
         // it is one this reader acts on, which then refuses the page rather than guess a value.
+        // A zero with a rounding residue's digits after it is 0 (isZeroWithResidue).
         var bad_operand = false;
         while (true) {
             lx.skipWhite();
@@ -1125,7 +1189,10 @@ const Interp = struct {
                 // The lexer reads a word from a number's first character and fails only when
                 // the word is not a number; any other refusal (a string, a dictionary) stands.
                 error.Malformed => if (start < content.len and read.isNumberStart(content[start])) {
-                    bad_operand = true;
+                    if (isZeroWithResidue(content[start..lx.pos])) {
+                        if (operands.items.len >= 1 << 16) return error.TooLarge;
+                        try operands.append(self.scratch, .{ .real = 0 });
+                    } else bad_operand = true;
                     continue;
                 } else return err,
                 else => return err,
@@ -1159,6 +1226,23 @@ const Interp = struct {
                 },
             }
         }
+    }
+
+    /// Whether `word` is a zero written with a dot, then '-' and digits only: `0.00-13322676`,
+    /// `-0.000000000000-5684342`. A writer (Google Docs, by MuPDF's bug 703248) prints a value
+    /// within rounding of zero as its fixed-point zero followed by the residue's significant
+    /// digits without their exponent: 13322676 is 6 * 2^-52 = 1.3322676e-15, 5684342 is 2^-44.
+    /// So the value is zero to within the residue. A nonzero part before the '-' (`1.5-30`)
+    /// gives no such reading and stays a bad word.
+    fn isZeroWithResidue(word: []const u8) bool {
+        const body = if (word.len > 0 and (word[0] == '-' or word[0] == '+')) word[1..] else word;
+        const dash = std.mem.indexOfScalar(u8, body, '-') orelse return false;
+        const zero = body[0..dash];
+        const residue = body[dash + 1 ..];
+        if (std.mem.count(u8, zero, ".") != 1 or zero.len < 2 or residue.len == 0) return false;
+        for (zero) |c| if (c != '0' and c != '.') return false;
+        for (residue) |c| if (!std.ascii.isDigit(c)) return false;
+        return true;
     }
 
     fn num(ops: []const Object, i: usize) Error!f64 {
@@ -1571,6 +1655,10 @@ const Interp = struct {
         var unmapped: u32 = 0;
         var width_known = true;
         var glyphs: std.ArrayList(Glyph) = .empty;
+        // A high surrogate half that ends a glyph's characters, waiting for the next glyph's: some
+        // writers map the two UTF-16 halves of one character to two glyphs. Joined, the character
+        // is the first glyph's and the second glyph has none; a half left alone is no character.
+        var pending_high: ?u16 = null;
         for (parts) |part| switch (part) {
             .string => |bytes| {
                 var i: usize = 0;
@@ -1580,14 +1668,37 @@ const Interp = struct {
                     const at = self.origin();
                     self.glyph_count += 1;
                     if (self.glyph_count > self.r.options.max_page_glyphs) return error.TooLarge;
+                    var buf: [max_chars]u21 = undefined;
+                    const found = font.unicode(g, &buf);
+                    var chars = found orelse &.{};
+                    if (pending_high) |high| {
+                        pending_high = null;
+                        if (chars.len > 0 and chars[0] <= 0xFFFF and std.unicode.utf16IsLowSurrogate(@intCast(chars[0]))) {
+                            try appendUtf8(a, &text, std.unicode.utf16DecodeSurrogatePair(&.{ high, @intCast(chars[0]) }) catch unreachable);
+                            chars = chars[1..];
+                        } else {
+                            try appendUtf8(a, &text, std.unicode.replacement_character);
+                            unmapped += 1;
+                        }
+                    }
                     const text_at = std.math.cast(u32, text.items.len) orelse return error.TooLarge;
                     try glyphs.append(a, .{ .x = at[0], .y = at[1], .text_at = text_at });
-                    var buf: [max_chars]u21 = undefined;
-                    if (font.unicode(g, &buf)) |chars| {
-                        for (chars) |cp| try appendUtf8(a, &text, cp);
-                    } else {
+                    if (found == null) {
                         try appendUtf8(a, &text, std.unicode.replacement_character);
                         unmapped += 1;
+                    } else {
+                        var lone = false;
+                        for (chars, 0..) |cp, k| {
+                            if (cp >= 0xD800 and cp <= 0xDFFF) {
+                                if (k == chars.len - 1 and std.unicode.utf16IsHighSurrogate(@intCast(cp))) {
+                                    pending_high = @intCast(cp);
+                                } else {
+                                    try appendUtf8(a, &text, std.unicode.replacement_character);
+                                    lone = true;
+                                }
+                            } else try appendUtf8(a, &text, cp);
+                        }
+                        if (lone) unmapped += 1;
                     }
                     const word: f64 = if (g.len == 1 and g.code == 32) self.gs.word_spacing else 0;
                     // 9.4.4: tx = (w0 Tfs + Tc + Tw) Th, or in vertical writing ty = w1 Tfs + Tc
@@ -1609,6 +1720,10 @@ const Interp = struct {
             },
             else => return error.Malformed,
         };
+        if (pending_high != null) {
+            try appendUtf8(a, &text, std.unicode.replacement_character);
+            unmapped += 1;
+        }
         // The run starts at its first glyph, so a TJ adjustment before that glyph moves the start.
         if (glyphs.items.len == 0) return;
         const first: [2]f64 = .{ glyphs.items[0].x, glyphs.items[0].y };
@@ -2174,6 +2289,42 @@ test "an embedded CFF program's own encoding is the base under /Differences, and
     try testing.expectEqualStrings("\u{FFFD}\u{FFFD}", pt.runs[1].text);
 }
 
+test "/W and /W2 that give a CID twice: the last value holds, and every other CID keeps its own" {
+    const gpa = testing.allocator;
+    const pdf = try read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /Resources << /Font << /H 5 0 R /V 6 0 R /T 9 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+        streamObject("", "BT /H 10 Tf 100 700 Td <000000010002000300040005000600070008> Tj ET BT /V 10 Tf 300 700 Td <000100020003> Tj ET BT /T 10 Tf 100 600 Td <000000010002> Tj ET"),
+        "<< /Type /Font /Subtype /Type0 /BaseFont /H /Encoding /Identity-H /DescendantFonts [7 0 R] >>",
+        "<< /Type /Font /Subtype /Type0 /BaseFont /V /Encoding /Identity-V /DescendantFonts [8 0 R] >>",
+        // Each CID's last value: 0 100; 1 900; 2 800; 3 700; 4 none (/DW 1000); 5 30; 6 40; 7 20;
+        // 8 none. Sorted by first CID, the entries overlap, and a CID past an overlap (3, 7) is
+        // still found.
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /A /DW 1000 /W [0 [100 200 300 400] 1 [900] 2 3 700 6 [10 20] 5 [30 40] 2 [800]] >>",
+        // CID 1 w1 -500, 2 -300 (given again, alone), 3 -800 (only in the first array).
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /B /W2 [1 [-500 0 880 -600 0 880 -800 0 880] 2 [-300 0 880]] >>",
+        // In order, but the last two entries share CID 2, which takes 700.
+        "<< /Type /Font /Subtype /Type0 /BaseFont /T /Encoding /Identity-H /DescendantFonts [10 0 R] >>",
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /C /W [0 [50] 1 [100 200] 2 [700]] >>",
+    }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    var pt = try r.pageText(gpa, 0);
+    defer pt.deinit();
+    try testing.expectEqual(@as(usize, 3), pt.runs.len);
+    const h = pt.runs[0];
+    for ([_]f64{ 100, 101, 110, 118, 125, 135, 135.3, 135.7, 135.9 }, h.glyphs) |x, g| try testing.expectApproxEqAbs(x, g.x, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 45.9), h.width.?, 1e-9);
+    const v = pt.runs[1];
+    for ([_]f64{ 700, 695, 692 }, v.glyphs) |y, g| try testing.expectApproxEqAbs(y, g.y, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 16), v.width.?, 1e-9);
+    const t = pt.runs[2];
+    for ([_]f64{ 100, 100.5, 101.5 }, t.glyphs) |x, g| try testing.expectApproxEqAbs(x, g.x, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 8.5), t.width.?, 1e-9);
+}
+
 test "Identity-V: glyphs move by /W2 and /DW2's w1 and Tc along y, TJ along y, with no Tz or Tw" {
     const gpa = testing.allocator;
     // Tc 2, Tz 50 and Tw 3 hold for every run. By ISO 32000-1 9.4.4, a vertical glyph moves the
@@ -2393,6 +2544,50 @@ test "PDFDocEncoding decodes as pdfminer's table does at the bytes that differ f
     for (cases) |c| try testing.expectEqual(c.cp, pdfDocEncoding(c.b));
 }
 
+test "a character's two UTF-16 halves mapped to two glyphs: joined on the first; a half alone is unmapped" {
+    const gpa = testing.allocator;
+    // 0001 and 0005 map to the high half of U+1F534, 0002 and 0004 to its low half, 0003 to A,
+    // 0006 to the high half then A.
+    const to_unicode =
+        \\1 begincodespacerange <0000> <FFFF> endcodespacerange
+        \\6 beginbfchar <0001> <D83D> <0002> <DD34> <0003> <0041> <0004> <DD34> <0005> <D83D> <0006> <D83D0041> endbfchar
+    ;
+    const pdf = try read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /Resources << /Font << /F 5 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+        // Joined; a high half then A; a low half alone; a high half last; joined across a TJ
+        // adjustment; a high half, then an unmapped code; a high half inside one code's
+        // characters, then a low half, which it does not wait for.
+        streamObject("", "BT /F 10 Tf <00010002> Tj <00010003> Tj <0004> Tj <0005> Tj [<0001> -100 <0002>] TJ <00010009> Tj <00060002> Tj ET"),
+        "<< /Type /Font /Subtype /Type0 /BaseFont /T /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 7 0 R >>",
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /T /DW 1000 >>",
+        streamObject("", to_unicode),
+    }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    var pt = try r.pageText(gpa, 0);
+    defer pt.deinit();
+    const Want = struct { text: []const u8, unmapped: u32, text_at: []const u32 };
+    const want = [_]Want{
+        .{ .text = "\u{1f534}", .unmapped = 0, .text_at = &.{ 0, 4 } },
+        .{ .text = "\u{fffd}A", .unmapped = 1, .text_at = &.{ 0, 3 } },
+        .{ .text = "\u{fffd}", .unmapped = 1, .text_at = &.{0} },
+        .{ .text = "\u{fffd}", .unmapped = 1, .text_at = &.{0} },
+        .{ .text = "\u{1f534}", .unmapped = 0, .text_at = &.{ 0, 4 } },
+        .{ .text = "\u{fffd}\u{fffd}", .unmapped = 2, .text_at = &.{ 0, 3 } },
+        .{ .text = "\u{fffd}A\u{fffd}", .unmapped = 2, .text_at = &.{ 0, 4 } },
+    };
+    try testing.expectEqual(want.len, pt.runs.len);
+    for (want, pt.runs) |w, run| {
+        try testing.expectEqualStrings(w.text, run.text);
+        try testing.expectEqual(w.unmapped, run.unmapped);
+        try testing.expectEqual(w.text_at.len, run.glyphs.len);
+        for (w.text_at, run.glyphs) |at, g| try testing.expectEqual(at, g.text_at);
+    }
+}
+
 test "a run starts at its first glyph; no glyph, no run; U+00A0's width; no guessed encoding for an embedded font" {
     const gpa = testing.allocator;
     const content =
@@ -2481,6 +2676,33 @@ test "CMaps: codes up to 0xFFFFFFFF, the latest definition wins, and limits are 
     for (0..max_large_ranges + 1) |i| try many.writer.print("<{X:0>8}> <{X:0>8}> <0041>\n", .{ i * 1000, i * 1000 + 999 });
     try many.writer.writeAll("endbfrange");
     try testing.expectError(error.TooLarge, parseCMap(a, testing.allocator, many.written(), 16));
+}
+
+test "ZapfDingbats glyph names by the ITC Zapf Dingbats Glyph List, in that font only" {
+    const gpa = testing.allocator;
+    const pdf = try read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /Resources << /Font << /Z 5 0 R /S 6 0 R /H 7 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+        // Z: the built-in encoding's 4 (a20), space (not in the list: the AGL's) and l (a71).
+        // S: a subset, by /Differences: a12, a variant of a71, and a20 and a71 joined. H:
+        // Helvetica with the same names in /Differences; the AGL has none of them.
+        streamObject("", "BT /Z 10 Tf 0 700 Td (4 l) Tj ET BT /S 10 Tf 0 600 Td (ABC) Tj ET BT /H 10 Tf 0 500 Td (A) Tj ET"),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /ZapfDingbats >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+ZapfDingbats /Encoding << /Differences [65 /a12 /a71.alt /a20_a71] >> >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /Differences [65 /a12] >> >>",
+    }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    var pt = try r.pageText(gpa, 0);
+    defer pt.deinit();
+    try testing.expectEqual(@as(usize, 3), pt.runs.len);
+    try testing.expectEqualStrings("\u{2714} \u{25cf}", pt.runs[0].text);
+    try testing.expectEqual(@as(u32, 0), pt.runs[0].unmapped);
+    try testing.expectEqualStrings("\u{261e}\u{25cf}\u{2714}\u{25cf}", pt.runs[1].text);
+    try testing.expectEqualStrings("\u{fffd}", pt.runs[2].text);
+    try testing.expectEqual(@as(u32, 1), pt.runs[2].unmapped);
 }
 
 test "fonts: /FirstChar out of range, Symbol widths by glyph name, no guessed encoding for a symbolic font" {
@@ -2586,23 +2808,23 @@ test "the interpreter: budgets, finite results, forms keep their q/Q and BMC/EMC
     try testing.expectError(error.TooLarge, few_glyphs.pageText(gpa, 0));
 }
 
-test "a word that starts like a number and is not one skips its operator, unless the reader acts on it" {
+test "a word that starts like a number and is not one skips its operator, unless the reader acts on it; a zero with a residue after it is 0" {
     const gpa = testing.allocator;
     const pdf = try read.test_util.build(gpa, &.{
         "<< /Type /Catalog /Pages 2 0 R >>",
-        "<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R 9 0 R] /Count 4 /MediaBox [0 0 612 792] /Resources << /Font << /F1 10 0 R >> >> >>",
+        "<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R 9 0 R 12 0 R] /Count 5 /MediaBox [0 0 612 792] /Resources << /Font << /F1 10 0 R >> >> >>",
         "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
         // A path's and a colour's operators skipped; an inline image after a bad word is still
         // skipped to its EI, so its "(" is not read as a string. true, false and null are
         // operands (of sh, which is skipped), not operators.
         streamObject("",
-            \\0.00-30 5 m 10 0.00-30 l 10 20 0.00-30 5 re S 1.-2 g 3-4 BI /W 1 /H 1 /CS /G /BPC 8 ID ( EI
+            \\2.50-30 5 m 10 2.50-30 l 10 20 2.50-30 5 re S 1.-2 g 3-4 BI /W 1 /H 1 /CS /G /BPC 8 ID ( EI
             \\true false null /Sh0 sh
             \\BT /F1 10 Tf 7 8 Td (A) Tj ET
         ),
         "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>",
         // Td still has two numbers without the bad word; it is refused all the same.
-        streamObject("", "BT /F1 10 Tf 1 0.00-30 5 Td (A) Tj ET"),
+        streamObject("", "BT /F1 10 Tf 1 2.50-30 5 Td (A) Tj ET"),
         "<< /Type /Page /Parent 2 0 R /Contents 8 0 R >>",
         // Inside an array the word is part of an object, which is refused.
         streamObject("", "BT /F1 10 Tf [(A) 1-2 (B)] TJ ET"),
@@ -2610,6 +2832,10 @@ test "a word that starts like a number and is not one skips its operator, unless
         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
         // A refusal that is not a word: a stray ")".
         streamObject("", ") 0 0 m BT /F1 10 Tf (A) Tj ET"),
+        "<< /Type /Page /Parent 2 0 R /Contents 13 0 R >>",
+        // Zeros with a residue's digits, read as 0, in cm, Tm and Td: B at (10 + 40, 20 + 0 + 5).
+        // Words close to these that are not one: the next test.
+        streamObject("", "1 0.00-13322676 -0.000000000000-5684342 1 10 20 cm BT /F1 10 Tf 1 .0-7 0. 1 40 0 Tm 0.0-1 5 Td (B) Tj ET"),
     }, "");
     defer gpa.free(pdf);
     var r = try Reader.open(gpa, pdf, .{});
@@ -2624,6 +2850,36 @@ test "a word that starts like a number and is not one skips its operator, unless
     try testing.expectError(error.Malformed, r.pageText(gpa, 1));
     try testing.expectError(error.Malformed, r.pageText(gpa, 2));
     try testing.expectError(error.Malformed, r.pageText(gpa, 3));
+    var zeros = try r.pageText(gpa, 4);
+    defer zeros.deinit();
+    try testing.expectEqual(@as(usize, 1), zeros.runs.len);
+    try testing.expectEqualStrings("B", zeros.runs[0].text);
+    try testing.expectApproxEqAbs(@as(f64, 50), zeros.runs[0].x, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 25), zeros.runs[0].y, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 10), zeros.runs[0].size, 1e-9);
+}
+
+test "words near a zero with a residue that are not one: refused where the reader acts on them" {
+    const gpa = testing.allocator;
+    // No dot, nothing after the '-', a dot in the residue, a nonzero digit, two dots, a second
+    // '-', a bare dot: each a bad word among Td's operands.
+    const words = [_][]const u8{ "00-12", "0.00-", "0.00-1.5", "0.01-12", "0.0.0-12", "0.00-12-3", ".-12" };
+    inline for (words) |w| {
+        const pdf = try read.test_util.build(gpa, &.{
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> >>",
+            "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+            streamObject("", "BT /F1 10 Tf 1 " ++ w ++ " Td (A) Tj ET"),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        }, "");
+        defer gpa.free(pdf);
+        var r = try Reader.open(gpa, pdf, .{});
+        defer r.deinit();
+        testing.expectError(error.Malformed, r.pageText(gpa, 0)) catch |err| {
+            std.debug.print("word {s} was not refused\n", .{w});
+            return err;
+        };
+    }
 }
 
 test "annotations: each appearance on its /Rect (12.5.5), by /AS, with Hidden, NoView, Popup and Invisible left out" {
@@ -2750,13 +3006,13 @@ test "glyph names: uniXXXX and uXXXX[XX] take uppercase hex and real characters 
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     const a = arena.allocator();
-    try testing.expectEqualSlices(u21, &.{0xE9}, (try glyphNameChars(a, "uni00E9", 0)).?);
-    try testing.expectEqualSlices(u21, &.{ 0x66, 0x69 }, (try glyphNameChars(a, "uni00660069", 0)).?);
-    try testing.expectEqualSlices(u21, &.{0x1F600}, (try glyphNameChars(a, "u1F600", 0)).?);
+    try testing.expectEqualSlices(u21, &.{0xE9}, (try glyphNameChars(a, "uni00E9", false, 0)).?);
+    try testing.expectEqualSlices(u21, &.{ 0x66, 0x69 }, (try glyphNameChars(a, "uni00660069", false, 0)).?);
+    try testing.expectEqualSlices(u21, &.{0x1F600}, (try glyphNameChars(a, "u1F600", false, 0)).?);
     // Lowercase hex, a surrogate, and a value past U+10FFFF name no character.
-    try testing.expectEqual(@as(?[]const u21, null), try glyphNameChars(a, "uni00e9", 0));
-    try testing.expectEqual(@as(?[]const u21, null), try glyphNameChars(a, "uniD800", 0));
-    try testing.expectEqual(@as(?[]const u21, null), try glyphNameChars(a, "u110000", 0));
+    try testing.expectEqual(@as(?[]const u21, null), try glyphNameChars(a, "uni00e9", false, 0));
+    try testing.expectEqual(@as(?[]const u21, null), try glyphNameChars(a, "uniD800", false, 0));
+    try testing.expectEqual(@as(?[]const u21, null), try glyphNameChars(a, "u110000", false, 0));
 }
 
 test "text strings: UTF-16BE surrogate pairs decode, and a lone half is U+FFFD" {

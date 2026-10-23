@@ -7,15 +7,19 @@ and positions when a PDF does not carry them itself.
 
     uv run tools/gen-read-tables.py <afm-dir> src/read_tables.zig
 
-<afm-dir> holds Adobe's Core 14 AFM files and MustRead.html, and the Adobe Glyph List:
+<afm-dir> holds Adobe's Core 14 AFM files and MustRead.html, the Adobe Glyph List and the ITC Zapf
+Dingbats Glyph List:
     https://raw.githubusercontent.com/apache/pdfbox/trunk/pdfbox/src/main/resources/org/apache/pdfbox/resources/afm/<name>
         (the 14 <Font>.afm files and MustRead.html)
     https://raw.githubusercontent.com/adobe-type-tools/agl-aglfn/master/glyphlist.txt
+    https://raw.githubusercontent.com/adobe-type-tools/agl-aglfn/master/zapfdingbats.txt
 They are inputs only; the AFM files are not checked in. Adobe's MustRead.html terms require the
 copyright notices kept and modifications noted: the generated file repeats both.
 
 What it writes:
 - glyph_names: every Adobe Glyph List name that maps to ONE code point, sorted by name.
+- zapf_dingbats_names: the ITC Zapf Dingbats Glyph List (a1 to a191 and the others), sorted by
+  name; the AGL Specification maps a ZapfDingbats font's glyph names by it before the AGL.
 - standard_encoding, mac_roman_encoding: glyph name per code (ISO 32000-1 Annex D). Standard is
   read from Helvetica.afm's codes (its EncodingScheme is AdobeStandardEncoding); MacRoman comes
   from fontTools, which is Mac OS Roman with the old 0xDB "currency": PDF's MacRomanEncoding
@@ -75,6 +79,12 @@ def main():
         cps = codes.split()
         if len(cps) == 1:
             agl[name] = int(cps[0], 16)
+    zapf = {}
+    for line in (src / "zapfdingbats.txt").read_text().splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        name, code = line.split(";")
+        zapf[name] = int(code, 16)
     must_read = re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]*>", " ", (src / "MustRead.html").read_text()))).strip()
 
     o = []
@@ -99,7 +109,8 @@ def main():
         line += w + " "
     o.append(f"//!   {line.rstrip()}")
     o.append("//! The glyph names are the Adobe Glyph List, glyphlist.txt, BSD-3-Clause, Copyright 2002-2019")
-    o.append("//! Adobe (https://github.com/adobe-type-tools/agl-aglfn).")
+    o.append("//! Adobe (https://github.com/adobe-type-tools/agl-aglfn); the ZapfDingbats names are the ITC")
+    o.append("//! Zapf Dingbats Glyph List, zapfdingbats.txt, from the same repository under the same terms.")
     o.append("")
     o.append("pub const GlyphName = struct { name: []const u8, cp: u21 };")
     o.append("")
@@ -107,6 +118,12 @@ def main():
     o.append("pub const glyph_names = [_]GlyphName{")
     for name in sorted(agl, key=lambda n: n.encode()):
         o.append(f'    .{{ .name = "{name}", .cp = 0x{agl[name]:04X} }},')
+    o.append("};")
+    o.append("")
+    o.append("/// The ITC Zapf Dingbats Glyph List, sorted by name (byte order), for binary search.")
+    o.append("pub const zapf_dingbats_names = [_]GlyphName{")
+    for name in sorted(zapf, key=lambda n: n.encode()):
+        o.append(f'    .{{ .name = "{name}", .cp = 0x{zapf[name]:04X} }},')
     o.append("};")
 
     def names_table(var, doc, names):

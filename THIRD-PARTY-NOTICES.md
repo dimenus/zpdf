@@ -36,7 +36,8 @@ Adobe's MustRead.html, which accompanies the AFM files:
   are prominently noted in the modified file(s); and that this paragraph is not modified.
   Adobe Systems has no responsibility or obligation to support the use of the AFM files. Col
 The glyph names are the Adobe Glyph List, glyphlist.txt, BSD-3-Clause, Copyright 2002-2019
-Adobe (https://github.com/adobe-type-tools/agl-aglfn).
+Adobe (https://github.com/adobe-type-tools/agl-aglfn); the ZapfDingbats names are the ITC
+Zapf Dingbats Glyph List, zapfdingbats.txt, from the same repository under the same terms.
 ```
 
 The Adobe Glyph List (https://github.com/adobe-type-tools/agl-aglfn), whose glyph names are
