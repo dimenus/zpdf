@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
     addValgrindMarks(mod);
 
     // libzpdf: the C ABI (src/abi.zig) as a native shared library, for .NET and C.
-    const native = addNative(b, kb, &cid, target, false);
+    const native = addNative(b, kb, &cid, target, false, .dynamic, false);
 
     // zpdf.h and the C# declarations, written from src/abi.zig.
     const gen_abi_mod = b.createModule(.{
@@ -58,7 +58,7 @@ pub fn build(b: *std.Build) void {
     // libzpdf for each runtime a .NET package carries.
     var native_libs: [native_targets.len]*std.Build.Step.Compile = undefined;
     for (native_targets, &native_libs) |t, *lib| {
-        lib.* = addNative(b, kb, &cid, b.resolveTargetQuery(t.query), true);
+        lib.* = addNative(b, kb, &cid, b.resolveTargetQuery(t.query), true, .dynamic, false);
         b.addNamedLazyPath(b.fmt("libzpdf-{s}", .{t.rid}), lib.*.getEmittedBin());
     }
 
@@ -275,8 +275,13 @@ pub fn build(b: *std.Build) void {
     abi_step.dependOn(&b.addInstallArtifact(native, .{}).step);
     abi_step.dependOn(&b.addInstallHeaderFile(header, "zpdf.h").step);
     abi_step.dependOn(&b.addInstallFileWithDir(csharp, .{ .custom = "csharp" }, "Zpdf.Abi.g.cs").step);
-    // The valgrind canary built as libzpdf is, for tools/valgrind-abi-bundle.sh.
-    const abi_canary = canaryExe(b, "valgrind-canary", nativeModule(b, target, b.path("tools/valgrind-canary.zig"), false));
+    // libzpdf as above, with Zig's valgrind support on, for the runs under valgrind
+    // (tools/valgrind-abi-bundle.sh). Never shipped: nativeModule says why it must not be.
+    const abi_valgrind = b.step("abi-valgrind", "Install libzpdf built for valgrind runs, and include/zpdf.h");
+    abi_valgrind.dependOn(&b.addInstallArtifact(addNative(b, kb, &cid, target, false, .dynamic, true), .{}).step);
+    abi_valgrind.dependOn(&b.addInstallHeaderFile(header, "zpdf.h").step);
+    // The valgrind canary built as libzpdf is for those runs.
+    const abi_canary = canaryExe(b, "valgrind-canary", nativeModule(b, target, b.path("tools/valgrind-canary.zig"), false, true));
     b.step("abi-canary", "Install the valgrind canary, built with libzpdf's options, to <prefix>/canary").dependOn(
         &b.addInstallArtifact(abi_canary, .{ .dest_dir = .{ .override = .{ .custom = "canary" } } }).step,
     );
@@ -316,6 +321,20 @@ pub fn build(b: *std.Build) void {
     abi_test.addFileArg(b.path("tests/images/exif/orient-6.jpg"));
     abi_test.expectStdOutEqual("abi-test: ok\n");
     test_step.dependOn(&abi_test.step);
+
+    // The same program linked statically, with libzpdf as a static library built as abi-valgrind's
+    // is, for tools/test-valgrind.sh on Linux. With -Dtarget=<arch>-linux-musl it is a static
+    // executable on Zig's own musl (libc.a and crt1.o, which Zig builds from source), so it has
+    // no ld.so and valgrind runs it on any Linux machine. A dynamic program runs through the
+    // system's ld.so, and valgrind needs that ld.so's debug symbols, which a host like Arch strips.
+    const abi_test_static_mod = b.createModule(.{ .target = target, .optimize = .Debug, .link_libc = true });
+    abi_test_static_mod.addCSourceFile(.{ .file = b.path("tests/abi/abi-test.c"), .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Wpedantic", "-Werror" } });
+    abi_test_static_mod.addIncludePath(header.dirname());
+    abi_test_static_mod.linkLibrary(addNative(b, kb, &cid, target, false, .static, true));
+    const abi_test_static = b.addExecutable(.{ .name = "abi-test-static", .root_module = abi_test_static_mod, .linkage = .static });
+    b.step("abi-test-static", "Install abi-test linked statically with libzpdf to <prefix>/bin").dependOn(
+        &b.addInstallArtifact(abi_test_static, .{}).step,
+    );
 
     // The .NET library (dotnet/Zpdf) keeps the generated declarations beside its own code, so it
     // builds with dotnet alone; `zig build test` fails when that copy differs from what
@@ -417,13 +436,13 @@ fn addZpdfModule(b: *std.Build, kb: *std.Build.Dependency, cid: *const CidMaps, 
 /// libzpdf: ReleaseSafe with kb's C undefined behaviour set to trap, for the reason zpdf.wasm
 /// is (addWasm). In a native process a defect then ends the process, which src/abi.zig's
 /// protocol says. kb's symbols are hidden, so only the zpdf_ exports leave the library.
-fn addNative(b: *std.Build, kb: *std.Build.Dependency, cid: *const CidMaps, target: std.Build.ResolvedTarget, strip: bool) *std.Build.Step.Compile {
-    const m = nativeModule(b, target, b.path("src/root.zig"), strip);
+fn addNative(b: *std.Build, kb: *std.Build.Dependency, cid: *const CidMaps, target: std.Build.ResolvedTarget, strip: bool, linkage: std.builtin.LinkMode, valgrind: bool) *std.Build.Step.Compile {
+    const m = nativeModule(b, target, b.path("src/root.zig"), strip, valgrind);
     m.addOptions("abi_options", abiOptions(b, false, true));
     addKb(b, m, kb, if (m.link_libc == false) .no_crt_hidden else .libc_hidden);
     addCidMaps(m, cid, true);
     addValgrindMarks(m);
-    return b.addLibrary(.{ .name = "zpdf", .linkage = .dynamic, .root_module = m });
+    return b.addLibrary(.{ .name = "zpdf", .linkage = linkage, .root_module = m });
 }
 
 /// The module options libzpdf is built with, for libzpdf and for the canary that checks valgrind
@@ -434,7 +453,14 @@ fn addNative(b: *std.Build, kb: *std.Build.Dependency, cid: *const CidMaps, targ
 /// std.heap.smp_allocator under each context's block cache (src/abi.zig). With no malloc for
 /// valgrind to replace, libzpdf marks its own allocations for valgrind (src/counting.zig), through
 /// addValgrindMarks.
-fn nativeModule(b: *std.Build, target: std.Build.ResolvedTarget, root: std.Build.LazyPath, strip: bool) *std.Build.Module {
+///
+/// valgrind: Zig's valgrind support, true only for a build that runs under valgrind. Off, as
+/// shipped, std.mem.Allocator.alloc fills each new block with 0xaa (ReleaseSafe's `undefined`),
+/// which valgrind sees as a write, so a read of a block libzpdf never wrote was reported by
+/// nothing: counting.zig's mark comes before the fill. On, the fill also marks the block
+/// undefined. It stays off in the shipped library because it marks every `undefined` value, which
+/// made writing measurably slower (src/valgrind_marks.zig).
+fn nativeModule(b: *std.Build, target: std.Build.ResolvedTarget, root: std.Build.LazyPath, strip: bool, valgrind: bool) *std.Build.Module {
     const no_libc = target.result.os.tag == .linux;
     return b.createModule(.{
         .root_source_file = root,
@@ -444,6 +470,7 @@ fn nativeModule(b: *std.Build, target: std.Build.ResolvedTarget, root: std.Build
         .pic = true,
         .sanitize_c = .trap,
         .strip = strip,
+        .valgrind = valgrind,
     });
 }
 
