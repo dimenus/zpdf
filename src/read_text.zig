@@ -55,7 +55,8 @@ pub const TextRun = struct {
     width: ?f64,
     /// The font's /BaseFont, or "" when it has none.
     font: []const u8,
-    /// Codes with no Unicode mapping; each is U+FFFD in `text`.
+    /// Codes with no Unicode mapping, or whose /ToUnicode gives half of a UTF-16 surrogate pair
+    /// that the next code does not complete; each is U+FFFD in `text`.
     unmapped: u32,
     /// Each glyph's origin, in default user space, in drawing order. None for an ActualText run
     /// placed on an image: its x and y are the image's bottom-left corner, its width the image's.
@@ -359,9 +360,10 @@ fn stringOf(o: Object) ?[]const u8 {
     return if (o == .string) o.string else null;
 }
 
-/// UTF-16BE to code points; an unpaired surrogate half is kept (it becomes U+FFFD when written
-/// through appendUtf8). Into `arena`: the result
-/// is a list's items, not a single allocation a caller could free.
+/// UTF-16BE to code points; an unpaired surrogate half is kept: Interp.show joins a ToUnicode
+/// high half with the next glyph's low half and counts any other half as unmapped, and a text
+/// string's half becomes U+FFFD through appendUtf8. Into `arena`: the result is a list's items,
+/// not a single allocation a caller could free.
 fn utf16be(arena: Allocator, bytes: []const u8) Error![]const u21 {
     const a = arena;
     var out: std.ArrayList(u21) = .empty;
@@ -1627,6 +1629,10 @@ const Interp = struct {
         var unmapped: u32 = 0;
         var width_known = true;
         var glyphs: std.ArrayList(Glyph) = .empty;
+        // A high surrogate half that ends a glyph's characters, waiting for the next glyph's: some
+        // writers map the two UTF-16 halves of one character to two glyphs. Joined, the character
+        // is the first glyph's and the second glyph has none; a half left alone is no character.
+        var pending_high: ?u16 = null;
         for (parts) |part| switch (part) {
             .string => |bytes| {
                 var i: usize = 0;
@@ -1636,14 +1642,37 @@ const Interp = struct {
                     const at = self.origin();
                     self.glyph_count += 1;
                     if (self.glyph_count > self.r.options.max_page_glyphs) return error.TooLarge;
+                    var buf: [max_chars]u21 = undefined;
+                    const found = font.unicode(g, &buf);
+                    var chars = found orelse &.{};
+                    if (pending_high) |high| {
+                        pending_high = null;
+                        if (chars.len > 0 and chars[0] <= 0xFFFF and std.unicode.utf16IsLowSurrogate(@intCast(chars[0]))) {
+                            try appendUtf8(a, &text, std.unicode.utf16DecodeSurrogatePair(&.{ high, @intCast(chars[0]) }) catch unreachable);
+                            chars = chars[1..];
+                        } else {
+                            try appendUtf8(a, &text, std.unicode.replacement_character);
+                            unmapped += 1;
+                        }
+                    }
                     const text_at = std.math.cast(u32, text.items.len) orelse return error.TooLarge;
                     try glyphs.append(a, .{ .x = at[0], .y = at[1], .text_at = text_at });
-                    var buf: [max_chars]u21 = undefined;
-                    if (font.unicode(g, &buf)) |chars| {
-                        for (chars) |cp| try appendUtf8(a, &text, cp);
-                    } else {
+                    if (found == null) {
                         try appendUtf8(a, &text, std.unicode.replacement_character);
                         unmapped += 1;
+                    } else {
+                        var lone = false;
+                        for (chars, 0..) |cp, k| {
+                            if (cp >= 0xD800 and cp <= 0xDFFF) {
+                                if (k == chars.len - 1 and std.unicode.utf16IsHighSurrogate(@intCast(cp))) {
+                                    pending_high = @intCast(cp);
+                                } else {
+                                    try appendUtf8(a, &text, std.unicode.replacement_character);
+                                    lone = true;
+                                }
+                            } else try appendUtf8(a, &text, cp);
+                        }
+                        if (lone) unmapped += 1;
                     }
                     const word: f64 = if (g.len == 1 and g.code == 32) self.gs.word_spacing else 0;
                     // 9.4.4: tx = (w0 Tfs + Tc + Tw) Th, or in vertical writing ty = w1 Tfs + Tc
@@ -1665,6 +1694,10 @@ const Interp = struct {
             },
             else => return error.Malformed,
         };
+        if (pending_high != null) {
+            try appendUtf8(a, &text, std.unicode.replacement_character);
+            unmapped += 1;
+        }
         // The run starts at its first glyph, so a TJ adjustment before that glyph moves the start.
         if (glyphs.items.len == 0) return;
         const first: [2]f64 = .{ glyphs.items[0].x, glyphs.items[0].y };
@@ -2477,6 +2510,50 @@ test "PDFDocEncoding decodes as pdfminer's table does at the bytes that differ f
         .{ .b = 0xAD, .cp = null },   .{ .b = 0xE9, .cp = 0xE9 },
     };
     for (cases) |c| try testing.expectEqual(c.cp, pdfDocEncoding(c.b));
+}
+
+test "a character's two UTF-16 halves mapped to two glyphs: joined on the first; a half alone is unmapped" {
+    const gpa = testing.allocator;
+    // 0001 and 0005 map to the high half of U+1F534, 0002 and 0004 to its low half, 0003 to A,
+    // 0006 to the high half then A.
+    const to_unicode =
+        \\1 begincodespacerange <0000> <FFFF> endcodespacerange
+        \\6 beginbfchar <0001> <D83D> <0002> <DD34> <0003> <0041> <0004> <DD34> <0005> <D83D> <0006> <D83D0041> endbfchar
+    ;
+    const pdf = try read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /Resources << /Font << /F 5 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+        // Joined; a high half then A; a low half alone; a high half last; joined across a TJ
+        // adjustment; a high half, then an unmapped code; a high half inside one code's
+        // characters, then a low half, which it does not wait for.
+        streamObject("", "BT /F 10 Tf <00010002> Tj <00010003> Tj <0004> Tj <0005> Tj [<0001> -100 <0002>] TJ <00010009> Tj <00060002> Tj ET"),
+        "<< /Type /Font /Subtype /Type0 /BaseFont /T /Encoding /Identity-H /DescendantFonts [6 0 R] /ToUnicode 7 0 R >>",
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /T /DW 1000 >>",
+        streamObject("", to_unicode),
+    }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    var pt = try r.pageText(gpa, 0);
+    defer pt.deinit();
+    const Want = struct { text: []const u8, unmapped: u32, text_at: []const u32 };
+    const want = [_]Want{
+        .{ .text = "\u{1f534}", .unmapped = 0, .text_at = &.{ 0, 4 } },
+        .{ .text = "\u{fffd}A", .unmapped = 1, .text_at = &.{ 0, 3 } },
+        .{ .text = "\u{fffd}", .unmapped = 1, .text_at = &.{0} },
+        .{ .text = "\u{fffd}", .unmapped = 1, .text_at = &.{0} },
+        .{ .text = "\u{1f534}", .unmapped = 0, .text_at = &.{ 0, 4 } },
+        .{ .text = "\u{fffd}\u{fffd}", .unmapped = 2, .text_at = &.{ 0, 3 } },
+        .{ .text = "\u{fffd}A\u{fffd}", .unmapped = 2, .text_at = &.{ 0, 4 } },
+    };
+    try testing.expectEqual(want.len, pt.runs.len);
+    for (want, pt.runs) |w, run| {
+        try testing.expectEqualStrings(w.text, run.text);
+        try testing.expectEqual(w.unmapped, run.unmapped);
+        try testing.expectEqual(w.text_at.len, run.glyphs.len);
+        for (w.text_at, run.glyphs) |at, g| try testing.expectEqual(at, g.text_at);
+    }
 }
 
 test "a run starts at its first glyph; no glyph, no run; U+00A0's width; no guessed encoding for an embedded font" {

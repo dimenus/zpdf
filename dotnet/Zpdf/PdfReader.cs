@@ -168,7 +168,8 @@ public sealed record PdfPage(int Index, PdfBox MediaBox, PdfBox CropBox, int Rot
 /// (see <paramref name="IsVertical"/>).</param>
 /// <param name="Width">The run's advance, or null when a glyph's width is unknown. In vertical
 /// writing it runs along the text's y axis.</param>
-/// <param name="UnmappedCodes">Codes with no Unicode mapping; each is U+FFFD in
+/// <param name="UnmappedCodes">Codes with no Unicode mapping, or whose /ToUnicode gives half of a
+/// UTF-16 surrogate pair that the next code does not complete; each is U+FFFD in
 /// <paramref name="Text"/>.</param>
 /// <param name="IsActualText">The text is the span's /ActualText, which replaces what the glyphs
 /// map to.</param>
