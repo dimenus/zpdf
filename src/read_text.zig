@@ -716,9 +716,6 @@ fn cidMetrics(r: *Reader, obj: Object, stride: usize) Error![]const Font.CidRang
         .array => |arr| arr,
         else => return error.Malformed,
     };
-    var scratch: std.heap.ArenaAllocator = .init(r.arena_state.child_allocator);
-    defer scratch.deinit();
-    const s = scratch.allocator();
     var ranges: std.ArrayList(Font.CidRange) = .empty;
     var i: usize = 0;
     while (i < w.len) {
@@ -735,19 +732,27 @@ fn cidMetrics(r: *Reader, obj: Object, stride: usize) Error![]const Font.CidRang
                 if (@as(u64, first) + n - 1 > 0xFFFF) return error.Malformed;
                 const ws = try a.alloc(f64, n);
                 for (ws, 0..) |*v, k| v.* = try firstOfGroup(r, list[k * stride ..][0..stride]);
-                try ranges.append(s, .{ .first = first, .last = first + @as(u32, @intCast(n)) - 1, .widths = ws });
+                try ranges.append(a, .{ .first = first, .last = first + @as(u32, @intCast(n)) - 1, .widths = ws });
                 i += 2;
             },
             else => {
                 const last = try cidOf(r, w[i + 1]);
                 if (i + 1 + stride >= w.len or last < first) return error.Malformed;
                 const v = try firstOfGroup(r, w[i + 2 ..][0..stride]);
-                try ranges.append(s, .{ .first = first, .last = last, .widths = try a.dupe(f64, &.{v}) });
+                try ranges.append(a, .{ .first = first, .last = last, .widths = try a.dupe(f64, &.{v}) });
                 i += 2 + stride;
             },
         }
     }
-    return disjointLatest(a, s, ranges.items);
+    // Writers almost always give the entries in order with no overlap; those are kept as they
+    // are, with no work beyond this check, and only the others are swept.
+    const in_order = for (ranges.items[@min(1, ranges.items.len)..], 0..) |e, k| {
+        if (e.first <= ranges.items[k].last) break false;
+    } else true;
+    if (in_order) return ranges.items;
+    var scratch: std.heap.ArenaAllocator = .init(r.arena_state.child_allocator);
+    defer scratch.deinit();
+    return disjointLatest(a, scratch.allocator(), ranges.items);
 }
 
 /// `entries`, in the order the file gives them, as ranges that do not overlap, sorted by first
@@ -2288,9 +2293,9 @@ test "/W and /W2 that give a CID twice: the last value holds, and every other CI
     const gpa = testing.allocator;
     const pdf = try read.test_util.build(gpa, &.{
         "<< /Type /Catalog /Pages 2 0 R >>",
-        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /Resources << /Font << /H 5 0 R /V 6 0 R >> >> >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /Resources << /Font << /H 5 0 R /V 6 0 R /T 9 0 R >> >> >>",
         "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
-        streamObject("", "BT /H 10 Tf 100 700 Td <000000010002000300040005000600070008> Tj ET BT /V 10 Tf 300 700 Td <000100020003> Tj ET"),
+        streamObject("", "BT /H 10 Tf 100 700 Td <000000010002000300040005000600070008> Tj ET BT /V 10 Tf 300 700 Td <000100020003> Tj ET BT /T 10 Tf 100 600 Td <000000010002> Tj ET"),
         "<< /Type /Font /Subtype /Type0 /BaseFont /H /Encoding /Identity-H /DescendantFonts [7 0 R] >>",
         "<< /Type /Font /Subtype /Type0 /BaseFont /V /Encoding /Identity-V /DescendantFonts [8 0 R] >>",
         // Each CID's last value: 0 100; 1 900; 2 800; 3 700; 4 none (/DW 1000); 5 30; 6 40; 7 20;
@@ -2299,19 +2304,25 @@ test "/W and /W2 that give a CID twice: the last value holds, and every other CI
         "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /A /DW 1000 /W [0 [100 200 300 400] 1 [900] 2 3 700 6 [10 20] 5 [30 40] 2 [800]] >>",
         // CID 1 w1 -500, 2 -300 (given again, alone), 3 -800 (only in the first array).
         "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /B /W2 [1 [-500 0 880 -600 0 880 -800 0 880] 2 [-300 0 880]] >>",
+        // In order, but the last two entries share CID 2, which takes 700.
+        "<< /Type /Font /Subtype /Type0 /BaseFont /T /Encoding /Identity-H /DescendantFonts [10 0 R] >>",
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /C /W [0 [50] 1 [100 200] 2 [700]] >>",
     }, "");
     defer gpa.free(pdf);
     var r = try Reader.open(gpa, pdf, .{});
     defer r.deinit();
     var pt = try r.pageText(gpa, 0);
     defer pt.deinit();
-    try testing.expectEqual(@as(usize, 2), pt.runs.len);
+    try testing.expectEqual(@as(usize, 3), pt.runs.len);
     const h = pt.runs[0];
     for ([_]f64{ 100, 101, 110, 118, 125, 135, 135.3, 135.7, 135.9 }, h.glyphs) |x, g| try testing.expectApproxEqAbs(x, g.x, 1e-9);
     try testing.expectApproxEqAbs(@as(f64, 45.9), h.width.?, 1e-9);
     const v = pt.runs[1];
     for ([_]f64{ 700, 695, 692 }, v.glyphs) |y, g| try testing.expectApproxEqAbs(y, g.y, 1e-9);
     try testing.expectApproxEqAbs(@as(f64, 16), v.width.?, 1e-9);
+    const t = pt.runs[2];
+    for ([_]f64{ 100, 100.5, 101.5 }, t.glyphs) |x, g| try testing.expectApproxEqAbs(x, g.x, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 8.5), t.width.?, 1e-9);
 }
 
 test "Identity-V: glyphs move by /W2 and /DW2's w1 and Tc along y, TJ along y, with no Tz or Tw" {
