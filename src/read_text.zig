@@ -702,13 +702,18 @@ fn loadType0(r: *Reader, f: *Font, dict: Dict) Error!void {
 
 /// /W or /W2 (9.7.4.3) as sorted ranges of each CID's first number: `c [n ...]` gives CIDs from
 /// c on, `stride` numbers each; `c_first c_last n ...` gives every CID in the range `stride`
-/// numbers.
+/// numbers. A CID the array gives more than once takes its last value, as a ToUnicode code
+/// defined twice does (CMap.lookup): pdfminer and pdf.js read /W the same way; which one MuPDF
+/// keeps depends on how its unstable sort orders the two.
 fn cidMetrics(r: *Reader, obj: Object, stride: usize) Error![]const Font.CidRange {
     const a = r.arenaAllocator();
     const w = switch (obj) {
         .array => |arr| arr,
         else => return error.Malformed,
     };
+    var scratch: std.heap.ArenaAllocator = .init(r.arena_state.child_allocator);
+    defer scratch.deinit();
+    const s = scratch.allocator();
     var ranges: std.ArrayList(Font.CidRange) = .empty;
     var i: usize = 0;
     while (i < w.len) {
@@ -725,24 +730,71 @@ fn cidMetrics(r: *Reader, obj: Object, stride: usize) Error![]const Font.CidRang
                 if (@as(u64, first) + n - 1 > 0xFFFF) return error.Malformed;
                 const ws = try a.alloc(f64, n);
                 for (ws, 0..) |*v, k| v.* = try firstOfGroup(r, list[k * stride ..][0..stride]);
-                try ranges.append(a, .{ .first = first, .last = first + @as(u32, @intCast(n)) - 1, .widths = ws });
+                try ranges.append(s, .{ .first = first, .last = first + @as(u32, @intCast(n)) - 1, .widths = ws });
                 i += 2;
             },
             else => {
                 const last = try cidOf(r, w[i + 1]);
                 if (i + 1 + stride >= w.len or last < first) return error.Malformed;
                 const v = try firstOfGroup(r, w[i + 2 ..][0..stride]);
-                try ranges.append(a, .{ .first = first, .last = last, .widths = try a.dupe(f64, &.{v}) });
+                try ranges.append(s, .{ .first = first, .last = last, .widths = try a.dupe(f64, &.{v}) });
                 i += 2 + stride;
             },
         }
     }
-    std.mem.sort(Font.CidRange, ranges.items, {}, struct {
-        fn lt(_: void, x: Font.CidRange, y: Font.CidRange) bool {
-            return x.first < y.first;
+    return disjointLatest(a, s, ranges.items);
+}
+
+/// `entries`, in the order the file gives them, as ranges that do not overlap, sorted by first
+/// CID, where each CID keeps the value of the last entry that covers it (Font.cidMetric's binary
+/// search needs both). The result and the width lists it points into are in `arena`; `scratch`
+/// holds the work. A sweep over the entries' ends with the covering entries in a heap by
+/// position, so a hostile array costs n log n, not one shift of the list per entry.
+fn disjointLatest(arena: Allocator, scratch: Allocator, entries: []const Font.CidRange) Error![]const Font.CidRange {
+    // Every place where the entry in force can change: each first CID and each CID after a last.
+    const bounds = try scratch.alloc(u32, entries.len * 2);
+    for (entries, 0..) |e, k| {
+        bounds[2 * k] = e.first;
+        bounds[2 * k + 1] = e.last + 1;
+    }
+    std.mem.sort(u32, bounds, {}, std.sort.asc(u32));
+    const by_first = try scratch.alloc(u32, entries.len);
+    for (by_first, 0..) |*o, k| o.* = @intCast(k);
+    std.mem.sort(u32, by_first, entries, struct {
+        fn lt(es: []const Font.CidRange, x: u32, y: u32) bool {
+            return es[x].first < es[y].first;
         }
     }.lt);
-    return ranges.items;
+    // The entries that cover the current CID, the latest on top.
+    var covering: std.PriorityQueue(u32, void, struct {
+        fn later(_: void, x: u32, y: u32) std.math.Order {
+            return std.math.order(y, x);
+        }
+    }.later) = .empty;
+    var out: std.ArrayList(Font.CidRange) = .empty;
+    var next: usize = 0;
+    var b: usize = 0;
+    while (b < bounds.len) {
+        const at = bounds[b];
+        var end = b + 1;
+        while (end < bounds.len and bounds[end] == at) end += 1;
+        if (end == bounds.len) break;
+        // Every first CID is a bound, so an entry joins at its own first CID.
+        while (next < by_first.len and entries[by_first[next]].first == at) : (next += 1) try covering.push(scratch, by_first[next]);
+        while (covering.peek()) |top| {
+            if (entries[top].last >= at) break;
+            _ = covering.pop();
+        }
+        // The top covers all of at up to the next bound: its own last + 1 is a bound too.
+        if (covering.peek()) |top| {
+            const e = entries[top];
+            const last = bounds[end] - 1;
+            const widths = if (e.widths.len == 1) e.widths else e.widths[at - e.first .. last - e.first + 1];
+            try out.append(arena, .{ .first = at, .last = last, .widths = widths });
+        }
+        b = end;
+    }
+    return out.items;
 }
 
 /// The first of a group of numbers; the others must be numbers too.
@@ -2172,6 +2224,36 @@ test "an embedded CFF program's own encoding is the base under /Differences, and
     try testing.expectEqualStrings("AB\u{03B1}Z", pt.runs[0].text);
     try testing.expectEqual(@as(u32, 0), pt.runs[0].unmapped);
     try testing.expectEqualStrings("\u{FFFD}\u{FFFD}", pt.runs[1].text);
+}
+
+test "/W and /W2 that give a CID twice: the last value holds, and every other CID keeps its own" {
+    const gpa = testing.allocator;
+    const pdf = try read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /Resources << /Font << /H 5 0 R /V 6 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+        streamObject("", "BT /H 10 Tf 100 700 Td <000000010002000300040005000600070008> Tj ET BT /V 10 Tf 300 700 Td <000100020003> Tj ET"),
+        "<< /Type /Font /Subtype /Type0 /BaseFont /H /Encoding /Identity-H /DescendantFonts [7 0 R] >>",
+        "<< /Type /Font /Subtype /Type0 /BaseFont /V /Encoding /Identity-V /DescendantFonts [8 0 R] >>",
+        // Each CID's last value: 0 100; 1 900; 2 800; 3 700; 4 none (/DW 1000); 5 30; 6 40; 7 20;
+        // 8 none. Sorted by first CID, the entries overlap, and a CID past an overlap (3, 7) is
+        // still found.
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /A /DW 1000 /W [0 [100 200 300 400] 1 [900] 2 3 700 6 [10 20] 5 [30 40] 2 [800]] >>",
+        // CID 1 w1 -500, 2 -300 (given again, alone), 3 -800 (only in the first array).
+        "<< /Type /Font /Subtype /CIDFontType2 /BaseFont /B /W2 [1 [-500 0 880 -600 0 880 -800 0 880] 2 [-300 0 880]] >>",
+    }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    var pt = try r.pageText(gpa, 0);
+    defer pt.deinit();
+    try testing.expectEqual(@as(usize, 2), pt.runs.len);
+    const h = pt.runs[0];
+    for ([_]f64{ 100, 101, 110, 118, 125, 135, 135.3, 135.7, 135.9 }, h.glyphs) |x, g| try testing.expectApproxEqAbs(x, g.x, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 45.9), h.width.?, 1e-9);
+    const v = pt.runs[1];
+    for ([_]f64{ 700, 695, 692 }, v.glyphs) |y, g| try testing.expectApproxEqAbs(y, g.y, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 16), v.width.?, 1e-9);
 }
 
 test "Identity-V: glyphs move by /W2 and /DW2's w1 and Tc along y, TJ along y, with no Tz or Tw" {
