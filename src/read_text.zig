@@ -1172,9 +1172,10 @@ const Interp = struct {
         var lx: read.Lexer = .{ .src = content, .pos = 0 };
         var p: read.Parser = .{ .lx = &lx, .arena = a, .max_depth = self.r.options.max_depth };
         var operands: std.ArrayList(Object) = .empty;
-        // A word that starts like a number but is not one (`0.00-30`), among the operands of the
+        // A word that starts like a number but is not one (`1.5-30`), among the operands of the
         // next operator. Writers make these in path coordinates; the operator is skipped, unless
         // it is one this reader acts on, which then refuses the page rather than guess a value.
+        // A zero with a rounding residue's digits after it is 0 (isZeroWithResidue).
         var bad_operand = false;
         while (true) {
             lx.skipWhite();
@@ -1183,7 +1184,10 @@ const Interp = struct {
                 // The lexer reads a word from a number's first character and fails only when
                 // the word is not a number; any other refusal (a string, a dictionary) stands.
                 error.Malformed => if (start < content.len and read.isNumberStart(content[start])) {
-                    bad_operand = true;
+                    if (isZeroWithResidue(content[start..lx.pos])) {
+                        if (operands.items.len >= 1 << 16) return error.TooLarge;
+                        try operands.append(self.scratch, .{ .real = 0 });
+                    } else bad_operand = true;
                     continue;
                 } else return err,
                 else => return err,
@@ -1217,6 +1221,23 @@ const Interp = struct {
                 },
             }
         }
+    }
+
+    /// Whether `word` is a zero written with a dot, then '-' and digits only: `0.00-13322676`,
+    /// `-0.000000000000-5684342`. A writer (Google Docs, by MuPDF's bug 703248) prints a value
+    /// within rounding of zero as its fixed-point zero followed by the residue's significant
+    /// digits without their exponent: 13322676 is 6 * 2^-52 = 1.3322676e-15, 5684342 is 2^-44.
+    /// So the value is zero to within the residue. A nonzero part before the '-' (`1.5-30`)
+    /// gives no such reading and stays a bad word.
+    fn isZeroWithResidue(word: []const u8) bool {
+        const body = if (word.len > 0 and (word[0] == '-' or word[0] == '+')) word[1..] else word;
+        const dash = std.mem.indexOfScalar(u8, body, '-') orelse return false;
+        const zero = body[0..dash];
+        const residue = body[dash + 1 ..];
+        if (std.mem.count(u8, zero, ".") != 1 or zero.len < 2 or residue.len == 0) return false;
+        for (zero) |c| if (c != '0' and c != '.') return false;
+        for (residue) |c| if (!std.ascii.isDigit(c)) return false;
+        return true;
     }
 
     fn num(ops: []const Object, i: usize) Error!f64 {
@@ -2776,23 +2797,23 @@ test "the interpreter: budgets, finite results, forms keep their q/Q and BMC/EMC
     try testing.expectError(error.TooLarge, few_glyphs.pageText(gpa, 0));
 }
 
-test "a word that starts like a number and is not one skips its operator, unless the reader acts on it" {
+test "a word that starts like a number and is not one skips its operator, unless the reader acts on it; a zero with a residue after it is 0" {
     const gpa = testing.allocator;
     const pdf = try read.test_util.build(gpa, &.{
         "<< /Type /Catalog /Pages 2 0 R >>",
-        "<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R 9 0 R] /Count 4 /MediaBox [0 0 612 792] /Resources << /Font << /F1 10 0 R >> >> >>",
+        "<< /Type /Pages /Kids [3 0 R 5 0 R 7 0 R 9 0 R 12 0 R] /Count 5 /MediaBox [0 0 612 792] /Resources << /Font << /F1 10 0 R >> >> >>",
         "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
         // A path's and a colour's operators skipped; an inline image after a bad word is still
         // skipped to its EI, so its "(" is not read as a string. true, false and null are
         // operands (of sh, which is skipped), not operators.
         streamObject("",
-            \\0.00-30 5 m 10 0.00-30 l 10 20 0.00-30 5 re S 1.-2 g 3-4 BI /W 1 /H 1 /CS /G /BPC 8 ID ( EI
+            \\2.50-30 5 m 10 2.50-30 l 10 20 2.50-30 5 re S 1.-2 g 3-4 BI /W 1 /H 1 /CS /G /BPC 8 ID ( EI
             \\true false null /Sh0 sh
             \\BT /F1 10 Tf 7 8 Td (A) Tj ET
         ),
         "<< /Type /Page /Parent 2 0 R /Contents 6 0 R >>",
         // Td still has two numbers without the bad word; it is refused all the same.
-        streamObject("", "BT /F1 10 Tf 1 0.00-30 5 Td (A) Tj ET"),
+        streamObject("", "BT /F1 10 Tf 1 2.50-30 5 Td (A) Tj ET"),
         "<< /Type /Page /Parent 2 0 R /Contents 8 0 R >>",
         // Inside an array the word is part of an object, which is refused.
         streamObject("", "BT /F1 10 Tf [(A) 1-2 (B)] TJ ET"),
@@ -2800,6 +2821,10 @@ test "a word that starts like a number and is not one skips its operator, unless
         "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
         // A refusal that is not a word: a stray ")".
         streamObject("", ") 0 0 m BT /F1 10 Tf (A) Tj ET"),
+        "<< /Type /Page /Parent 2 0 R /Contents 13 0 R >>",
+        // Zeros with a residue's digits, read as 0, in cm, Tm and Td: B at (10 + 40, 20 + 0 + 5).
+        // Words close to these that are not one: the next test.
+        streamObject("", "1 0.00-13322676 -0.000000000000-5684342 1 10 20 cm BT /F1 10 Tf 1 .0-7 0. 1 40 0 Tm 0.0-1 5 Td (B) Tj ET"),
     }, "");
     defer gpa.free(pdf);
     var r = try Reader.open(gpa, pdf, .{});
@@ -2814,6 +2839,36 @@ test "a word that starts like a number and is not one skips its operator, unless
     try testing.expectError(error.Malformed, r.pageText(gpa, 1));
     try testing.expectError(error.Malformed, r.pageText(gpa, 2));
     try testing.expectError(error.Malformed, r.pageText(gpa, 3));
+    var zeros = try r.pageText(gpa, 4);
+    defer zeros.deinit();
+    try testing.expectEqual(@as(usize, 1), zeros.runs.len);
+    try testing.expectEqualStrings("B", zeros.runs[0].text);
+    try testing.expectApproxEqAbs(@as(f64, 50), zeros.runs[0].x, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 25), zeros.runs[0].y, 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 10), zeros.runs[0].size, 1e-9);
+}
+
+test "words near a zero with a residue that are not one: refused where the reader acts on them" {
+    const gpa = testing.allocator;
+    // No dot, nothing after the '-', a dot in the residue, a nonzero digit, two dots, a second
+    // '-', a bare dot: each a bad word among Td's operands.
+    const words = [_][]const u8{ "00-12", "0.00-", "0.00-1.5", "0.01-12", "0.0.0-12", "0.00-12-3", ".-12" };
+    inline for (words) |w| {
+        const pdf = try read.test_util.build(gpa, &.{
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /Resources << /Font << /F1 5 0 R >> >> >>",
+            "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+            streamObject("", "BT /F1 10 Tf 1 " ++ w ++ " Td (A) Tj ET"),
+            "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        }, "");
+        defer gpa.free(pdf);
+        var r = try Reader.open(gpa, pdf, .{});
+        defer r.deinit();
+        testing.expectError(error.Malformed, r.pageText(gpa, 0)) catch |err| {
+            std.debug.print("word {s} was not refused\n", .{w});
+            return err;
+        };
+    }
 }
 
 test "annotations: each appearance on its /Rect (12.5.5), by /AS, with Hidden, NoView, Popup and Invisible left out" {
