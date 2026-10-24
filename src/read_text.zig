@@ -1016,9 +1016,11 @@ fn loadSimple(r: *Reader, f: *Font, dict: Dict, type3: bool) Error!void {
 
     if (is_winansi) {
         for (0..256) |c| {
-            const cp = winansi.decode(@intCast(c)) orelse continue;
+            // WinAnsiEncoding's unused codes above octal 40 (0x7F, 0x81, 0x8D, 0x8F, 0x90, 0x9D)
+            // draw the glyph "bullet" (Annex D, its note 3); cp1252 leaves them undefined.
+            const cp = winansi.decode(@intCast(c)) orelse if (c > 0o40) 0x2022 else continue;
             // WinAnsiEncoding draws 0xA0 with the glyph "space" and 0xAD with "hyphen" (Annex D,
-            // its notes 6 and 7), and a glyph's name is what says its character (9.10.2): so
+            // its notes 6 and 5), and a glyph's name is what says its character (9.10.2): so
             // U+0020 and U+002D, not cp1252's U+00A0 and U+00AD.
             const char: u21 = switch (cp) {
                 0xA0 => 0x20,
@@ -2586,6 +2588,34 @@ test "a character's two UTF-16 halves mapped to two glyphs: joined on the first;
         try testing.expectEqual(w.text_at.len, run.glyphs.len);
         for (w.text_at, run.glyphs) |at, g| try testing.expectEqual(at, g.text_at);
     }
+}
+
+test "WinAnsi's unused codes above octal 40 are bullets; below it, and under /Differences, they are not" {
+    const gpa = testing.allocator;
+    const content =
+        \\BT /F1 10 Tf 100 100 Td (\177\201\215\217\220\235\037A) Tj ET
+        \\BT /F2 10 Tf 100 80 Td (\177\201) Tj ET
+    ;
+    const pdf = try read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> >>",
+        streamObject("", content),
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>",
+        "<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding << /BaseEncoding /WinAnsiEncoding /Differences [127 /A] >> >>",
+    }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    var pt = try r.pageText(gpa, 0);
+    defer pt.deinit();
+    try testing.expectEqual(@as(usize, 2), pt.runs.len);
+    // \037 is below octal 40: no glyph name, so unmapped.
+    try testing.expectEqualStrings("\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{2022}\u{fffd}A", pt.runs[0].text);
+    try testing.expectEqual(@as(u32, 1), pt.runs[0].unmapped);
+    // Helvetica's bullet is 350 wide: the sixth bullet starts at 100 + 5 * 3.5.
+    try testing.expectApproxEqAbs(@as(f64, 117.5), pt.runs[0].glyphs[5].x, 1e-9);
+    try testing.expectEqualStrings("A\u{2022}", pt.runs[1].text);
 }
 
 test "a run starts at its first glyph; no glyph, no run; U+00A0's width; no guessed encoding for an embedded font" {
