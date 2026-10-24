@@ -34,9 +34,11 @@ Per file, zpdf-read's JSON (src/zpdf-read.zig) is checked against:
 
 Where an oracle deviates from ISO 32000-1, the deviation is undone or counted, never silently
 excused; each one is in the code beside the place it applies:
-- pdfminer leaves out the character spacing after an operator's last glyph and the text rise in
-  a glyph's origin (both undone in pdfminer_pages), and has no Euro width for Helvetica (the
-  glyphs after such a gap must then be off by one constant shift, which is counted).
+- pdfminer places the character spacing before glyphs rather than after each one, leaves the text
+  rise out of a glyph's origin, and takes a font's widths from its own metrics, ignoring /Widths,
+  for the standard 14 and its aliases (all three undone in pdfminer_pages). Its metrics have no
+  Euro width for Helvetica, so for such a font with no /Widths the glyphs after the gap must be
+  off by one constant shift, which is counted.
 - pdfminer reads codes in ways that differ from ISO 32000-1, undone in pdfminer_pages: WinAnsi
   0o255 as a space and no bullet for WinAnsi's unused codes (Annex D); Symbol and ZapfDingbats
   with no base encoding by a Latin encoding instead of their built-in ones (9.6.6.1); and a
@@ -89,6 +91,7 @@ says, not what its name or folder suggests.
 import collections
 import functools
 import html
+import io
 import json
 import math
 import pathlib
@@ -171,32 +174,91 @@ def pdfminer_pages(path):
     """(pages of {"media_box", "rotate", "chars": [(text, origin matrix, advance)]}, error)."""
     # Not high_level.extract_pages: it replaces laparams=None with LAParams(), whose layout
     # analysis reorders characters. The aggregator with no laparams keeps content order.
-    from pdfminer.cmapdb import FileUnicodeMap, PyUnicodeMap
+    from pdfminer.cmapdb import CMapParser, FileCMap, FileUnicodeMap, PyUnicodeMap
     from pdfminer.converter import PDFLayoutAnalyzer, PDFPageAggregator
     from pdfminer.encodingdb import EncodingDB, name2unicode
-    from pdfminer.pdffont import PDFCIDFont, PDFSimpleFont
+    from pdfminer.pdffont import FontMetricsDB, PDFCIDFont, PDFSimpleFont, PDFType1Font
     from pdfminer.layout import LTChar
     from pdfminer.pdfdevice import PDFTextDevice
     from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
     from pdfminer.pdfpage import PDFPage
-    from pdfminer.pdftypes import resolve1
+    from pdfminer.pdftypes import PDFStream, resolve1
     from pdfminer.psparser import LIT, PSLiteral, literal_name
+    from pdfminer.utils import translate_matrix
 
-    # pdfminer adds the character spacing (Tc) before every glyph but an operator's first, so the
-    # Tc after an operator's last glyph is never added (pdfdevice.render_string_horizontal,
-    # needcharspace), and its pen falls behind by Tc at each operator until the next Td. ISO
-    # 32000-1 9.4.4 adds Tc after every glyph; mutool does, and so does zpdf. Add the missing one.
+    # pdfminer adds the character spacing (Tc) before a glyph, and only once a glyph or a TJ
+    # number has come before it in the operator (pdfdevice.render_string_horizontal and _vertical,
+    # needcharspace): an operator's first glyph gets no Tc, unless a number comes before it, and
+    # then it is moved by Tc; the Tc after the last glyph is never added. ISO 32000-1 9.4.4 adds
+    # Tc after every glyph; mutool does, and so does zpdf. Both are replaced by copies that do.
     if not hasattr(PDFTextDevice, "_zpdf_tc"):
-        horizontal = PDFTextDevice.render_string_horizontal
 
-        def with_last_tc(self, seq, matrix, pos, font, fontsize, scaling, charspace, *rest):
-            x, y = horizontal(self, seq, matrix, pos, font, fontsize, scaling, charspace, *rest)
-            if any(isinstance(o, bytes) and font.decode(o) for o in seq):
-                x += charspace
-            return (x, y)
+        def tc_after_glyph(axis):
+            def render(self, seq, matrix, pos, font, fontsize, scaling, charspace, wordspace, rise, dxscale, ncs, graphicstate):
+                p = list(pos)
+                for obj in seq:
+                    if isinstance(obj, (int, float)):
+                        p[axis] -= obj * dxscale
+                    elif isinstance(obj, bytes):
+                        for cid in font.decode(obj):
+                            p[axis] += self.render_char(translate_matrix(matrix, tuple(p)), font, fontsize, scaling, rise, cid, ncs, graphicstate)
+                            p[axis] += charspace
+                            if cid == 32 and wordspace:
+                                p[axis] += wordspace
+                return tuple(p)
 
-        PDFTextDevice.render_string_horizontal = with_last_tc
+            return render
+
+        PDFTextDevice.render_string_horizontal = tc_after_glyph(0)
+        PDFTextDevice.render_string_vertical = tc_after_glyph(1)
         PDFTextDevice._zpdf_tc = True
+
+    # pdfminer takes a simple font's widths from its own AFM data whenever it has metrics for the
+    # /BaseFont (FontMetricsDB: the standard 14 and aliases such as Arial for Helvetica), and then
+    # ignores the font's /Widths (PDFType1Font, also for TrueType). ISO 32000-1 9.6.2.1 and 9.6.3:
+    # /Widths gives the widths; mutool and zpdf use them. When the font has /Widths, pdfminer is
+    # made to read it as a font it has no metrics for, which takes /FirstChar, /Widths and the
+    # /FontDescriptor from the file.
+    if not hasattr(PDFType1Font, "_zpdf_widths"):
+        type1_init = PDFType1Font.__init__
+        get_metrics = FontMetricsDB.__dict__["get_metrics"]
+
+        def no_metrics(cls, fontname):
+            raise KeyError(fontname)
+
+        def files_widths(self, rsrcmgr, spec):
+            if "Widths" not in spec:
+                return type1_init(self, rsrcmgr, spec)
+            FontMetricsDB.get_metrics = classmethod(no_metrics)
+            try:
+                type1_init(self, rsrcmgr, spec)
+            finally:
+                FontMetricsDB.get_metrics = get_metrics
+
+        PDFType1Font.__init__ = files_widths
+        PDFType1Font._zpdf_widths = True
+
+    # pdfminer never reads a CID font's /Encoding when it is an embedded CMap stream: it looks the
+    # stream's /CMapName up among its predefined CMaps (PDFCIDFont.get_cmap_from_spec), and a
+    # name it does not have gives an empty CMap, which decodes no code at all. ISO 32000-1
+    # 9.7.5.3 allows the stream. It is read with pdfminer's own CMapParser instead, whose
+    # cidrange and cidchar calls go to add_cid2unichr(cid, code): here they fill a FileCMap.
+    if not hasattr(PDFCIDFont, "_zpdf_cmap"):
+        cmap_from_spec = PDFCIDFont.get_cmap_from_spec
+
+        def embedded_cmap(self, spec, strict):
+            enc = resolve1(spec.get("Encoding"))
+            if not isinstance(enc, PDFStream):
+                return cmap_from_spec(self, spec, strict)
+            cmap = FileCMap()
+            cmap.add_cid2unichr = lambda cid, code: cmap.add_code2cid(code.decode("latin-1"), cid) if isinstance(code, bytes) else None
+            CMapParser(cmap, io.BytesIO(enc.get_data())).run()
+            if resolve1(enc.get("WMode")) == 1:
+                cmap.set_attr("WMode", 1)
+            return cmap
+
+        PDFCIDFont.get_cmap_from_spec = embedded_cmap
+        PDFCIDFont._zpdf_cmap = True
 
     # LTChar keeps the text rise only inside its bounding box; keep it, so a glyph's origin can
     # include it as zpdf's does (ISO 32000-1 9.4.4: the origin is (0, Ts) in text space).
@@ -1093,10 +1155,9 @@ def check(path, verbose):
                     gap, shift = True, None
             k += len(r["glyphs"])
         # A glyph pdfminer places elsewhere is still right when mutool has its character at the
-        # glyph's origin: pdfminer, not zpdf, is then the one that differs (it gives some
-        # non-embedded fonts the standard 14's AFM widths instead of the file's /Widths, so its
-        # glyphs drift from mutool's and zpdf's). Like "start", it fails only when every oracle
-        # that can measure it disagrees; an ActualText glyph, or one mutool cannot measure, fails.
+        # glyph's origin: pdfminer, not zpdf, is then the one that differs. Like "start", it
+        # fails only when every oracle that can measure it disagrees; an ActualText glyph, or one
+        # mutool cannot measure, fails.
         mutool_agrees = [b for b in bad if not b[2]["actual_text"] and mutool_has(b[3], b[0], b[2])]
         bad = [b for b in bad if b[2]["actual_text"] or not mutool_has(b[3], b[0], b[2])]
         if shifted:
