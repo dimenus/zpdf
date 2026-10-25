@@ -210,6 +210,16 @@ pub const Reader = struct {
         return self.arena_state.allocator();
     }
 
+    /// The scope of the reader's own arena: objects cached, results valid until deinit.
+    pub fn documentScope(self: *Reader) Scope {
+        return .{ .r = self, .arena = self.arena_state };
+    }
+
+    /// A scope in `arena`, which the caller resets or frees: results valid until then.
+    pub fn scopeIn(self: *Reader, arena_state: *std.heap.ArenaAllocator) Scope {
+        return .{ .r = self, .arena = arena_state };
+    }
+
     /// The text page `index` draws, as runs (read_text.zig says what a run is). The result owns
     /// its memory: call its deinit. Fonts are parsed once and kept by the reader.
     pub fn pageText(self: *Reader, gpa: Allocator, index: usize) Error!PageText {
@@ -245,54 +255,12 @@ pub const Reader = struct {
 
     /// Object `num`, parsed once and cached. A free or missing object is null (7.3.10).
     pub fn object(self: *Reader, num: u32) Error!Object {
-        return self.load(num, null);
-    }
-
-    /// Object `num`. With `once` null, parsed into the reader's arena and cached (object). With an
-    /// allocator, an object not cached yet is parsed into it and not cached: for what one page
-    /// reads once (its content streams), so that reading every page does not grow the reader.
-    fn load(self: *Reader, num: u32, once: ?Allocator) Error!Object {
-        if (self.cache.get(num)) |o| return o;
-        const entry = self.xref.get(num) orelse return .null;
-        if (self.loading.contains(num)) return error.Malformed;
-        // Loading one object can load another (a /Length, an object stream): bound the chain,
-        // which a file of streams whose /Length each refers to the next would make deep.
-        if (self.loading.count() >= self.options.max_depth) return error.TooDeep;
-        try self.loading.put(self.arena(), num, {});
-        defer _ = self.loading.remove(num);
-        const a = once orelse self.arena();
-        const obj = switch (entry) {
-            .free => .null,
-            .offset => |o| try self.parseIndirectAt(a, num, o.at, o.gen),
-            .compressed => |c| try self.parseCompressed(a, num, c.stream, c.index),
-        };
-        if (once == null) try self.cache.put(self.arena(), num, obj);
-        return obj;
+        return self.documentScope().load(num);
     }
 
     /// `obj`, with a reference followed to its object (a chain of references too).
     pub fn resolve(self: *Reader, obj: Object) Error!Object {
-        return self.resolveIn(obj, null);
-    }
-
-    /// resolve, with objects loaded as `load` loads them for `once`.
-    fn resolveIn(self: *Reader, obj: Object, once: ?Allocator) Error!Object {
-        var o = obj;
-        var hops: u32 = 0;
-        while (o == .ref) : (hops += 1) {
-            if (hops >= self.options.max_depth) return error.TooDeep;
-            // A reference whose generation is not the xref entry's names an object that no
-            // longer exists: null (7.3.10). Objects in object streams have generation 0.
-            const entry = self.xref.get(o.ref.num) orelse return .null;
-            const gen: u16 = switch (entry) {
-                .free => return .null,
-                .offset => |e| e.gen,
-                .compressed => 0,
-            };
-            if (gen != o.ref.gen) return .null;
-            o = try self.load(o.ref.num, once);
-        }
-        return o;
+        return self.documentScope().resolve(obj);
     }
 
     /// dict[key], resolved; null when absent or null.
@@ -305,7 +273,7 @@ pub const Reader = struct {
     /// The decoded data of `stream`, owned by the reader: valid until deinit, never freed by
     /// the caller. For data read once and dropped, decodeStream does not grow the reader.
     pub fn streamData(self: *Reader, stream: Stream) Error![]const u8 {
-        return self.decodeInto(self.arena(), stream);
+        return self.documentScope().decode(stream);
     }
 
     /// The decoded data of `stream`, owned by the caller: free it with `allocator`. Always a
@@ -314,162 +282,7 @@ pub const Reader = struct {
     pub fn decodeStream(self: *Reader, allocator: Allocator, stream: Stream) Error![]u8 {
         var scratch: std.heap.ArenaAllocator = .init(self.arena_state.child_allocator);
         defer scratch.deinit();
-        return allocator.dupe(u8, try self.decodeInto(scratch.allocator(), stream));
-    }
-
-    /// The decoded data, in `a` or (with no filter) a slice of the file: callers pass an arena.
-    fn decodeInto(self: *Reader, a: Allocator, stream: Stream) Error![]const u8 {
-        const data = try self.decodeFilters(a, stream);
-        // Every path, unfiltered included, keeps to the limit callers rely on.
-        if (data.len > self.options.max_stream_bytes) return error.TooLarge;
-        return data;
-    }
-
-    fn decodeFilters(self: *Reader, a: Allocator, stream: Stream) Error![]const u8 {
-        const allocator = a;
-        const filter_obj = try self.getResolved(stream.dict, "Filter");
-        const params = try self.getResolved(stream.dict, "DecodeParms");
-        var data = try self.decryptStream(a, stream, filter_obj, params);
-        const filters = filter_obj orelse return data;
-        switch (filters) {
-            .name => |n| data = try self.applyFilter(allocator, n, if (params) |p| p else .null, data),
-            .array => |list| {
-                if (list.len > 16) return error.TooDeep;
-                for (list, 0..) |f, i| {
-                    const name = switch (try self.resolve(f)) {
-                        .name => |n| n,
-                        else => return error.Malformed,
-                    };
-                    // A /Crypt filter comes first (7.4.10); decryptStream has applied it.
-                    if (i > 0 and std.mem.eql(u8, name, "Crypt")) return error.Malformed;
-                    const p: Object = if (params) |ps| switch (ps) {
-                        .array => |pa| if (i < pa.len) try self.resolve(pa[i]) else .null,
-                        else => return error.Malformed,
-                    } else .null;
-                    data = try self.applyFilter(allocator, name, p, data);
-                }
-            },
-            else => return error.Malformed,
-        }
-        return data;
-    }
-
-    fn applyFilter(self: *Reader, allocator: Allocator, name: []const u8, params: Object, data: []const u8) Error![]const u8 {
-        const max = self.options.max_stream_bytes;
-        if (std.mem.eql(u8, name, "FlateDecode") or std.mem.eql(u8, name, "Fl")) {
-            const inflated = try inflate(allocator, data, max);
-            return try self.unpredict(allocator, params, inflated);
-        }
-        if (std.mem.eql(u8, name, "LZWDecode") or std.mem.eql(u8, name, "LZW")) {
-            const early_change = switch (params) {
-                .dict => |d| try self.intParam(d, "EarlyChange", 1),
-                .null => 1,
-                else => return error.Malformed,
-            };
-            if (early_change != 0 and early_change != 1) return error.Malformed;
-            const decoded = try lzw(allocator, data, early_change == 1, max);
-            return try self.unpredict(allocator, params, decoded);
-        }
-        if (std.mem.eql(u8, name, "ASCIIHexDecode") or std.mem.eql(u8, name, "AHx")) return asciiHex(allocator, data, max);
-        if (std.mem.eql(u8, name, "ASCII85Decode") or std.mem.eql(u8, name, "A85")) return ascii85(allocator, data, max);
-        if (std.mem.eql(u8, name, "Crypt")) return data;
-        return error.UnsupportedFilter;
-    }
-
-    /// The stream's data decrypted (7.6.2), into `a`, or its raw bytes when the file is not
-    /// encrypted or the stream is not: a cross-reference stream, a /Metadata stream when
-    /// /EncryptMetadata is false, or one whose /Crypt filter is /Identity (7.4.10). A /Crypt
-    /// filter names its crypt filter in its /DecodeParms /Name: /Identity when absent, or /StdCF.
-    fn decryptStream(self: *Reader, a: Allocator, stream: Stream, filters: ?Object, params: ?Object) Error![]const u8 {
-        const h = self.crypt orelse return stream.raw;
-        if (nameIs(stream.dict.get("Type"), "XRef")) return stream.raw;
-        if (!h.encrypt_metadata and nameIs(stream.dict.get("Type"), "Metadata")) return stream.raw;
-        var method = h.stream_method;
-        const first: ?Object = if (filters) |f| switch (f) {
-            .name => f,
-            .array => |list| if (list.len > 0) try self.resolve(list[0]) else null,
-            else => null,
-        } else null;
-        if (first != null and nameIs(first, "Crypt")) {
-            const p: ?Object = if (params) |ps| switch (ps) {
-                .array => |pa| if (pa.len > 0) try self.resolve(pa[0]) else null,
-                else => ps,
-            } else null;
-            const name: Object = if (p) |pd| switch (pd) {
-                .dict => |d| (try self.getResolved(d, "Name")) orelse .{ .name = "Identity" },
-                .null => .{ .name = "Identity" },
-                else => return error.Malformed,
-            } else .{ .name = "Identity" };
-            if (nameIs(name, "Identity")) {
-                method = .none;
-            } else if (nameIs(name, "StdCF")) {
-                method = h.std_cf_method;
-            } else return error.UnsupportedEncryption;
-        }
-        return h.decrypt(a, method, stream.ref.num, stream.ref.gen, stream.raw);
-    }
-
-    /// FlateDecode's and LZWDecode's /Predictor (7.4.4.4): 1 none, 2 TIFF, 10 to 15 PNG (each row says its own).
-    fn unpredict(self: *Reader, allocator: Allocator, params: Object, data: []const u8) Error![]const u8 {
-        const p = switch (params) {
-            .dict => |d| d,
-            .null => return data,
-            else => return error.Malformed,
-        };
-        const predictor = try self.intParam(p, "Predictor", 1);
-        if (predictor == 1) return data;
-        const colors = try self.intParam(p, "Colors", 1);
-        const bpc = try self.intParam(p, "BitsPerComponent", 8);
-        const columns = try self.intParam(p, "Columns", 1);
-        if (colors < 1 or colors > 32 or columns < 1 or columns > 1 << 20) return error.Malformed;
-        if (bpc != 1 and bpc != 2 and bpc != 4 and bpc != 8 and bpc != 16) return error.Malformed;
-        const bits_per_pixel: usize = @intCast(colors * bpc);
-        const row_len: usize = (bits_per_pixel * @as(usize, @intCast(columns)) + 7) / 8;
-        // Bytes per complete pixel, rounded up: 3 colours of 4 bits are 2 bytes (PNG's rule).
-        const bpp: usize = (bits_per_pixel + 7) / 8;
-        if (predictor == 2) {
-            // TIFF predictor 2, for 8-bit components only: each byte adds the one `bpp` before it.
-            if (bpc != 8) return error.UnsupportedFilter;
-            if (data.len % row_len != 0) return error.Malformed;
-            const out = try allocator.dupe(u8, data);
-            var row: usize = 0;
-            while (row + row_len <= out.len) : (row += row_len) {
-                for (bpp..row_len) |i| out[row + i] +%= out[row + i - bpp];
-            }
-            return out;
-        }
-        if (predictor < 10 or predictor > 15) return error.Malformed;
-        // PNG: each row is one filter-type byte, then row_len bytes. A short row is refused.
-        if (data.len % (row_len + 1) != 0) return error.Malformed;
-        var out: std.ArrayList(u8) = .empty;
-        try out.ensureTotalCapacity(allocator, data.len);
-        var prev = try allocator.alloc(u8, row_len);
-        @memset(prev, 0);
-        var at: usize = 0;
-        while (at < data.len) {
-            const kind = data[at];
-            at += 1;
-            const n = @min(row_len, data.len - at);
-            const row = data[at .. at + n];
-            at += n;
-            const start = out.items.len;
-            for (row, 0..) |b, i| {
-                const left: u8 = if (i >= bpp) out.items[start + i - bpp] else 0;
-                const up = prev[i];
-                const up_left: u8 = if (i >= bpp) prev[i - bpp] else 0;
-                const v: u8 = switch (kind) {
-                    0 => b,
-                    1 => b +% left,
-                    2 => b +% up,
-                    3 => b +% @as(u8, @intCast((@as(u16, left) + up) / 2)),
-                    4 => b +% paeth(left, up, up_left),
-                    else => return error.Malformed,
-                };
-                out.appendAssumeCapacity(v);
-            }
-            @memcpy(prev[0..n], out.items[start..][0..n]);
-        }
-        return out.items;
+        return allocator.dupe(u8, try self.scopeIn(&scratch).decode(stream));
     }
 
     fn intParam(self: *Reader, d: Dict, key: []const u8, default: i64) Error!i64 {
@@ -663,14 +476,14 @@ pub const Reader = struct {
     /// to apply after the section's /XRefStm.
     fn readXrefSection(self: *Reader, at: usize, frees: *std.ArrayList(u32)) Error!Dict {
         var lx: Lexer = .{ .src = self.bytes, .pos = at };
-        const first = try lx.next(self.arena());
+        const first = try lx.next(self.arena_state);
         if (first == .keyword and std.mem.eql(u8, first.keyword, "xref")) return self.readXrefTable(&lx, frees);
         // Otherwise a cross-reference stream: "n g obj << ... >> stream".
         lx.pos = at;
-        const head = try parseIndirectHead(&lx, self.arena());
-        var p: Parser = .{ .lx = &lx, .arena = self.arena(), .max_depth = self.options.max_depth };
+        const head = try parseIndirectHead(&lx, self.arena_state);
+        var p: Parser = .{ .lx = &lx, .arena = self.arena_state, .max_depth = self.options.max_depth };
         const value = try p.parseValue(0);
-        const stream = try self.finishObject(self.arena(), &lx, value, head);
+        const stream = try self.documentScope().finishObject(&lx, value, head);
         const s = switch (stream) {
             .stream => |s| s,
             else => return error.Malformed,
@@ -682,18 +495,18 @@ pub const Reader = struct {
 
     fn readXrefTable(self: *Reader, lx: *Lexer, frees: *std.ArrayList(u32)) Error!Dict {
         while (true) {
-            const t = try lx.next(self.arena());
+            const t = try lx.next(self.arena_state);
             switch (t) {
                 .keyword => |k| {
                     if (!std.mem.eql(u8, k, "trailer")) return error.Malformed;
-                    var p: Parser = .{ .lx = lx, .arena = self.arena(), .max_depth = self.options.max_depth };
+                    var p: Parser = .{ .lx = lx, .arena = self.arena_state, .max_depth = self.options.max_depth };
                     return switch (try p.parseValue(0)) {
                         .dict => |d| d,
                         else => error.Malformed,
                     };
                 },
                 .integer => |start| {
-                    const count = switch (try lx.next(self.arena())) {
+                    const count = switch (try lx.next(self.arena_state)) {
                         .integer => |c| c,
                         else => return error.Malformed,
                     };
@@ -702,9 +515,9 @@ pub const Reader = struct {
                     if (@as(u64, @intCast(count)) * 18 > self.bytes.len - lx.pos) return error.Malformed;
                     var i: i64 = 0;
                     while (i < count) : (i += 1) {
-                        const off = try lx.next(self.arena());
-                        const gen = try lx.next(self.arena());
-                        const kind = try lx.next(self.arena());
+                        const off = try lx.next(self.arena_state);
+                        const gen = try lx.next(self.arena_state);
+                        const kind = try lx.next(self.arena_state);
                         if (off != .integer or gen != .integer or kind != .keyword) return error.Malformed;
                         const num: u32 = @intCast(start + i);
                         if (std.mem.eql(u8, kind.keyword, "n")) {
@@ -755,7 +568,7 @@ pub const Reader = struct {
         } else &default_index;
         if (index.len % 2 != 0) return error.Malformed;
         // The xref stream's own filters are direct objects: nothing to resolve yet.
-        const data = try self.decodeInto(self.arena(), s);
+        const data = try self.streamData(s);
         const entry_len = widths[0] + widths[1] + widths[2];
         if (entry_len == 0) return error.Malformed;
         var at: usize = 0;
@@ -805,106 +618,6 @@ pub const Reader = struct {
 
     // ---- objects ----
 
-    fn parseIndirectAt(self: *Reader, a: Allocator, num: u32, at: usize, gen: u16) Error!Object {
-        var lx: Lexer = .{ .src = self.bytes, .pos = at };
-        const head = try parseIndirectHead(&lx, a);
-        if (head.num != num or head.gen != gen) return error.Malformed;
-        var p: Parser = .{ .lx = &lx, .arena = a, .max_depth = self.options.max_depth };
-        const value = try p.parseValue(0);
-        const obj = try self.finishObject(a, &lx, value, head);
-        const h = self.crypt orelse return obj;
-        if (self.encrypt_num == num) return obj;
-        return self.decryptStrings(a, &h, obj, head);
-    }
-
-    /// `obj` with every string in it decrypted (7.6.2), into `a`; a stream's dictionary too, not
-    /// its data (decodeFilters does that). A signature's /Contents is not encrypted (7.6.2).
-    fn decryptStrings(self: *Reader, a: Allocator, h: *const crypt.Handler, obj: Object, ref: Ref) Error!Object {
-        switch (obj) {
-            .string => |s| return .{ .string = try h.decryptString(a, ref.num, ref.gen, s) },
-            .array => |items| {
-                const out = try a.alloc(Object, items.len);
-                for (out, items) |*o, item| o.* = try self.decryptStrings(a, h, item, ref);
-                return .{ .array = out };
-            },
-            .dict => |d| return .{ .dict = try self.decryptDict(a, h, d, ref) },
-            .stream => |st| return .{ .stream = .{ .dict = try self.decryptDict(a, h, st.dict, ref), .raw = st.raw, .ref = st.ref } },
-            else => return obj,
-        }
-    }
-
-    fn decryptDict(self: *Reader, a: Allocator, h: *const crypt.Handler, d: Dict, ref: Ref) Error!Dict {
-        // As MuPDF tells a signature: /Type /Sig with /Contents, /ByteRange and /Filter.
-        const signature = nameIs(d.get("Type"), "Sig") and d.get("Contents") != null and
-            d.get("ByteRange") != null and d.get("Filter") != null;
-        const out = try a.alloc(Dict.Entry, d.entries.len);
-        for (out, d.entries) |*o, e| {
-            o.* = .{ .key = e.key, .value = if (signature and std.mem.eql(u8, e.key, "Contents")) e.value else try self.decryptStrings(a, h, e.value, ref) };
-        }
-        return .{ .entries = out };
-    }
-
-    /// After an indirect object's value: its stream, when `stream` follows a dictionary, then
-    /// `endobj`, which must be there (7.3.10): without it, a value can run into the next object.
-    fn finishObject(self: *Reader, a: Allocator, lx: *Lexer, value: Object, ref: Ref) Error!Object {
-        const obj = try self.finishStream(a, lx, value, ref);
-        const end = try lx.next(a);
-        if (!(end == .keyword and std.mem.eql(u8, end.keyword, "endobj"))) return error.Malformed;
-        return obj;
-    }
-
-    /// `stream ... endstream` when it follows a dictionary.
-    fn finishStream(self: *Reader, a: Allocator, lx: *Lexer, value: Object, ref: Ref) Error!Object {
-        const dict = switch (value) {
-            .dict => |d| d,
-            else => return value,
-        };
-        const save = lx.pos;
-        const t = try lx.next(a);
-        if (!(t == .keyword and std.mem.eql(u8, t.keyword, "stream"))) {
-            lx.pos = save;
-            return value;
-        }
-        // The keyword is followed by CRLF or LF (7.3.8.1); a lone CR is accepted too, nothing
-        // else is.
-        var start = lx.pos;
-        const eol_at = start;
-        if (start < self.bytes.len and self.bytes[start] == '\r') start += 1;
-        if (start < self.bytes.len and self.bytes[start] == '\n') start += 1;
-        if (start == eol_at) return error.Malformed;
-        const length = switch (try self.resolve(dict.get("Length") orelse return error.Malformed)) {
-            .integer => |n| n,
-            else => return error.Malformed,
-        };
-        if (length < 0 or length > self.bytes.len - start) return error.Malformed;
-        const end = start + @as(usize, @intCast(length));
-        // After the data: white space (an end-of-line, 7.3.8.1), then `endstream` itself. Not a
-        // comment and not anything else: a /Length that falls short must not still find it.
-        var at = end;
-        while (at < self.bytes.len and isWhite(self.bytes[at])) at += 1;
-        const keyword = "endstream";
-        if (!std.mem.startsWith(u8, self.bytes[at..], keyword)) return error.Malformed;
-        at += keyword.len;
-        if (at < self.bytes.len and !isWhite(self.bytes[at]) and !isDelimiter(self.bytes[at])) return error.Malformed;
-        lx.pos = at;
-        return .{ .stream = .{ .dict = dict, .raw = self.bytes[start..end], .ref = ref } };
-    }
-
-    fn parseCompressed(self: *Reader, a: Allocator, num: u32, stream_num: u32, index: u32) Error!Object {
-        const os = try self.objectStream(stream_num);
-        if (index >= os.offsets.len / 2) return error.Malformed;
-        if (os.offsets[index * 2] != num) return error.Malformed;
-        const off = os.offsets[index * 2 + 1];
-        if (off >= os.data.len) return error.Malformed;
-        var lx: Lexer = .{ .src = os.data[0..os.ends[index]], .pos = off };
-        var p: Parser = .{ .lx = &lx, .arena = a, .max_depth = self.options.max_depth };
-        // An object in an object stream is never a stream itself (7.5.7), and is all its extent
-        // holds: anything after the value is refused.
-        const value = try p.parseValue(0);
-        if (try lx.next(a) != .eof) return error.Malformed;
-        return value;
-    }
-
     fn objectStream(self: *Reader, num: u32) Error!ObjectStream {
         if (self.object_streams.get(num)) |os| return os;
         // An object stream must be an uncompressed object: one inside another is refused.
@@ -923,7 +636,7 @@ pub const Reader = struct {
             .integer => |v| v,
             else => return error.Malformed,
         };
-        const data = try self.decodeInto(self.arena(), s);
+        const data = try self.streamData(s);
         if (n < 0 or first < 0 or first > data.len or n > data.len) return error.Malformed;
         // Each header pair is at least "1 0" plus a separator: a count the header cannot hold is
         // refused before allocating for it.
@@ -931,8 +644,8 @@ pub const Reader = struct {
         const offsets = try self.arena().alloc(u32, @intCast(n * 2));
         var lx: Lexer = .{ .src = data[0..@intCast(first)], .pos = 0 };
         for (0..@intCast(n)) |i| {
-            const obj_num = try lx.next(self.arena());
-            const rel = try lx.next(self.arena());
+            const obj_num = try lx.next(self.arena_state);
+            const rel = try lx.next(self.arena_state);
             if (obj_num != .integer or rel != .integer) return error.Malformed;
             if (obj_num.integer < 0 or obj_num.integer > std.math.maxInt(u32)) return error.Malformed;
             if (rel.integer < 0 or rel.integer > data.len - @as(usize, @intCast(first))) return error.Malformed;
@@ -1008,39 +721,12 @@ pub const Reader = struct {
         });
     }
 
-    /// The page's content: its /Contents streams decoded and joined with a newline (a content
-    /// stream may be split anywhere between tokens, 7.8.2). Owned by the caller: free it with
-    /// `allocator`. null when the page has no /Contents (a blank page).
+    /// Scope.pageContents, owned by the caller: free it with `allocator`.
     pub fn pageContents(self: *Reader, allocator: Allocator, p: Page) Error!?[]u8 {
         var scratch: std.heap.ArenaAllocator = .init(self.arena_state.child_allocator);
         defer scratch.deinit();
-        const content = (try self.pageContentsIn(scratch.allocator(), p)) orelse return null;
+        const content = (try self.scopeIn(&scratch).pageContents(p)) orelse return null;
         return try allocator.dupe(u8, content);
-    }
-
-    /// pageContents, parsed, decoded and returned in the arena `a`; it may be a slice of the
-    /// file. The content streams are read once, for this page: parsed into `a` and not cached, so
-    /// reading every page does not grow the reader. read_text passes the reader's work arena,
-    /// which keeps its memory for the next page.
-    pub fn pageContentsIn(self: *Reader, a: Allocator, p: Page) Error!?[]const u8 {
-        const contents = try self.resolveIn(p.dict.get("Contents") orelse return null, a);
-        switch (contents) {
-            .null => return null,
-            .stream => |s| return try self.decodeInto(a, s),
-            .array => |parts| {
-                var out: std.ArrayList(u8) = .empty;
-                for (parts) |part| {
-                    const s = switch (try self.resolveIn(part, a)) {
-                        .stream => |s| s,
-                        else => return error.Malformed,
-                    };
-                    try out.appendSlice(a, try self.decodeInto(a, s));
-                    try out.append(a, '\n');
-                }
-                return out.items;
-            },
-            else => return error.Malformed,
-        }
     }
 
     /// A rectangle (7.9.5): four finite numbers, normalized so x0 <= x1 and y0 <= y1.
@@ -1056,6 +742,351 @@ pub const Reader = struct {
             if (!std.math.isFinite(r[i])) return error.Malformed;
         }
         return .{ @min(r[0], r[2]), @min(r[1], r[3]), @max(r[0], r[2]), @max(r[1], r[3]) };
+    }
+};
+
+/// Where the reader parses, decodes and decrypts into, and so how long what it returns lives.
+///
+/// What a Scope method returns is in `arena`, or is a slice of the file's bytes: valid while both
+/// the arena and the file are, and never freed by the caller. Two kinds:
+/// - Reader.documentScope, the reader's own arena: each object is parsed once and cached, and
+///   results are valid until Reader.deinit.
+/// - Reader.scopeIn, an arena the caller resets or frees: an object not cached yet is parsed for
+///   this use only and not cached, so what one page reads once (its content streams) does not
+///   grow the reader. What such an object refers to (a /Length, a /Filter, an object stream) is
+///   still loaded through the document scope.
+pub const Scope = struct {
+    r: *Reader,
+    arena: *std.heap.ArenaAllocator,
+
+    /// Only the reader's own arena may fill its cache: any other one is reset while the cache
+    /// would still hold what it parsed.
+    fn caches(s: Scope) bool {
+        return s.arena == s.r.arena_state;
+    }
+
+    fn allocator(s: Scope) Allocator {
+        return s.arena.allocator();
+    }
+
+    /// Object `num`; a free or missing object is null (7.3.10).
+    pub fn load(s: Scope, num: u32) Error!Object {
+        const r = s.r;
+        if (r.cache.get(num)) |o| return o;
+        const entry = r.xref.get(num) orelse return .null;
+        if (r.loading.contains(num)) return error.Malformed;
+        // Loading one object can load another (a /Length, an object stream): bound the chain,
+        // which a file of streams whose /Length each refers to the next would make deep.
+        if (r.loading.count() >= r.options.max_depth) return error.TooDeep;
+        try r.loading.put(r.arena(), num, {});
+        defer _ = r.loading.remove(num);
+        const obj = switch (entry) {
+            .free => .null,
+            .offset => |o| try s.parseIndirectAt(num, o.at, o.gen),
+            .compressed => |c| try s.parseCompressed(num, c.stream, c.index),
+        };
+        if (s.caches()) try r.cache.put(r.arena(), num, obj);
+        return obj;
+    }
+
+    /// `obj`, with a reference followed to its object (a chain of references too).
+    pub fn resolve(s: Scope, obj: Object) Error!Object {
+        var o = obj;
+        var hops: u32 = 0;
+        while (o == .ref) : (hops += 1) {
+            if (hops >= s.r.options.max_depth) return error.TooDeep;
+            // A reference whose generation is not the xref entry's names an object that no
+            // longer exists: null (7.3.10). Objects in object streams have generation 0.
+            const entry = s.r.xref.get(o.ref.num) orelse return .null;
+            const gen: u16 = switch (entry) {
+                .free => return .null,
+                .offset => |e| e.gen,
+                .compressed => 0,
+            };
+            if (gen != o.ref.gen) return .null;
+            o = try s.load(o.ref.num);
+        }
+        return o;
+    }
+
+    /// The page's content: its /Contents streams decoded and joined with a newline (a content
+    /// stream may be split anywhere between tokens, 7.8.2). null when the page has no /Contents
+    /// (a blank page).
+    pub fn pageContents(s: Scope, p: Page) Error!?[]const u8 {
+        const contents = try s.resolve(p.dict.get("Contents") orelse return null);
+        switch (contents) {
+            .null => return null,
+            .stream => |st| return try s.decode(st),
+            .array => |parts| {
+                var out: std.ArrayList(u8) = .empty;
+                for (parts) |part| {
+                    const st = switch (try s.resolve(part)) {
+                        .stream => |st| st,
+                        else => return error.Malformed,
+                    };
+                    try out.appendSlice(s.allocator(), try s.decode(st));
+                    try out.append(s.allocator(), '\n');
+                }
+                return out.items;
+            },
+            else => return error.Malformed,
+        }
+    }
+
+    /// The decoded data of `stream`.
+    pub fn decode(s: Scope, stream: Stream) Error![]const u8 {
+        const data = try s.decodeFilters(stream);
+        // Every path, unfiltered included, keeps to the limit callers rely on.
+        if (data.len > s.r.options.max_stream_bytes) return error.TooLarge;
+        return data;
+    }
+
+    fn decodeFilters(s: Scope, stream: Stream) Error![]const u8 {
+        const filter_obj = try s.r.getResolved(stream.dict, "Filter");
+        const params = try s.r.getResolved(stream.dict, "DecodeParms");
+        var data = try s.decryptStream(stream, filter_obj, params);
+        const filters = filter_obj orelse return data;
+        switch (filters) {
+            .name => |n| data = try s.applyFilter(n, if (params) |p| p else .null, data),
+            .array => |list| {
+                if (list.len > 16) return error.TooDeep;
+                for (list, 0..) |f, i| {
+                    const name = switch (try s.r.resolve(f)) {
+                        .name => |n| n,
+                        else => return error.Malformed,
+                    };
+                    // A /Crypt filter comes first (7.4.10); decryptStream has applied it.
+                    if (i > 0 and std.mem.eql(u8, name, "Crypt")) return error.Malformed;
+                    const p: Object = if (params) |ps| switch (ps) {
+                        .array => |pa| if (i < pa.len) try s.r.resolve(pa[i]) else .null,
+                        else => return error.Malformed,
+                    } else .null;
+                    data = try s.applyFilter(name, p, data);
+                }
+            },
+            else => return error.Malformed,
+        }
+        return data;
+    }
+
+    fn applyFilter(s: Scope, name: []const u8, params: Object, data: []const u8) Error![]const u8 {
+        const a = s.allocator();
+        const max = s.r.options.max_stream_bytes;
+        if (std.mem.eql(u8, name, "FlateDecode") or std.mem.eql(u8, name, "Fl")) {
+            const inflated = try inflate(a, data, max);
+            return try s.unpredict(params, inflated);
+        }
+        if (std.mem.eql(u8, name, "LZWDecode") or std.mem.eql(u8, name, "LZW")) {
+            const early_change = switch (params) {
+                .dict => |d| try s.r.intParam(d, "EarlyChange", 1),
+                .null => 1,
+                else => return error.Malformed,
+            };
+            if (early_change != 0 and early_change != 1) return error.Malformed;
+            const decoded = try lzw(a, data, early_change == 1, max);
+            return try s.unpredict(params, decoded);
+        }
+        if (std.mem.eql(u8, name, "ASCIIHexDecode") or std.mem.eql(u8, name, "AHx")) return asciiHex(a, data, max);
+        if (std.mem.eql(u8, name, "ASCII85Decode") or std.mem.eql(u8, name, "A85")) return ascii85(a, data, max);
+        if (std.mem.eql(u8, name, "Crypt")) return data;
+        return error.UnsupportedFilter;
+    }
+
+    /// The stream's data decrypted (7.6.2), or its raw bytes when the file is not
+    /// encrypted or the stream is not: a cross-reference stream, a /Metadata stream when
+    /// /EncryptMetadata is false, or one whose /Crypt filter is /Identity (7.4.10). A /Crypt
+    /// filter names its crypt filter in its /DecodeParms /Name: /Identity when absent, or /StdCF.
+    fn decryptStream(s: Scope, stream: Stream, filters: ?Object, params: ?Object) Error![]const u8 {
+        const h = s.r.crypt orelse return stream.raw;
+        if (nameIs(stream.dict.get("Type"), "XRef")) return stream.raw;
+        if (!h.encrypt_metadata and nameIs(stream.dict.get("Type"), "Metadata")) return stream.raw;
+        var method = h.stream_method;
+        const first: ?Object = if (filters) |f| switch (f) {
+            .name => f,
+            .array => |list| if (list.len > 0) try s.r.resolve(list[0]) else null,
+            else => null,
+        } else null;
+        if (first != null and nameIs(first, "Crypt")) {
+            const p: ?Object = if (params) |ps| switch (ps) {
+                .array => |pa| if (pa.len > 0) try s.r.resolve(pa[0]) else null,
+                else => ps,
+            } else null;
+            const name: Object = if (p) |pd| switch (pd) {
+                .dict => |d| (try s.r.getResolved(d, "Name")) orelse .{ .name = "Identity" },
+                .null => .{ .name = "Identity" },
+                else => return error.Malformed,
+            } else .{ .name = "Identity" };
+            if (nameIs(name, "Identity")) {
+                method = .none;
+            } else if (nameIs(name, "StdCF")) {
+                method = h.std_cf_method;
+            } else return error.UnsupportedEncryption;
+        }
+        return h.decrypt(s.arena, method, stream.ref.num, stream.ref.gen, stream.raw);
+    }
+
+    /// FlateDecode's and LZWDecode's /Predictor (7.4.4.4): 1 none, 2 TIFF, 10 to 15 PNG (each row says its own).
+    fn unpredict(s: Scope, params: Object, data: []const u8) Error![]const u8 {
+        const a = s.allocator();
+        const p = switch (params) {
+            .dict => |d| d,
+            .null => return data,
+            else => return error.Malformed,
+        };
+        const predictor = try s.r.intParam(p, "Predictor", 1);
+        if (predictor == 1) return data;
+        const colors = try s.r.intParam(p, "Colors", 1);
+        const bpc = try s.r.intParam(p, "BitsPerComponent", 8);
+        const columns = try s.r.intParam(p, "Columns", 1);
+        if (colors < 1 or colors > 32 or columns < 1 or columns > 1 << 20) return error.Malformed;
+        if (bpc != 1 and bpc != 2 and bpc != 4 and bpc != 8 and bpc != 16) return error.Malformed;
+        const bits_per_pixel: usize = @intCast(colors * bpc);
+        const row_len: usize = (bits_per_pixel * @as(usize, @intCast(columns)) + 7) / 8;
+        // Bytes per complete pixel, rounded up: 3 colours of 4 bits are 2 bytes (PNG's rule).
+        const bpp: usize = (bits_per_pixel + 7) / 8;
+        if (predictor == 2) {
+            // TIFF predictor 2, for 8-bit components only: each byte adds the one `bpp` before it.
+            if (bpc != 8) return error.UnsupportedFilter;
+            if (data.len % row_len != 0) return error.Malformed;
+            const out = try a.dupe(u8, data);
+            var row: usize = 0;
+            while (row + row_len <= out.len) : (row += row_len) {
+                for (bpp..row_len) |i| out[row + i] +%= out[row + i - bpp];
+            }
+            return out;
+        }
+        if (predictor < 10 or predictor > 15) return error.Malformed;
+        // PNG: each row is one filter-type byte, then row_len bytes. A short row is refused.
+        if (data.len % (row_len + 1) != 0) return error.Malformed;
+        var out: std.ArrayList(u8) = .empty;
+        try out.ensureTotalCapacity(a, data.len);
+        var prev = try a.alloc(u8, row_len);
+        @memset(prev, 0);
+        var at: usize = 0;
+        while (at < data.len) {
+            const kind = data[at];
+            at += 1;
+            const n = @min(row_len, data.len - at);
+            const row = data[at .. at + n];
+            at += n;
+            const start = out.items.len;
+            for (row, 0..) |b, i| {
+                const left: u8 = if (i >= bpp) out.items[start + i - bpp] else 0;
+                const up = prev[i];
+                const up_left: u8 = if (i >= bpp) prev[i - bpp] else 0;
+                const v: u8 = switch (kind) {
+                    0 => b,
+                    1 => b +% left,
+                    2 => b +% up,
+                    3 => b +% @as(u8, @intCast((@as(u16, left) + up) / 2)),
+                    4 => b +% paeth(left, up, up_left),
+                    else => return error.Malformed,
+                };
+                out.appendAssumeCapacity(v);
+            }
+            @memcpy(prev[0..n], out.items[start..][0..n]);
+        }
+        return out.items;
+    }
+
+    fn parseIndirectAt(s: Scope, num: u32, at: usize, gen: u16) Error!Object {
+        var lx: Lexer = .{ .src = s.r.bytes, .pos = at };
+        const head = try parseIndirectHead(&lx, s.arena);
+        if (head.num != num or head.gen != gen) return error.Malformed;
+        var p: Parser = .{ .lx = &lx, .arena = s.arena, .max_depth = s.r.options.max_depth };
+        const value = try p.parseValue(0);
+        const obj = try s.finishObject(&lx, value, head);
+        const h = s.r.crypt orelse return obj;
+        if (s.r.encrypt_num == num) return obj;
+        return s.decryptStrings(&h, obj, head);
+    }
+
+    /// `obj` with every string in it decrypted (7.6.2); a stream's dictionary too, not
+    /// its data (decodeFilters does that). A signature's /Contents is not encrypted (7.6.2).
+    fn decryptStrings(s: Scope, h: *const crypt.Handler, obj: Object, ref: Ref) Error!Object {
+        switch (obj) {
+            .string => |str| return .{ .string = try h.decryptString(s.arena, ref.num, ref.gen, str) },
+            .array => |items| {
+                const out = try s.allocator().alloc(Object, items.len);
+                for (out, items) |*o, item| o.* = try s.decryptStrings(h, item, ref);
+                return .{ .array = out };
+            },
+            .dict => |d| return .{ .dict = try s.decryptDict(h, d, ref) },
+            .stream => |st| return .{ .stream = .{ .dict = try s.decryptDict(h, st.dict, ref), .raw = st.raw, .ref = st.ref } },
+            else => return obj,
+        }
+    }
+
+    fn decryptDict(s: Scope, h: *const crypt.Handler, d: Dict, ref: Ref) Error!Dict {
+        // As MuPDF tells a signature: /Type /Sig with /Contents, /ByteRange and /Filter.
+        const signature = nameIs(d.get("Type"), "Sig") and d.get("Contents") != null and
+            d.get("ByteRange") != null and d.get("Filter") != null;
+        const out = try s.allocator().alloc(Dict.Entry, d.entries.len);
+        for (out, d.entries) |*o, e| {
+            o.* = .{ .key = e.key, .value = if (signature and std.mem.eql(u8, e.key, "Contents")) e.value else try s.decryptStrings(h, e.value, ref) };
+        }
+        return .{ .entries = out };
+    }
+
+    /// After an indirect object's value: its stream, when `stream` follows a dictionary, then
+    /// `endobj`, which must be there (7.3.10): without it, a value can run into the next object.
+    fn finishObject(s: Scope, lx: *Lexer, value: Object, ref: Ref) Error!Object {
+        const obj = try s.finishStream(lx, value, ref);
+        const end = try lx.next(s.arena);
+        if (!(end == .keyword and std.mem.eql(u8, end.keyword, "endobj"))) return error.Malformed;
+        return obj;
+    }
+
+    /// `stream ... endstream` when it follows a dictionary.
+    fn finishStream(s: Scope, lx: *Lexer, value: Object, ref: Ref) Error!Object {
+        const dict = switch (value) {
+            .dict => |d| d,
+            else => return value,
+        };
+        const save = lx.pos;
+        const t = try lx.next(s.arena);
+        if (!(t == .keyword and std.mem.eql(u8, t.keyword, "stream"))) {
+            lx.pos = save;
+            return value;
+        }
+        // The keyword is followed by CRLF or LF (7.3.8.1); a lone CR is accepted too, nothing
+        // else is.
+        var start = lx.pos;
+        const eol_at = start;
+        if (start < s.r.bytes.len and s.r.bytes[start] == '\r') start += 1;
+        if (start < s.r.bytes.len and s.r.bytes[start] == '\n') start += 1;
+        if (start == eol_at) return error.Malformed;
+        const length = switch (try s.r.resolve(dict.get("Length") orelse return error.Malformed)) {
+            .integer => |n| n,
+            else => return error.Malformed,
+        };
+        if (length < 0 or length > s.r.bytes.len - start) return error.Malformed;
+        const end = start + @as(usize, @intCast(length));
+        // After the data: white space (an end-of-line, 7.3.8.1), then `endstream` itself. Not a
+        // comment and not anything else: a /Length that falls short must not still find it.
+        var at = end;
+        while (at < s.r.bytes.len and isWhite(s.r.bytes[at])) at += 1;
+        const keyword = "endstream";
+        if (!std.mem.startsWith(u8, s.r.bytes[at..], keyword)) return error.Malformed;
+        at += keyword.len;
+        if (at < s.r.bytes.len and !isWhite(s.r.bytes[at]) and !isDelimiter(s.r.bytes[at])) return error.Malformed;
+        lx.pos = at;
+        return .{ .stream = .{ .dict = dict, .raw = s.r.bytes[start..end], .ref = ref } };
+    }
+
+    fn parseCompressed(s: Scope, num: u32, stream_num: u32, index: u32) Error!Object {
+        const os = try s.r.objectStream(stream_num);
+        if (index >= os.offsets.len / 2) return error.Malformed;
+        if (os.offsets[index * 2] != num) return error.Malformed;
+        const off = os.offsets[index * 2 + 1];
+        if (off >= os.data.len) return error.Malformed;
+        var lx: Lexer = .{ .src = os.data[0..os.ends[index]], .pos = off };
+        var p: Parser = .{ .lx = &lx, .arena = s.arena, .max_depth = s.r.options.max_depth };
+        // An object in an object stream is never a stream itself (7.5.7), and is all its extent
+        // holds: anything after the value is refused.
+        const value = try p.parseValue(0);
+        if (try lx.next(s.arena) != .eof) return error.Malformed;
+        return value;
     }
 };
 
@@ -1081,13 +1112,14 @@ fn findStartXref(bytes: []const u8) Error!usize {
     var lx: Lexer = .{ .src = bytes, .pos = tail_start + at + "startxref".len };
     var scratch: [64]u8 = undefined;
     var fba: std.heap.FixedBufferAllocator = .init(&scratch);
-    const t = lx.next(fba.allocator()) catch return error.Malformed;
+    var arena_state: std.heap.ArenaAllocator = .init(fba.allocator());
+    const t = lx.next(&arena_state) catch return error.Malformed;
     if (t != .integer or t.integer < 0 or t.integer >= bytes.len) return error.Malformed;
     return @intCast(t.integer);
 }
 
 /// "n g obj" at the lexer's position.
-fn parseIndirectHead(lx: *Lexer, a: Allocator) Error!Ref {
+fn parseIndirectHead(lx: *Lexer, a: *std.heap.ArenaAllocator) Error!Ref {
     const n = try lx.next(a);
     const g = try lx.next(a);
     const kw = try lx.next(a);
@@ -1127,9 +1159,9 @@ pub fn isDelimiter(c: u8) bool {
     };
 }
 
-/// PDF tokens (ISO 32000-1 7.2, 7.3). Strings and escaped names are decoded into the allocator
+/// PDF tokens (ISO 32000-1 7.2, 7.3). Strings and escaped names are decoded into the arena
 /// `next` is given; keywords, numbers' text and plain names are slices of `src`. So a token
-/// borrows from both: pass an arena that lives as long as `src`, and never free a payload.
+/// borrows from both: it is valid while both live, and a payload is never freed.
 pub const Lexer = struct {
     src: []const u8,
     pos: usize,
@@ -1145,7 +1177,7 @@ pub const Lexer = struct {
         }
     }
 
-    pub fn next(self: *Lexer, arena: Allocator) Error!Token {
+    pub fn next(self: *Lexer, arena: *std.heap.ArenaAllocator) Error!Token {
         const a = arena;
         self.skipWhite();
         if (self.pos >= self.src.len) return .eof;
@@ -1196,7 +1228,8 @@ pub const Lexer = struct {
         return .{ .keyword = word };
     }
 
-    fn name(self: *Lexer, a: Allocator) Error![]const u8 {
+    fn name(self: *Lexer, arena: *std.heap.ArenaAllocator) Error![]const u8 {
+        const a = arena.allocator();
         const start = self.pos;
         while (self.pos < self.src.len and !isWhite(self.src[self.pos]) and !isDelimiter(self.src[self.pos])) self.pos += 1;
         const raw = self.src[start..self.pos];
@@ -1218,7 +1251,8 @@ pub const Lexer = struct {
         return out[0..n];
     }
 
-    fn hexString(self: *Lexer, a: Allocator) Error![]const u8 {
+    fn hexString(self: *Lexer, arena: *std.heap.ArenaAllocator) Error![]const u8 {
+        const a = arena.allocator();
         self.pos += 1;
         var out: std.ArrayList(u8) = .empty;
         var half: ?u8 = null;
@@ -1239,7 +1273,8 @@ pub const Lexer = struct {
         return out.items;
     }
 
-    fn literalString(self: *Lexer, a: Allocator) Error![]const u8 {
+    fn literalString(self: *Lexer, arena: *std.heap.ArenaAllocator) Error![]const u8 {
+        const a = arena.allocator();
         self.pos += 1;
         var out: std.ArrayList(u8) = .empty;
         var depth: usize = 1;
@@ -1322,7 +1357,7 @@ fn hexValue(c: u8) ?u8 {
 /// Objects from tokens: arrays, dictionaries and `n g R` references.
 pub const Parser = struct {
     lx: *Lexer,
-    arena: Allocator,
+    arena: *std.heap.ArenaAllocator,
     max_depth: u32,
 
     pub fn parseValue(self: *Parser, depth: u32) Error!Object {
@@ -1369,7 +1404,7 @@ pub const Parser = struct {
                 while (true) {
                     const n = try self.lx.next(self.arena);
                     if (n == .array_close) break;
-                    try items.append(self.arena, try self.fromToken(n, depth + 1));
+                    try items.append(self.arena.allocator(), try self.fromToken(n, depth + 1));
                 }
                 return .{ .array = items.items };
             },
@@ -1380,7 +1415,7 @@ pub const Parser = struct {
                     const k = try self.lx.next(self.arena);
                     if (k == .dict_close) break;
                     if (k != .name) return error.Malformed;
-                    try entries.append(self.arena, .{ .key = k.name, .value = try self.parseValue(depth + 1) });
+                    try entries.append(self.arena.allocator(), .{ .key = k.name, .value = try self.parseValue(depth + 1) });
                 }
                 return .{ .dict = .{ .entries = entries.items } };
             },
@@ -1739,7 +1774,7 @@ test "not decrypted: clear metadata, a signature's /Contents, the encryption dic
         var r = try Reader.open(gpa, bytes, .{});
         defer r.deinit();
         var lx: Lexer = .{ .src = bytes, .pos = try findStartXref(bytes) };
-        const head = try parseIndirectHead(&lx, r.arenaAllocator());
+        const head = try parseIndirectHead(&lx, r.arena_state);
         const xref = (try r.object(head.num)).stream;
         try testing.expect(nameIs(xref.dict.get("Type"), "XRef"));
         var row: usize = 0;
@@ -1985,27 +2020,26 @@ test "broken structure is Malformed: cycles, bad lengths, bad offsets, no startx
 test "the lexer decodes strings, names and numbers as ISO 32000-1 7.3 says" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
-    const a = arena_state.allocator();
     var lx: Lexer = .{ .src = "(a\\(b\\)c\\\\ \\101\\7x \\q (nest) line\\\ncont\r\nend) <48 65 6c6C 6f 7> /A#20B /Plain 12 -3 +.5 4. -0.25 %c\n" ++
         "true R", .pos = 0 };
-    try testing.expectEqualStrings("a(b)c\\ A\x07x q (nest) linecont\nend", (try lx.next(a)).string);
-    try testing.expectEqualStrings("Hello\x70", (try lx.next(a)).string);
-    try testing.expectEqualStrings("A B", (try lx.next(a)).name);
-    try testing.expectEqualStrings("Plain", (try lx.next(a)).name);
-    try testing.expectEqual(@as(i64, 12), (try lx.next(a)).integer);
-    try testing.expectEqual(@as(i64, -3), (try lx.next(a)).integer);
-    try testing.expectEqual(@as(f64, 0.5), (try lx.next(a)).real);
-    try testing.expectEqual(@as(f64, 4), (try lx.next(a)).real);
-    try testing.expectEqual(@as(f64, -0.25), (try lx.next(a)).real);
-    try testing.expectEqualStrings("true", (try lx.next(a)).keyword);
-    try testing.expectEqualStrings("R", (try lx.next(a)).keyword);
-    try testing.expectEqual(Token.eof, try lx.next(a));
+    try testing.expectEqualStrings("a(b)c\\ A\x07x q (nest) linecont\nend", (try lx.next(&arena_state)).string);
+    try testing.expectEqualStrings("Hello\x70", (try lx.next(&arena_state)).string);
+    try testing.expectEqualStrings("A B", (try lx.next(&arena_state)).name);
+    try testing.expectEqualStrings("Plain", (try lx.next(&arena_state)).name);
+    try testing.expectEqual(@as(i64, 12), (try lx.next(&arena_state)).integer);
+    try testing.expectEqual(@as(i64, -3), (try lx.next(&arena_state)).integer);
+    try testing.expectEqual(@as(f64, 0.5), (try lx.next(&arena_state)).real);
+    try testing.expectEqual(@as(f64, 4), (try lx.next(&arena_state)).real);
+    try testing.expectEqual(@as(f64, -0.25), (try lx.next(&arena_state)).real);
+    try testing.expectEqualStrings("true", (try lx.next(&arena_state)).keyword);
+    try testing.expectEqualStrings("R", (try lx.next(&arena_state)).keyword);
+    try testing.expectEqual(Token.eof, try lx.next(&arena_state));
     for ([_][]const u8{ "1-2", "--1", "(open", "<4g>", "/A#2", ">", "1e5" }) |bad| {
         var l: Lexer = .{ .src = bad, .pos = 0 };
-        try testing.expectError(error.Malformed, l.next(a));
+        try testing.expectError(error.Malformed, l.next(&arena_state));
     }
     var p_lx: Lexer = .{ .src = "<< /K [1 2 R 3 /N (s)] /D << >> /R 7 0 R >>", .pos = 0 };
-    var p: Parser = .{ .lx = &p_lx, .arena = a, .max_depth = 8 };
+    var p: Parser = .{ .lx = &p_lx, .arena = &arena_state, .max_depth = 8 };
     const d = (try p.parseValue(0)).dict;
     const k = d.get("K").?.array;
     try testing.expectEqual(@as(usize, 4), k.len);
@@ -2036,7 +2070,7 @@ test "ASCIIHex, ASCII85 and the TIFF predictor decode known vectors" {
         .{ .key = "Columns", .value = .{ .integer = 3 } },
     } } };
     // Each byte after the first in a row adds the byte before it.
-    try testing.expectEqualSlices(u8, &.{ 1, 3, 6, 10, 10, 11 }, try r.unpredict(a, params, &.{ 1, 2, 3, 10, 0, 1 }));
+    try testing.expectEqualSlices(u8, &.{ 1, 3, 6, 10, 10, 11 }, try r.documentScope().unpredict(params, &.{ 1, 2, 3, 10, 0, 1 }));
 }
 
 /// LZW codes since a clear, packed as an encoder would: 9 bits wide at first, wider when the
@@ -2081,13 +2115,13 @@ test "LZWDecode: libtiff's data and the standard's example, at both /EarlyChange
 
     // ISO 32000-1 7.4.4.2, Example: codes 256 45 258 258 65 259 66 257.
     const example = "\x80\x0b\x60\x50\x22\x0c\x0c\x85\x01";
-    try testing.expectEqualStrings("-----A---B", try r.applyFilter(a, "LZWDecode", .null, example));
+    try testing.expectEqualStrings("-----A---B", try r.documentScope().applyFilter("LZWDecode", .null, example));
     // With /Predictor 2 (TIFF), in rows of 5: each byte adds the one before it.
     const tiff: Object = .{ .dict = .{ .entries = &.{
         .{ .key = "Predictor", .value = .{ .integer = 2 } },
         .{ .key = "Columns", .value = .{ .integer = 5 } },
     } } };
-    try testing.expectEqualSlices(u8, &.{ 45, 90, 135, 180, 225, 65, 110, 155, 200, 10 }, try r.applyFilter(a, "LZW", tiff, example));
+    try testing.expectEqualSlices(u8, &.{ 45, 90, 135, 180, 225, 65, 110, 155, 200, 10 }, try r.documentScope().applyFilter("LZW", tiff, example));
 
     // base.pdf, encoded by libtiff (EarlyChange 1) and by tools/lzw-fixtures.py (EarlyChange 0);
     // both fill the code table and clear it.
@@ -2101,14 +2135,14 @@ test "LZWDecode: libtiff's data and the standard's example, at both /EarlyChange
         .{ .dict = .{ .entries = &.{.{ .key = "EarlyChange", .value = .{ .integer = 0 } }} } },
         .{ .dict = .{ .entries = &.{.{ .key = "EarlyChange", .value = .{ .integer = 1 } }} } },
     };
-    try testing.expectEqualSlices(u8, plain, try r.applyFilter(a, "LZW", .null, ec1));
-    try testing.expectEqualSlices(u8, plain, try r.applyFilter(a, "LZWDecode", early[1], ec1));
-    try testing.expectEqualSlices(u8, plain, try r.applyFilter(a, "LZWDecode", early[0], ec0));
+    try testing.expectEqualSlices(u8, plain, try r.documentScope().applyFilter("LZW", .null, ec1));
+    try testing.expectEqualSlices(u8, plain, try r.documentScope().applyFilter("LZWDecode", early[1], ec1));
+    try testing.expectEqualSlices(u8, plain, try r.documentScope().applyFilter("LZWDecode", early[0], ec0));
     // Read with the other /EarlyChange, the widths go wrong and the data with them.
-    try testing.expectError(error.Malformed, r.applyFilter(a, "LZWDecode", early[0], ec1));
-    try testing.expectError(error.Malformed, r.applyFilter(a, "LZWDecode", early[1], ec0));
+    try testing.expectError(error.Malformed, r.documentScope().applyFilter("LZWDecode", early[0], ec1));
+    try testing.expectError(error.Malformed, r.documentScope().applyFilter("LZWDecode", early[1], ec0));
     const two: Object = .{ .dict = .{ .entries = &.{.{ .key = "EarlyChange", .value = .{ .integer = 2 } }} } };
-    try testing.expectError(error.Malformed, r.applyFilter(a, "LZWDecode", two, example));
+    try testing.expectError(error.Malformed, r.documentScope().applyFilter("LZWDecode", two, example));
     try testing.expectError(error.TooLarge, lzw(a, ec1, true, plain.len - 1));
 }
 
@@ -2330,7 +2364,6 @@ test "generations, endobj, object-stream extents and stream delimiters are check
 test "the PNG predictor's left byte is a whole pixel back, rounded up, and short rows are refused" {
     var arena_state: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena_state.deinit();
-    const a = arena_state.allocator();
     var r: Reader = undefined;
     r.options = .{};
     r.arena_state = &arena_state;
@@ -2345,8 +2378,8 @@ test "the PNG predictor's left byte is a whole pixel back, rounded up, and short
         .{ .key = "BitsPerComponent", .value = .{ .integer = 4 } },
         .{ .key = "Columns", .value = .{ .integer = 2 } },
     } } };
-    try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, try r.unpredict(a, params, &.{ 1, 1, 2, 2 }));
-    try testing.expectError(error.Malformed, r.unpredict(a, params, &.{ 1, 1, 2 }));
+    try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, try r.documentScope().unpredict(params, &.{ 1, 1, 2, 2 }));
+    try testing.expectError(error.Malformed, r.documentScope().unpredict(params, &.{ 1, 1, 2 }));
 }
 
 test "inflate refuses a stream that ends inside a code" {
@@ -2358,4 +2391,24 @@ test "inflate refuses a stream that ends inside a code" {
     for (0..prefix.len + 1) |cut| {
         try std.testing.expectError(error.Malformed, inflate(std.testing.allocator, prefix[0..cut], 1 << 20));
     }
+}
+
+test "an object loaded in the document scope is parsed once and cached; in another arena it is not cached" {
+    const gpa = testing.allocator;
+    const pdf = try buildPdf(gpa, &.{ "<< /Type /Catalog /Pages 2 0 R >>", "<< /Type /Pages /Kids [] /Count 0 >>", "<< /A 1 >>" }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    // Object 3 is not in the page tree, so open has not loaded it.
+    try testing.expect(!r.cache.contains(3));
+    var arena_state: std.heap.ArenaAllocator = .init(gpa);
+    defer arena_state.deinit();
+    const once = try r.scopeIn(&arena_state).load(3);
+    try testing.expectEqual(@as(i64, 1), once.dict.get("A").?.integer);
+    try testing.expect(!r.cache.contains(3));
+    const first = try r.object(3);
+    try testing.expect(r.cache.contains(3));
+    try testing.expectEqual(first.dict.entries.ptr, (try r.object(3)).dict.entries.ptr);
+    // Once cached, any scope gets the cached object.
+    try testing.expectEqual(first.dict.entries.ptr, (try r.scopeIn(&arena_state).load(3)).dict.entries.ptr);
 }
