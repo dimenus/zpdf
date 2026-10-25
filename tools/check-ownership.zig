@@ -253,3 +253,39 @@ test "each shape is found where an Allocator is passed, and nowhere else" {
         try std.testing.expectEqual(w[1], f.kind);
     }
 }
+
+test "an empty slice never reaches an allocator's free, unless its type has a sentinel" {
+    // The premise of allowing an empty literal: Allocator.free returns before the allocator's own
+    // free is called. This allocator only counts the calls that reach it.
+    const Counting = struct {
+        frees: usize = 0,
+
+        fn free(ctx: *anyopaque, memory: []u8, alignment: std.mem.Alignment, ret_addr: usize) void {
+            _ = memory;
+            _ = alignment;
+            _ = ret_addr;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            self.frees += 1;
+        }
+
+        fn allocator(self: *@This()) std.mem.Allocator {
+            return .{ .ptr = self, .vtable = &.{
+                .alloc = std.mem.Allocator.noAlloc,
+                .resize = std.mem.Allocator.noResize,
+                .remap = std.mem.Allocator.noRemap,
+                .free = free,
+            } };
+        }
+    };
+    var counting: Counting = .{};
+    const a = counting.allocator();
+    a.free(@as([]const u8, ""));
+    a.free(@as([]const u32, &.{}));
+    try std.testing.expectEqual(@as(usize, 0), counting.frees);
+    // The sentinel is counted in the length, so an empty `[:0]u8` is one byte to free, and the
+    // checker finds an empty literal of that type. Not a literal here: free writes over the bytes
+    // first, and a literal's are read-only.
+    var buf: [0:0]u8 = .{};
+    a.free(@as([:0]u8, buf[0..0 :0]));
+    try std.testing.expectEqual(@as(usize, 1), counting.frees);
+}
