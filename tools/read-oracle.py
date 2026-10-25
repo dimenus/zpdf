@@ -75,7 +75,12 @@ excused; each one is in the code beside the place it applies:
 - mutool leaves out a glyph whose character equals the previous one when it starts less than 0.1
   times the size from where that one started (MuPDF's fake-bold rule that runs without
   collect-styles). zpdf gives every glyph drawn; a page whose only differences are such glyphs is
-  counted, not failed (mupdf_fake_bold_drops).
+  counted, not failed (mupdf_fake_bold_drops). The rule also applies after an ActualText of one
+  character over one glyph, which MuPDF adds as if drawn.
+- mutool leaves out the start of an ActualText over one glyph when the ActualText ends with the
+  glyph's own character and does not start with it (a lam-alef ligature whose ToUnicode is only
+  the alef, with ActualText "لا", gives only the alef). zpdf gives the ActualText (14.9.4); a page
+  whose only differences are those characters is counted (mupdf_actualtext_drops).
 - mutool maps a CID with no /ToUnicode through MuPDF's copy of Adobe's CID-to-Unicode table for
   the font's collection, which can be an older version than zpdf's (src/cid): MuPDF 1.28.5 has
   Adobe-Japan1-UCS2 8.004, zpdf 10.002. A page whose only text differences are pairs that the two
@@ -502,18 +507,66 @@ def glyph_texts(r):
 MUPDF_FAKE_BOLD_MAX_DIST = 0.1
 
 
-def mupdf_fake_bold_drops(runs):
+def mupdf_actualtext_glyph(text, to_unicode):
+    """For an ActualText run of one glyph, with its ActualText and the glyph's ToUnicode value
+    (None for none): (the character MuPDF's text device adds at the glyph as if the file drew it,
+    the ActualText's characters it leaves out), or None where that is not modelled.
+
+    MuPDF (do_extract_within_actualtext, stext-device.c, 1.28.5) sends the glyphs of a span whose
+    characters match the start or the end of the ActualText as drawn, puts the ActualText's other
+    characters on the glyphs between them, and sends what is left after the last of those. For a
+    span of one glyph of one character (MuPDF makes one item per character of a ToUnicode value):
+    an ActualText of one character is put on the glyph. A longer one that ends with the glyph's
+    character, and does not start with it, leaves no glyph between, and the rest is never sent:
+    fz_stext_begin_metatext clears the last glyph's position (last.valid), and flush_actualtext
+    sends nothing without one."""
+    if to_unicode is not None and len(to_unicode) != 1:
+        return None
+    if len(text) == 1:
+        return text, ""
+    if to_unicode is not None and text[-1] == to_unicode and text[0] != to_unicode:
+        return to_unicode, text[:-1]
+    return None
+
+
+def mupdf_actualtext_drops(runs, codes):
+    """The ActualText characters mutool leaves out of zpdf's runs (mupdf_actualtext_glyph), as a
+    multiset. codes as for mupdf_glyph_texts; None gives none."""
+    drops = collections.Counter()
+    j = 0
+    for r in runs:
+        n = len(r["glyphs"])
+        if r["actual_text"] and n == 1 and codes is not None and not r["annotation"]:
+            at = mupdf_actualtext_glyph(r["text"], codes[j][1])
+            if at is not None:
+                drops.update(at[1])
+        if not r["annotation"]:
+            j += n
+    return drops
+
+
+def mupdf_fake_bold_drops(runs, codes):
     """The characters mutool leaves out of zpdf's runs by MuPDF's always-on fake-bold rule, as a
-    multiset. zpdf's runs are in drawing order, as MuPDF's characters are. An ActualText run, or a
-    glyph of more than one character, starts over: what MuPDF does there is not modelled, so no
-    drop is assumed, which can only fail a page, never excuse one."""
+    multiset. zpdf's runs are in drawing order, as MuPDF's characters are. An ActualText run of
+    one glyph whose character MuPDF adds as drawn (mupdf_actualtext_glyph) is read as that glyph;
+    any other ActualText run, or a glyph of more than one character, starts over: what MuPDF does
+    there is not modelled, so no drop is assumed, which can only fail a page, never excuse one.
+    codes as for mupdf_glyph_texts."""
     drops = collections.Counter()
     prev = None
+    j = 0
     for r in runs:
+        texts = glyph_texts(r)
+        own = codes[j:j + len(texts)] if codes is not None and not r["annotation"] else None
+        if not r["annotation"]:
+            j += len(texts)
         if r["actual_text"]:
-            prev = None
-            continue
-        for g, c in zip(r["glyphs"], glyph_texts(r)):
+            at = mupdf_actualtext_glyph(r["text"], own[0][1]) if own is not None and len(texts) == 1 else None
+            if at is None:
+                prev = None
+                continue
+            texts = [at[0]]
+        for g, c in zip(r["glyphs"], texts):
             if len(c) != 1 or r["size"] <= 0:
                 prev = None
                 continue
@@ -850,7 +903,8 @@ def text_explanations(path, index, runs, pm_page, mu_page, inside):
     extra, zpdf's extra inside the page). Applied in turn, each only when it changes something:
     zpdf's glyphs read as MuPDF reads a code (mupdf_glyph_texts); mutool's soft-mask text taken
     out (mutool_mask_text, traced only when mutool still has more); the glyphs MuPDF's fake-bold
-    rule drops (mupdf_fake_bold_drops)."""
+    rule drops (mupdf_fake_bold_drops); the ActualText characters MuPDF does not send
+    (mupdf_actualtext_drops)."""
     labels = []
     content = sum(len(r["glyphs"]) for r in runs if not r["annotation"])
     codes = pm_page["codes"] if pm_page is not None and len(pm_page["codes"]) == content else None
@@ -874,9 +928,14 @@ def text_explanations(path, index, runs, pm_page, mu_page, inside):
     if extra:
         # Only zpdf's extra characters are taken: the rule can predict a drop that mutool did
         # not make, and taking it from zpdf's text would then fail a character both have.
-        dropped = extra - counted(mupdf_fake_bold_drops(runs).elements())
+        dropped = extra - counted(mupdf_fake_bold_drops(runs, codes).elements())
         if dropped != extra:
             labels.append("text: only glyphs MuPDF drops as drawn again where the previous one was")
+            extra = dropped
+    if extra:
+        dropped = extra - counted(mupdf_actualtext_drops(runs, codes).elements())
+        if dropped != extra:
+            labels.append("text: only the start of an ActualText that MuPDF does not send (the glyph's own character ends it)")
             extra = dropped
     return (labels if not missing and not extra else None), (missing, extra)
 
