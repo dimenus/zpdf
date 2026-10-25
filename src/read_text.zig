@@ -262,7 +262,7 @@ fn parseCMap(arena: Allocator, gpa: Allocator, data: []const u8, max_depth: u32)
     const a = arena;
     var tokens: std.heap.ArenaAllocator = .init(gpa);
     defer tokens.deinit();
-    const t_a = tokens.allocator();
+    const t_a = &tokens;
     var cm: CMap = .{};
     var ranges: std.ArrayList(CMap.Range) = .empty;
     var seq: u32 = 0;
@@ -938,7 +938,7 @@ fn type1Encoding(r: *Reader, dict: Dict) Error!?[256]?[]const u8 {
     while (true) {
         const before = lx.pos;
         // PostScript procedures ({ }) are not PDF syntax: step over what the lexer refuses.
-        const t = lx.next(tokens.allocator()) catch |err| switch (err) {
+        const t = lx.next(&tokens) catch |err| switch (err) {
             error.Malformed => {
                 if (lx.pos == before) lx.pos += 1;
                 step = .none;
@@ -1175,7 +1175,7 @@ const Interp = struct {
         // a form runs inside the Do operator of the stream that draws it.
         var tokens: std.heap.ArenaAllocator = .init(self.gpa);
         defer tokens.deinit();
-        const a = tokens.allocator();
+        const a = &tokens;
         var lx: read.Lexer = .{ .src = content, .pos = 0 };
         var p: read.Parser = .{ .lx = &lx, .arena = a, .max_depth = self.r.options.max_depth };
         var operands: std.ArrayList(Object) = .empty;
@@ -1810,7 +1810,7 @@ fn appendUtf8(a: Allocator, out: *std.ArrayList(u8), cp: u21) Error!void {
 /// size from /W, /H, /BPC and the colour count; else the first "EI" with white space on both
 /// sides, which image data can contain (a filtered image without /L is the one case left to
 /// that guess). Either way EI must follow, or the page is refused.
-fn skipInlineImage(lx: *read.Lexer, arena: Allocator, max_depth: u32) Error!void {
+fn skipInlineImage(lx: *read.Lexer, arena: *std.heap.ArenaAllocator, max_depth: u32) Error!void {
     var p: read.Parser = .{ .lx = lx, .arena = arena, .max_depth = max_depth };
     var length: ?u64 = null;
     var w: ?i64 = null;
@@ -1950,7 +1950,7 @@ pub fn pageRuns(r: *Reader, index: usize) Error!PageRuns {
     const page = r.page(index);
     var interp: Interp = .{ .r = r, .out = work, .scratch = work, .gpa = r.arena_state.child_allocator };
     interp.mcids = try structParents(r, page.dict);
-    if (try r.pageContentsIn(work, page)) |content| try interp.run(content, page.resources, 0);
+    if (try r.scopeIn(r.work_state).pageContents(page)) |content| try interp.run(content, page.resources, 0);
     try interp.drawAnnotations(page);
     return .{ .runs = interp.runs.items, .unplaced_actual_text = interp.unplaced_actual_text };
 }

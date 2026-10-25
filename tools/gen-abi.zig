@@ -124,7 +124,8 @@ fn pascal(arena: Allocator, name: []const u8) ![]const u8 {
     return out.items;
 }
 
-fn cType(arena: Allocator, comptime T: type) ![]const u8 {
+fn cType(arena_state: *std.heap.ArenaAllocator, comptime T: type) ![]const u8 {
+    const arena = arena_state.allocator();
     if (T == abi.Context) return "zpdf_context";
     if (comptime recordName(T)) |name| return std.fmt.allocPrint(arena, "zpdf_{s}", .{try snake(arena, name)});
     if (T == anyopaque) return "void";
@@ -139,11 +140,11 @@ fn cType(arena: Allocator, comptime T: type) ![]const u8 {
             f64 => "double",
             else => @compileError("no C type for " ++ @typeName(T)),
         },
-        .optional => |o| cType(arena, o.child),
+        .optional => |o| cType(arena_state, o.child),
         .pointer => |p| blk: {
             if (p.size == .slice or p.size == .c) @compileError("no C type for " ++ @typeName(T));
             if (p.child == u8 and p.sentinel() != null) break :blk "const char *";
-            const child = try cType(arena, p.child);
+            const child = try cType(arena_state, p.child);
             break :blk std.fmt.allocPrint(arena, "{s}{s}{s}*", .{ if (p.attrs.@"const") "const " else "", child, if (child[child.len - 1] == '*') "" else " " });
         },
         else => @compileError("no C type for " ++ @typeName(T)),
@@ -152,14 +153,15 @@ fn cType(arena: Allocator, comptime T: type) ![]const u8 {
 
 /// A function pointer field as a C declarator: `int32_t (*write)(void *, const uint8_t *, size_t)`.
 /// The compiled type carries no parameter names, so none are written.
-fn cFnPointerField(arena: Allocator, comptime F: type, name: []const u8) ![]const u8 {
+fn cFnPointerField(arena_state: *std.heap.ArenaAllocator, comptime F: type, name: []const u8) ![]const u8 {
+    const arena = arena_state.allocator();
     const f = @typeInfo(F).@"fn";
     var params: std.ArrayList(u8) = .empty;
     inline for (f.param_types, 0..) |param_type, i| {
         if (i != 0) try params.appendSlice(arena, ", ");
-        try params.appendSlice(arena, try cType(arena, param_type.?));
+        try params.appendSlice(arena, try cType(arena_state, param_type.?));
     }
-    const ret = try cType(arena, f.return_type.?);
+    const ret = try cType(arena_state, f.return_type.?);
     return std.fmt.allocPrint(arena, "{s} (*{s})({s})", .{ ret, name, if (params.items.len == 0) "void" else params.items });
 }
 
@@ -187,7 +189,8 @@ fn fnPointee(comptime T: type) ?type {
     };
 }
 
-fn csType(arena: Allocator, comptime T: type) ![]const u8 {
+fn csType(arena_state: *std.heap.ArenaAllocator, comptime T: type) ![]const u8 {
+    const arena = arena_state.allocator();
     if (T == abi.Context) return "ZpdfContext";
     if (T == anyopaque) return "void";
     if (comptime fnPointee(T)) |F| {
@@ -195,10 +198,10 @@ fn csType(arena: Allocator, comptime T: type) ![]const u8 {
         const f = @typeInfo(F).@"fn";
         var args: std.ArrayList(u8) = .empty;
         inline for (f.param_types) |param_type| {
-            try args.appendSlice(arena, try csType(arena, param_type.?));
+            try args.appendSlice(arena, try csType(arena_state, param_type.?));
             try args.appendSlice(arena, ", ");
         }
-        try args.appendSlice(arena, try csType(arena, f.return_type.?));
+        try args.appendSlice(arena, try csType(arena_state, f.return_type.?));
         return std.fmt.allocPrint(arena, "delegate* unmanaged[Cdecl]<{s}>", .{args.items});
     }
     if (comptime recordName(T)) |name| return name;
@@ -211,10 +214,10 @@ fn csType(arena: Allocator, comptime T: type) ![]const u8 {
         f32 => "float",
         f64 => "double",
         else => switch (@typeInfo(T)) {
-            .optional => |o| csType(arena, o.child),
+            .optional => |o| csType(arena_state, o.child),
             .pointer => |p| blk: {
                 if (p.size == .slice or p.size == .c) @compileError("no C# type for " ++ @typeName(T));
-                break :blk std.fmt.allocPrint(arena, "{s}*", .{try csType(arena, p.child)});
+                break :blk std.fmt.allocPrint(arena, "{s}*", .{try csType(arena_state, p.child)});
             },
             else => @compileError("no C# type for " ++ @typeName(T)),
         },
@@ -259,7 +262,8 @@ const cs_keywords = std.StaticStringMap(void).initComptime(.{
     .{"using"},     .{"virtual"},  .{"void"},     .{"volatile"},   .{"while"},
 });
 
-fn csName(arena: Allocator, name: []const u8) ![]const u8 {
+fn csName(arena_state: *std.heap.ArenaAllocator, name: []const u8) ![]const u8 {
+    const arena = arena_state.allocator();
     return if (cs_keywords.has(name)) std.fmt.allocPrint(arena, "@{s}", .{name}) else name;
 }
 
@@ -269,7 +273,8 @@ fn writeDoc(w: *std.Io.Writer, indent: []const u8, doc: Doc) !void {
     }
 }
 
-fn header(arena: Allocator, w: *std.Io.Writer, src: *const Source) !void {
+fn header(arena_state: *std.heap.ArenaAllocator, w: *std.Io.Writer, src: *const Source) !void {
+    const arena = arena_state.allocator();
     try w.writeAll(
         \\// zpdf.h: generated from src/abi.zig by tools/gen-abi.zig; do not edit.
         \\
@@ -306,18 +311,18 @@ fn header(arena: Allocator, w: *std.Io.Writer, src: *const Source) !void {
     try w.writeAll("};\n\n");
     inline for (records) |name| {
         const T = @field(abi, name);
-        const c_name = try cType(arena, T);
+        const c_name = try cType(arena_state, T);
         try writeDoc(w, "", src.docs.get(name) orelse &.{});
         try w.print("typedef struct {s} {{\n", .{c_name});
         const fields = @typeInfo(T).@"struct";
         inline for (fields.field_names, fields.field_types) |field_name, field_type| {
             try writeDoc(w, "    ", src.docs.get(name ++ "." ++ field_name) orelse &.{});
             if (comptime fnPointee(field_type)) |F| {
-                try w.print("    {s};\n", .{try cFnPointerField(arena, F, try cName(field_name))});
+                try w.print("    {s};\n", .{try cFnPointerField(arena_state, F, try cName(field_name))});
             } else switch (@typeInfo(field_type)) {
-                .array => |a| try w.print("    {s} {s}[{d}];\n", .{ try cType(arena, a.child), try cName(field_name), a.len }),
+                .array => |a| try w.print("    {s} {s}[{d}];\n", .{ try cType(arena_state, a.child), try cName(field_name), a.len }),
                 else => {
-                    const t = try cType(arena, field_type);
+                    const t = try cType(arena_state, field_type);
                     try w.print("    {s}{s}{s};\n", .{ t, if (t[t.len - 1] == '*') "" else " ", try cName(field_name) });
                 },
             }
@@ -333,11 +338,11 @@ fn header(arena: Allocator, w: *std.Io.Writer, src: *const Source) !void {
         const info = @typeInfo(@TypeOf(@field(abi.exports, decl_name))).@"fn";
         const names = try paramNames(src, decl_name, info.param_types.len);
         try writeDoc(w, "", src.fns.get(decl_name).?.doc);
-        const ret = try cType(arena, info.return_type.?);
+        const ret = try cType(arena_state, info.return_type.?);
         try w.print("{s}{s}{s}(", .{ ret, if (ret[ret.len - 1] == '*') "" else " ", decl_name });
         if (info.param_types.len == 0) try w.writeAll("void");
         inline for (info.param_types, 0..) |param_type, i| {
-            const t = try cType(arena, param_type.?);
+            const t = try cType(arena_state, param_type.?);
             try w.print("{s}{s}{s}{s}", .{ if (i == 0) "" else ", ", t, if (t[t.len - 1] == '*') "" else " ", try cName(names[i]) });
         }
         try w.writeAll(");\n\n");
@@ -364,7 +369,8 @@ fn paramNames(src: *const Source, name: []const u8, count: usize) ![]const []con
     return f.params;
 }
 
-fn csharp(arena: Allocator, w: *std.Io.Writer, src: *const Source) !void {
+fn csharp(arena_state: *std.heap.ArenaAllocator, w: *std.Io.Writer, src: *const Source) !void {
+    const arena = arena_state.allocator();
     try w.writeAll(
         \\// <auto-generated>
         \\// Generated from src/abi.zig by tools/gen-abi.zig; do not edit. The protocol (contexts,
@@ -408,8 +414,8 @@ fn csharp(arena: Allocator, w: *std.Io.Writer, src: *const Source) !void {
         inline for (fields.field_names, fields.field_types) |field_name, field_type| {
             try writeDoc(w, "    ", src.docs.get(name ++ "." ++ field_name) orelse &.{});
             switch (@typeInfo(field_type)) {
-                .array => |a| try w.print("    public fixed {s} {s}[{d}];\n", .{ try csType(arena, a.child), try csName(arena, field_name), a.len }),
-                else => try w.print("    public {s} {s};\n", .{ try csType(arena, field_type), try csName(arena, field_name) }),
+                .array => |a| try w.print("    public fixed {s} {s}[{d}];\n", .{ try csType(arena_state, a.child), try csName(arena_state, field_name), a.len }),
+                else => try w.print("    public {s} {s};\n", .{ try csType(arena_state, field_type), try csName(arena_state, field_name) }),
             }
         }
         try w.writeAll("}\n\n");
@@ -426,9 +432,9 @@ fn csharp(arena: Allocator, w: *std.Io.Writer, src: *const Source) !void {
         const names = try paramNames(src, decl_name, info.param_types.len);
         try w.writeAll("\n");
         try writeDoc(w, "    ", src.fns.get(decl_name).?.doc);
-        try w.print("    [LibraryImport(LibraryName, EntryPoint = \"{s}\")]\n    public static partial {s} {s}(", .{ decl_name, try csType(arena, info.return_type.?), decl_name });
+        try w.print("    [LibraryImport(LibraryName, EntryPoint = \"{s}\")]\n    public static partial {s} {s}(", .{ decl_name, try csType(arena_state, info.return_type.?), decl_name });
         inline for (info.param_types, 0..) |param_type, i| {
-            try w.print("{s}{s} {s}", .{ if (i == 0) "" else ", ", try csType(arena, param_type.?), try csName(arena, names[i]) });
+            try w.print("{s}{s} {s}", .{ if (i == 0) "" else ", ", try csType(arena_state, param_type.?), try csName(arena_state, names[i]) });
         }
         try w.writeAll(");\n");
     }
@@ -446,12 +452,12 @@ pub fn main(init: std.process.Init) !void {
     const cwd = std.Io.Dir.cwd();
     const source = try cwd.readFileAllocOptions(io, args[1], arena, .limited(1 << 22), .of(u8), 0);
     const src = try readSource(arena, source);
-    for ([_]struct { []const u8, *const fn (Allocator, *std.Io.Writer, *const Source) anyerror!void }{
+    for ([_]struct { []const u8, *const fn (*std.heap.ArenaAllocator, *std.Io.Writer, *const Source) anyerror!void }{
         .{ args[2], header },
         .{ args[3], csharp },
     }) |out| {
         var aw: std.Io.Writer.Allocating = .init(arena);
-        try out[1](arena, &aw.writer, &src);
+        try out[1](init.arena, &aw.writer, &src);
         try cwd.writeFile(io, .{ .sub_path = out[0], .data = aw.written() });
     }
 }

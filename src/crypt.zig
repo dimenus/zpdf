@@ -27,7 +27,6 @@
 //! unencrypted make exactly these (a catalog's /OCProperties /D /Name, in a file from the web).
 
 const std = @import("std");
-const Allocator = std.mem.Allocator;
 const Md5 = std.crypto.hash.Md5;
 const Sha256 = std.crypto.hash.sha2.Sha256;
 const Sha384 = std.crypto.hash.sha2.Sha384;
@@ -122,19 +121,22 @@ pub const Handler = struct {
         return error.PasswordRequired;
     }
 
-    /// A string of object `num` `gen` decrypted with string_method, in `a`; as written when it
-    /// is AES with a length AES cannot produce (the file's header says why).
-    pub fn decryptString(self: *const Handler, a: Allocator, num: u32, gen: u16, data: []const u8) Error![]const u8 {
+    /// A string of object `num` `gen` decrypted with string_method, in `arena`; as written when
+    /// it is AES with a length AES cannot produce (the file's header says why). So it may be
+    /// `data` itself: valid while both live, never freed by the caller.
+    pub fn decryptString(self: *const Handler, arena: *std.heap.ArenaAllocator, num: u32, gen: u16, data: []const u8) Error![]const u8 {
         switch (self.string_method) {
             .aesv2, .aesv3 => if (data.len != 0 and (data.len < 32 or data.len % 16 != 0)) return data,
             .none, .rc4 => {},
         }
-        return self.decrypt(a, self.string_method, num, gen, data);
+        return self.decrypt(arena, self.string_method, num, gen, data);
     }
 
-    /// `data` of object `num` `gen` decrypted with `method`, in `a` (or `data` itself for
-    /// .none). AES data is the 16-byte IV, then whole blocks with PKCS #5 padding (7.6.3.1).
-    pub fn decrypt(self: *const Handler, a: Allocator, method: Method, num: u32, gen: u16, data: []const u8) Error![]const u8 {
+    /// `data` of object `num` `gen` decrypted with `method`, in `arena` (or `data` itself for
+    /// .none): valid while both live, never freed by the caller. AES data is the 16-byte IV,
+    /// then whole blocks with PKCS #5 padding (7.6.3.1).
+    pub fn decrypt(self: *const Handler, arena: *std.heap.ArenaAllocator, method: Method, num: u32, gen: u16, data: []const u8) Error![]const u8 {
+        const a = arena.allocator();
         switch (method) {
             .none => return data,
             .rc4 => {
@@ -483,7 +485,7 @@ test "AES-CBC decrypts and encrypts NIST SP 800-38A F.2" {
 test "AES data is the IV and whole blocks, with padding of 1 to 16 bytes, or Malformed" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
-    const a = arena.allocator();
+    const a = &arena;
     const h: Handler = .{ .revision = 4, .key = @splat(7), .key_len = 16, .string_method = .aesv2, .stream_method = .aesv2, .std_cf_method = .aesv2, .encrypt_metadata = true };
     const key = h.objectKey(12, 0, true).bytes[0..16].*;
     const iv: [16]u8 = @splat(3);

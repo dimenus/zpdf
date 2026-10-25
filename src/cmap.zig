@@ -403,7 +403,7 @@ pub const Builder = struct {
 pub fn parse(a: Allocator, gpa: Allocator, text: []const u8) Error!Builder {
     var tokens: std.heap.ArenaAllocator = .init(gpa);
     defer tokens.deinit();
-    const t_a = tokens.allocator();
+    const t_a = &tokens;
     var b: Builder = .{};
     var lx: read.Lexer = .{ .src = text, .pos = 0 };
     var operands: std.ArrayList(read.Token) = .empty;

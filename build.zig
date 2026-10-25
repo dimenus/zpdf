@@ -209,6 +209,21 @@ pub fn build(b: *std.Build) void {
     addGolden(b, golden_step, text_exe, harfbuzz);
     test_step.dependOn(golden_step);
 
+    // A function that takes an Allocator and returns a slice must not return a literal or a
+    // parameter: its caller frees the result (tools/check-ownership.zig says what it finds).
+    const ownership_mod = b.createModule(.{
+        .root_source_file = b.path("tools/check-ownership.zig"),
+        .target = b.graph.host,
+        .optimize = .Debug,
+    });
+    test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = ownership_mod })).step);
+    const ownership = b.addRunArtifact(b.addExecutable(.{ .name = "check-ownership", .root_module = ownership_mod }));
+    for ([_][]const u8{ "src", "tools" }) |sub| {
+        for (zigFiles(b, sub)) |path| ownership.addFileArg(b.path(path));
+    }
+    ownership.addFileArg(b.path("build.zig"));
+    test_step.dependOn(&ownership.step);
+
     // Unformatted code fails `zig build test`; `zig build fmt` fixes it.
     const fmt_paths: []const std.Build.LazyPath = &.{ b.path("src"), b.path("tools"), b.path("tests/consumer"), b.path("build.zig"), b.path("build.zig.zon") };
     test_step.dependOn(&b.addFmt(.{ .paths = fmt_paths, .check = true }).step);
@@ -693,6 +708,25 @@ fn addCidMaps(m: *std.Build.Module, maps: *const CidMaps, use: bool) void {
         m.addAnonymousImport(m.owner.fmt("cid_{s}", .{ordering}), .{ .root_source_file = map });
     }
     m.addAnonymousImport("cid_cmaps", .{ .root_source_file = maps.cmaps });
+}
+
+/// The .zig files directly in `sub`, sorted.
+fn zigFiles(b: *std.Build, sub: []const u8) []const []const u8 {
+    b.dependOnDirectoryContents(b.path(sub));
+    var dir = b.root.openDir(b.graph.io, sub, .{ .iterate = true }) catch |err| std.debug.panic("{s}: {t}", .{ sub, err });
+    defer dir.close(b.graph.io);
+    var list: std.ArrayList([]const u8) = .empty;
+    var it = dir.iterate();
+    while (it.next(b.graph.io) catch |err| std.debug.panic("{s}: {t}", .{ sub, err })) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".zig")) continue;
+        list.append(b.allocator, b.fmt("{s}/{s}", .{ sub, entry.name })) catch @panic("OOM");
+    }
+    std.mem.sort([]const u8, list.items, {}, struct {
+        fn lt(_: void, x: []const u8, y: []const u8) bool {
+            return std.mem.order(u8, x, y) == .lt;
+        }
+    }.lt);
+    return list.items;
 }
 
 /// src/cmap's files, sorted: the predefined CMaps.
