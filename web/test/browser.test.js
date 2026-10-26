@@ -104,6 +104,55 @@ test("empty text renders a blank page, so the ink check can fail", async () => {
   expect(result.ink).toBeLessThanOrEqual(MAX_BLANK_INK);
 });
 
+// zpdf.wasm reads back what it writes, through its own reader exports: the PDF's streams are
+// FlateDecode, so this runs libdeflate as built for wasm32-freestanding (src/libdeflate_impl.c),
+// which nothing else here does. The text comes from zpdf_reader_page_text's strings, the last
+// strings_len bytes of each page's buffer (zpdf.h, zpdf_text_header).
+test("zpdf.wasm's reader reads back the compressed PDF zpdf.wasm writes", async () => {
+  const got = await page.evaluate(async () => {
+    const response = await fetch(`/fonts/${encodeURIComponent("Roboto-Regular.ttf")}`);
+    const font = new Uint8Array(await response.arrayBuffer());
+    const z = window.zpdfPage;
+    const pdf = await z.textToPdf(z.wasmModule, font, "zpdf reads this back. ".repeat(40), {});
+    const { exports: e } = await WebAssembly.instantiate(z.wasmModule, {});
+    const check = (code, what) => {
+      if (code !== 0) throw new Error(`${what} returned ${code}`);
+    };
+    const view = () => new DataView(e.memory.buffer);
+    const ctx = e.zpdf_context_new();
+    const bytes = e.zpdf_alloc(ctx, pdf.length);
+    new Uint8Array(e.memory.buffer, bytes, pdf.length).set(pdf);
+    const out = e.zpdf_alloc(ctx, 16);
+    check(e.zpdf_reader_open(ctx, bytes, pdf.length, out), "zpdf_reader_open");
+    const reader = view().getUint32(out, true);
+    check(e.zpdf_reader_page_count(ctx, reader, out + 4), "zpdf_reader_page_count");
+    const pages = view().getUint32(out + 4, true);
+    let strings = "";
+    for (let i = 0; i < pages; i++) {
+      check(e.zpdf_reader_page_text(ctx, reader, i, out + 8, out + 12), "zpdf_reader_page_text");
+      const ptr = view().getUint32(out + 8, true);
+      const len = view().getUint32(out + 12, true);
+      const strings_len = view().getUint32(ptr + 12, true);
+      strings += new TextDecoder().decode(new Uint8Array(e.memory.buffer, ptr + len - strings_len, strings_len));
+      check(e.zpdf_free(ctx, ptr, len), "zpdf_free");
+    }
+    check(e.zpdf_reader_close(ctx, reader), "zpdf_reader_close");
+    check(e.zpdf_free(ctx, out, 16), "zpdf_free");
+    check(e.zpdf_free(ctx, bytes, pdf.length), "zpdf_free");
+    return {
+      flate: new TextDecoder("latin1").decode(pdf).includes("/FlateDecode"),
+      pages,
+      text: strings.replace(/\s+/g, ""),
+      freed: e.zpdf_context_free(ctx),
+    };
+  });
+  expect(got.flate).toBe(true);
+  expect(got.pages).toBeGreaterThan(0);
+  expect(got.text).toContain("zpdfreadsthisback.".repeat(10));
+  expect(got.freed).toBe(0);
+  expect(page_errors).toEqual([]);
+});
+
 test("junk font throws InvalidFont and the page keeps working", async () => {
   const thrown = await page.evaluate(async () => {
     // Fixed seed, so a failure reproduces.

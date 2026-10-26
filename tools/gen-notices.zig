@@ -1,7 +1,7 @@
 //! Writes THIRD-PARTY-NOTICES.md: the notices of the third-party data and code built into
 //! libzpdf and zpdf.wasm, each copied from the file it covers, so nothing is retyped.
 //!
-//!     gen-notices <out> <src/read_tables.zig> <kb LICENSE> <src/cid/Adobe-*-UCS2 ...> -- <src/cmap/* ...>
+//!     gen-notices <out> <src/read_tables.zig> <kb LICENSE> <libdeflate COPYING> <src/cid/Adobe-*-UCS2 ...> -- <src/cmap/* ...>
 //!
 //! - Adobe's Core 14 AFM metrics and the Adobe Glyph List: read_tables.zig's `//!` header, which
 //!   tools/gen-read-tables.py writes from the AFM files and keeps Adobe's notices and terms in.
@@ -12,6 +12,7 @@
 //! - Adobe's predefined CMaps (src/cmap): their `%%Copyright:` blocks, each different block once,
 //!   with the files that carry it.
 //! - kb_text_shape: its LICENSE.
+//! - libdeflate: its COPYING.
 //!
 //! `zig build notices` rewrites the file; `zig build test` fails when it differs from this output.
 
@@ -20,8 +21,8 @@ const std = @import("std");
 pub fn main(init: std.process.Init) !void {
     const arena = init.arena.allocator();
     const args = try init.minimal.args.toSlice(arena);
-    if (args.len < 5) {
-        std.debug.print("usage: gen-notices <out> <read_tables.zig> <kb LICENSE> <cmap>...\n", .{});
+    if (args.len < 6) {
+        std.debug.print("usage: gen-notices <out> <read_tables.zig> <kb LICENSE> <libdeflate COPYING> <cmap>...\n", .{});
         std.process.exit(2);
     }
     const io = init.io;
@@ -58,10 +59,10 @@ pub fn main(init: std.process.Init) !void {
     if (header_lines < 10) fail("{s} has no notice header", .{args[2]});
     try w.writeAll("```\n\n");
 
-    const sep = for (args[4..], 4..) |a, i| {
+    const sep = for (args[5..], 5..) |a, i| {
         if (std.mem.eql(u8, a, "--")) break i;
     } else fail("no -- before src/cmap's files", .{});
-    const cmaps = args[4..sep];
+    const cmaps = args[5..sep];
     const encodings = args[sep + 1 ..];
     if (cmaps.len == 0 or encodings.len == 0) fail("no CMaps on one side of --", .{});
     // The glyph list's terms are the CMaps' terms: the first CMap's block after its copyright line.
@@ -128,6 +129,19 @@ pub fn main(init: std.process.Init) !void {
         \\```
         \\
     , .{std.mem.trimEnd(u8, kb, "\n")});
+
+    const libdeflate = try cwd.readFileAlloc(io, args[4], arena, .limited(1 << 20));
+    try w.print(
+        \\
+        \\## libdeflate
+        \\
+        \\The DEFLATE decompressor (https://github.com/ebiggers/libdeflate, at the commit build.zig.zon pins):
+        \\
+        \\```
+        \\{s}
+        \\```
+        \\
+    , .{std.mem.trimEnd(u8, libdeflate, "\n")});
 
     try cwd.writeFile(io, .{ .sub_path = args[1], .data = out.written() });
 }

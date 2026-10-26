@@ -25,7 +25,12 @@
   it on this machine before main moves (test-platforms runs it on Linux; CI on Linux and macOS).
 - kb_text_shape comes from the fork `dimenus/kb`, branch `fixes`, pinned by commit in `build.zig.zon`.
   A kb change is made and tested in the fork first; then the pin moves here.
-- Before writing or changing code that calls a dependency (kb from `src/kb_shim.c` and `src/root.zig`),
+- libdeflate (FlateDecode, `src/read.zig`'s inflate) is upstream `ebiggers/libdeflate`, pinned by commit
+  in `build.zig.zon`; `src/libdeflate_impl.c` says which files are compiled and why. After moving the
+  pin, run `uv run tools/bench-abi.py` on Linux too, where libzpdf links no libc: a C `memcpy` that
+  replaces Zig's slows all of libzpdf there, and the macOS benchmarks do not show it.
+- Before writing or changing code that calls a dependency (kb from `src/kb_shim.c` and `src/root.zig`,
+  libdeflate from `src/read.zig`),
   read that library's own docs AND implementation, and use it the way the library intends, not the
   first way that compiles. The compiled source is `zig-pkg/<hash>/`, with the hash from `build.zig.zon`
   (kb: `kb_text_shape.h`, docs at the top, examples under EXAMPLES). Example of the miss: kb caches shape

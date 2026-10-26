@@ -41,6 +41,7 @@
 //! decoded streams it returns are valid until then.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const read_text = @import("read_text.zig");
 const crypt = @import("crypt.zig");
@@ -1517,16 +1518,90 @@ pub const Parser = struct {
 
 // ---- filters ----
 
+/// FlateDecode: a zlib stream (RFC 1950), decoded by libdeflate (src/libdeflate_impl.c). Its
+/// wrapper is read as std.compress.flate read it before: the header's method 8 and window code at
+/// most 7, no FCHECK test, and a 4-byte trailer that must be there but is not compared with the
+/// data's Adler-32. libdeflate decodes in one call into a buffer it is given (libdeflate.h,
+/// libdeflate_deflate_decompress): the first is 8 times the input, which most streams fit, and a
+/// stream that needs more is decoded again into one 4 times larger, up to `max`.
 fn inflate(allocator: Allocator, data: []const u8, max: usize) Error![]u8 {
-    var in: std.Io.Reader = .fixed(data);
-    const window = try allocator.alloc(u8, std.compress.flate.max_window_len);
-    defer allocator.free(window);
-    var d: std.compress.flate.Decompress = .init(&in, .zlib, window);
-    return d.reader.allocRemaining(allocator, .limited(max)) catch |err| switch (err) {
-        error.OutOfMemory => error.OutOfMemory,
-        error.StreamTooLong => error.TooLarge,
-        error.ReadFailed => error.Malformed,
+    if (data.len < 2 or data[0] & 0x0f != 8 or data[0] >> 4 > 7) return error.Malformed;
+    const body = data[2..];
+    const options: LibdeflateOptions = .{
+        .sizeof_options = @sizeOf(LibdeflateOptions),
+        .malloc_func = libdeflateMalloc,
+        .free_func = libdeflateFree,
     };
+    const d = libdeflate_alloc_decompressor_ex(&options) orelse return error.OutOfMemory;
+    defer libdeflate_free_decompressor(d);
+    var capacity = @min(max, body.len *| 8 +| 4096);
+    while (true) {
+        // Raw, so the buffer is not filled first (ReleaseSafe's Allocator.alloc writes 0xaa over a
+        // new block): only what libdeflate writes is returned, and the unused part of the guess is
+        // never touched, so it does not become resident memory.
+        const len = @max(capacity, 1);
+        const buf = allocator.rawAlloc(len, .@"1", @returnAddress()) orelse return error.OutOfMemory;
+        var used_in: usize = 0;
+        var used_out: usize = 0;
+        const result = libdeflate_deflate_decompress_ex(d, body.ptr, body.len, buf, capacity, &used_in, &used_out);
+        if (result == .success and body.len - used_in >= 4 and used_out > 0) {
+            if (allocator.rawResize(buf[0..len], .@"1", used_out, @returnAddress())) return buf[0..used_out];
+            defer allocator.rawFree(buf[0..len], .@"1", @returnAddress());
+            return allocator.dupe(u8, buf[0..used_out]);
+        }
+        allocator.rawFree(buf[0..len], .@"1", @returnAddress());
+        switch (result) {
+            // The trailer is missing, or the data is empty.
+            .success => return if (body.len - used_in >= 4) &.{} else error.Malformed,
+            .insufficient_space => {
+                if (capacity == max) return error.TooLarge;
+                capacity = @min(max, capacity *| 4);
+            },
+            else => return error.Malformed,
+        }
+    }
+}
+
+const LibdeflateDecompressor = opaque {};
+const LibdeflateResult = enum(c_int) { success = 0, bad_data = 1, short_output = 2, insufficient_space = 3, _ };
+const LibdeflateOptions = extern struct {
+    sizeof_options: usize,
+    malloc_func: *const fn (usize) callconv(.c) ?*anyopaque,
+    free_func: *const fn (?*anyopaque) callconv(.c) void,
+};
+extern fn libdeflate_alloc_decompressor_ex(options: *const LibdeflateOptions) ?*LibdeflateDecompressor;
+extern fn libdeflate_free_decompressor(d: *LibdeflateDecompressor) void;
+extern fn libdeflate_deflate_decompress_ex(d: *LibdeflateDecompressor, in: [*]const u8, in_len: usize, out: [*]u8, out_len: usize, used_in: *usize, used_out: *usize) LibdeflateResult;
+
+/// The allocator for memory C code takes with no context to give it back by: the system's malloc
+/// where zpdf links libc, smp_allocator on Linux, where libzpdf links none (build.zig,
+/// nativeModule), and wasm_allocator in zpdf.wasm. src/abi.zig takes each context's memory from it.
+pub const system_allocator = if (builtin.cpu.arch.isWasm())
+    std.heap.wasm_allocator
+else if (builtin.link_libc)
+    std.heap.c_allocator
+else
+    std.heap.smp_allocator;
+
+/// libdeflate's malloc and free, over system_allocator. free gets only the pointer, so each block
+/// starts with its size; 16 bytes keep the block as aligned as malloc's, which libdeflate assumes
+/// for its decompressor (libdeflate_alloc_decompressor_ex).
+const libdeflate_header = 16;
+
+/// Blocks libdeflate holds, which no testing allocator sees: a test checks it is 0 after its calls.
+var libdeflate_blocks: std.atomic.Value(usize) = .init(0);
+
+fn libdeflateMalloc(size: usize) callconv(.c) ?*anyopaque {
+    const block = system_allocator.alignedAlloc(u8, .@"16", libdeflate_header + size) catch return null;
+    std.mem.writeInt(usize, block[0..@sizeOf(usize)], block.len, .little);
+    _ = libdeflate_blocks.fetchAdd(1, .monotonic);
+    return block.ptr + libdeflate_header;
+}
+
+fn libdeflateFree(ptr: ?*anyopaque) callconv(.c) void {
+    const p: [*]align(16) u8 = @alignCast(@as([*]u8, @ptrCast(ptr orelse return)) - libdeflate_header);
+    _ = libdeflate_blocks.fetchSub(1, .monotonic);
+    system_allocator.free(p[0..std.mem.readInt(usize, p[0..@sizeOf(usize)], .little)]);
 }
 
 /// LZWDecode (7.4.4.2): codes of 9 to 12 bits, most significant bit first. 256 clears the
@@ -2551,6 +2626,84 @@ test "the PNG predictor's left byte is a whole pixel back, rounded up, and short
     } } };
     try testing.expectEqualSlices(u8, &.{ 1, 2, 3 }, try r.documentScope().unpredict(params, &.{ 1, 1, 2, 2 }));
     try testing.expectError(error.Malformed, r.documentScope().unpredict(params, &.{ 1, 1, 2 }));
+}
+
+/// std.compress.flate, as inflate called it before libdeflate: the reference the test below checks
+/// inflate against.
+fn inflateStdReference(allocator: Allocator, data: []const u8, max: usize) Error![]u8 {
+    var in: std.Io.Reader = .fixed(data);
+    const window = try allocator.alloc(u8, std.compress.flate.max_window_len);
+    defer allocator.free(window);
+    var d: std.compress.flate.Decompress = .init(&in, .zlib, window);
+    return d.reader.allocRemaining(allocator, .limited(max)) catch |err| switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        error.StreamTooLong => error.TooLarge,
+        error.ReadFailed => error.Malformed,
+    };
+}
+
+test "inflate reads what std.compress.flate reads, and refuses what it refuses" {
+    // Streams from std's compressor at three levels, of random bytes (stored blocks), text, and
+    // long runs that inflate more than 8 times (so inflate decodes again into a larger buffer);
+    // each whole, with its trailer cut short, with a bad method, with a reserved window size, and
+    // with a limit one byte short. Each must give std's bytes, or std's refusal.
+    const gpa = testing.allocator;
+    var prng: std.Random.DefaultPrng = .init(0x666c6174);
+    const rand = prng.random();
+    const levels = [_]std.compress.flate.Compress.Options{ .level_1, .level_6, .level_9 };
+    var plain: std.ArrayList(u8) = .empty;
+    defer plain.deinit(gpa);
+    var compared: usize = 0;
+    var retried: usize = 0;
+    for (0..48) |i| {
+        plain.clearRetainingCapacity();
+        const len = rand.uintAtMost(usize, 40_000);
+        switch (i % 4) {
+            0 => for (0..len) |_| try plain.append(gpa, rand.int(u8)),
+            1 => for (0..len) |_| try plain.append(gpa, "etaoin shrdlu\n()[]0123"[rand.uintLessThan(usize, 22)]),
+            2 => while (plain.items.len < len) try plain.appendNTimes(gpa, rand.int(u8), rand.uintAtMost(usize, 3000)),
+            else => for (0..len % 64) |_| try plain.append(gpa, rand.int(u8)),
+        }
+        var out: std.Io.Writer.Allocating = try .initCapacity(gpa, 64);
+        defer out.deinit();
+        const window = try gpa.alloc(u8, std.compress.flate.max_window_len);
+        defer gpa.free(window);
+        var c = try std.compress.flate.Compress.init(&out.writer, window, .zlib, levels[i % levels.len]);
+        try c.writer.writeAll(plain.items);
+        try c.finish();
+        const z = out.written();
+        if (plain.items.len > z.len * 8 + 4096) retried += 1;
+
+        var bad_method = try gpa.dupe(u8, z);
+        defer gpa.free(bad_method);
+        bad_method[0] = (bad_method[0] & 0xf0) | 9;
+        var big_window = try gpa.dupe(u8, z);
+        defer gpa.free(big_window);
+        big_window[0] = (big_window[0] & 0x0f) | 0x80;
+        const variants = [_]struct { data: []const u8, max: usize }{
+            .{ .data = z, .max = 1 << 24 },
+            .{ .data = z[0 .. z.len - 1], .max = 1 << 24 },
+            .{ .data = z[0 .. z.len - 4], .max = 1 << 24 },
+            .{ .data = bad_method, .max = 1 << 24 },
+            .{ .data = big_window, .max = 1 << 24 },
+            .{ .data = z, .max = plain.items.len -| 1 },
+        };
+        for (variants) |v| {
+            const want = inflateStdReference(gpa, v.data, v.max);
+            defer if (want) |w| gpa.free(w) else |_| {};
+            const got = inflate(gpa, v.data, v.max);
+            defer if (got) |g| gpa.free(g) else |_| {};
+            if (want) |w| {
+                try testing.expectEqualSlices(u8, w, try got);
+                try testing.expectEqualSlices(u8, plain.items, w);
+            } else |err| try testing.expectError(err, got);
+            compared += 1;
+        }
+    }
+    // The run did the work: every variant compared, and some streams took the larger buffer. And
+    // libdeflate gave back every block it took.
+    try testing.expect(compared == 48 * 6 and retried >= 4);
+    try testing.expectEqual(@as(usize, 0), libdeflate_blocks.load(.monotonic));
 }
 
 test "inflate refuses a stream that ends inside a code" {

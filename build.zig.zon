@@ -14,6 +14,10 @@
             .url = "https://codeload.github.com/dimenus/kb/tar.gz/80e3e030c4b2eea3d4da4a5bbd7a6152d94daff9",
             .hash = "N-V-__8AAGgnHgCv1wSDL4_IKgrH3pIF8IjnIe-fdZa5nnVP",
         },
+        .libdeflate = .{
+            .url = "https://codeload.github.com/ebiggers/libdeflate/tar.gz/92e6a0db9fa848d742f9eb286c92afc60f2c3dda",
+            .hash = "N-V-__8AAEaRCwCsYb_rSsH72Pb6DNFQLSjdRzTFOVsJWcoB",
+        },
     },
     // What a package that depends on zpdf needs: build.zig's first part reads only these.
     .paths = .{ "build.zig", "build.zig.zon", "src", "tools/gen-abi.zig", "tools/gen-cid-table.zig", "tools/gen-cmaps.zig", "LICENSE", "THIRD-PARTY-NOTICES.md" },
