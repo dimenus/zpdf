@@ -1267,23 +1267,36 @@ pub const Lexer = struct {
     fn hexString(self: *Lexer, arena: *std.heap.ArenaAllocator) Error![]const u8 {
         const a = arena.allocator();
         self.pos += 1;
-        var out: std.ArrayList(u8) = .empty;
+        const end = std.mem.indexOfScalarPos(u8, self.src, self.pos, '>') orelse {
+            self.pos = self.src.len;
+            return error.Malformed;
+        };
+        const body = self.src[self.pos..end];
+        // One byte per two digits, the last rounded up; white space only makes it shorter.
+        const out = try a.alloc(u8, (body.len + 1) / 2);
+        var n: usize = 0;
         var half: ?u8 = null;
-        while (true) {
-            if (self.pos >= self.src.len) return error.Malformed;
-            const c = self.src[self.pos];
-            self.pos += 1;
-            if (c == '>') break;
+        for (body, 0..) |c, i| {
             if (isWhite(c)) continue;
-            const v = hexValue(c) orelse return error.Malformed;
+            const v = hex_value[c];
+            if (v == 0xff) {
+                // Past the bad character, as every refusal is.
+                self.pos += i + 1;
+                return error.Malformed;
+            }
             if (half) |h| {
-                try out.append(a, h * 16 + v);
+                out[n] = h * 16 + v;
+                n += 1;
                 half = null;
             } else half = v;
         }
+        self.pos = end + 1;
         // An odd digit count: the last digit is followed by 0 (7.3.4.3).
-        if (half) |h| try out.append(a, h * 16);
-        return out.items;
+        if (half) |h| {
+            out[n] = h * 16;
+            n += 1;
+        }
+        return out[0..n];
     }
 
     fn literalString(self: *Lexer, arena: *std.heap.ArenaAllocator) Error![]const u8 {
@@ -1420,8 +1433,18 @@ fn numberSlow(word: []const u8) Error!Token {
 }
 
 fn hexValue(c: u8) ?u8 {
-    return std.fmt.charToDigit(c, 16) catch null;
+    const v = hex_value[c];
+    return if (v == 0xff) null else v;
 }
+
+/// Each byte's value as a hex digit, or 0xff.
+const hex_value: [256]u8 = blk: {
+    var t: [256]u8 = @splat(0xff);
+    for ("0123456789", 0..) |c, i| t[c] = i;
+    for ("abcdef", 10..) |c, i| t[c] = i;
+    for ("ABCDEF", 10..) |c, i| t[c] = i;
+    break :blk t;
+};
 
 /// Objects from tokens: arrays, dictionaries and `n g R` references.
 pub const Parser = struct {
@@ -2111,6 +2134,14 @@ test "the lexer decodes strings, names and numbers as ISO 32000-1 7.3 says" {
     try testing.expectEqual(@as(i64, 12), (try more.next(&arena_state)).integer);
     try testing.expectEqual(@as(i64, 13), (try more.next(&arena_state)).integer);
     try testing.expectEqual(Token.eof, try more.next(&arena_state));
+    // A refusal moves past what it refused, so a caller that skips bad tokens moves on: past a
+    // hex string's bad digit, and to the end when its '>' never comes.
+    var bad_hex: Lexer = .{ .src = "<4g>5", .pos = 0 };
+    try testing.expectError(error.Malformed, bad_hex.next(&arena_state));
+    try testing.expectEqual(@as(usize, 3), bad_hex.pos);
+    var open_hex: Lexer = .{ .src = "<48 65", .pos = 0 };
+    try testing.expectError(error.Malformed, open_hex.next(&arena_state));
+    try testing.expectEqual(@as(usize, 6), open_hex.pos);
     for ([_][]const u8{ "1-2", "--1", "(open", "<4g>", "/A#2", ">", "1e5" }) |bad| {
         var l: Lexer = .{ .src = bad, .pos = 0 };
         try testing.expectError(error.Malformed, l.next(&arena_state));
