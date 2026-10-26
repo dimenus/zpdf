@@ -1233,10 +1233,13 @@ pub const Lexer = struct {
             else => {},
         }
         const start = self.pos;
+        if (isNumberStart(c)) {
+            const n = scanNumber(self.src, start);
+            self.pos = n.end;
+            return n.token orelse numberSlow(self.src[start..n.end]);
+        }
         while (self.pos < self.src.len and isRegular(self.src[self.pos])) self.pos += 1;
-        const word = self.src[start..self.pos];
-        if (isNumberStart(word[0])) return number(word);
-        return .{ .keyword = word };
+        return .{ .keyword = self.src[start..self.pos] };
     }
 
     fn name(self: *Lexer, arena: *std.heap.ArenaAllocator) Error![]const u8 {
@@ -1373,16 +1376,20 @@ pub fn isNumberStart(c: u8) bool {
     return std.ascii.isDigit(c) or c == '+' or c == '-' or c == '.';
 }
 
-fn number(word: []const u8) Error!Token {
-    return numberFast(word) orelse numberSlow(word);
-}
+const ScannedNumber = struct {
+    /// Where the word ends: the first character at or after `start` that is not regular.
+    end: usize,
+    /// Null when the word is not one of the shapes scanNumber reads; numberSlow then reads it.
+    token: ?Token,
+};
 
-/// The common shapes, [+-]digits and [+-]digits.digits, read without std.fmt: an integer of at most
-/// 18 digits, and a real of at most 15 digits with at most 22 after the point. Then the digits as an
+/// The word at `start` (a number's first character), found and read in one pass. The common
+/// shapes, [+-]digits and [+-]digits.digits, are read without std.fmt: an integer of at most 18
+/// digits, and a real of at most 15 digits with at most 22 after the point. Then the digits as an
 /// integer and the power of ten are both exact as f64, so one division is the correctly rounded
 /// value, the one numberSlow's parseFloat gives. Anything else (more digits, a lone sign or point,
-/// a character that is not a digit) is left to numberSlow: null.
-fn numberFast(word: []const u8) ?Token {
+/// a regular character that is not a digit) gives a null token, and the word is left to numberSlow.
+fn scanNumber(src: []const u8, start: usize) ScannedNumber {
     const pow10 = comptime blk: {
         var t: [23]f64 = undefined;
         var v: f64 = 1;
@@ -1392,31 +1399,37 @@ fn numberFast(word: []const u8) ?Token {
         }
         break :blk t;
     };
-    var i: usize = 0;
-    const neg = word[0] == '-';
-    if (word[0] == '-' or word[0] == '+') i = 1;
+    var i = start;
+    const neg = src[i] == '-';
+    if (src[i] == '-' or src[i] == '+') i += 1;
     var mantissa: u64 = 0;
     var digits: usize = 0;
     var point: ?usize = null;
-    while (i < word.len) : (i += 1) {
-        const c = word[i];
+    const end = while (i < src.len) : (i += 1) {
+        const c = src[i];
         if (c >= '0' and c <= '9') {
-            if (digits == 18) return null;
+            if (digits == 18) break null;
             mantissa = mantissa * 10 + (c - '0');
             digits += 1;
         } else if (c == '.' and point == null) {
             point = digits;
-        } else return null;
-    }
-    if (digits == 0) return null;
+        } else if (isRegular(c)) {
+            break null;
+        } else break i;
+    } else i;
+    const e = end orelse {
+        while (i < src.len and isRegular(src[i])) i += 1;
+        return .{ .end = i, .token = null };
+    };
+    if (digits == 0) return .{ .end = e, .token = null };
     const p = point orelse {
         const v: i64 = @intCast(mantissa);
-        return .{ .integer = if (neg) -v else v };
+        return .{ .end = e, .token = .{ .integer = if (neg) -v else v } };
     };
     const after = digits - p;
-    if (digits > 15 or after > 22) return null;
+    if (digits > 15 or after > 22) return .{ .end = e, .token = null };
     const v = @as(f64, @floatFromInt(mantissa)) / pow10[after];
-    return .{ .real = if (neg) -v else v };
+    return .{ .end = e, .token = .{ .real = if (neg) -v else v } };
 }
 
 fn numberSlow(word: []const u8) Error!Token {
@@ -2401,14 +2414,17 @@ const TestFile = struct {
 
 test "the numbers' fast path reads what the general one does, and leaves it the rest" {
     // Shapes and edges by hand, then generated words: each must read as numberSlow reads it, to
-    // the bit, or be left to it.
+    // the bit, or be left to it. And the word must end where it ends: alone, and in a stream
+    // with a word before it and white space, a delimiter or the end after it.
     const words = [_][]const u8{
-        "0",                         "-0",                "+0",                    "7",     "-7",  "+7",                 "5.",                  ".5",              "-.5",              "+.5",
-        "-0.0",                      "0.000",             "1.5",                   "-1.25", "007", "00.10",              ".",                   "-",               "+",                "-.",
-        "1.2.3",                     "1-2",               "--1",                   "+-1",   "1e5", "999999999999999999", "9999999999999999999", "123456789012345", "1234567890123456", "0.1234567890123456789012",
-        "0.12345678901234567890123", "3.141592653589793", "-922337203685477580.8",
+        "0",                         "-0",                "+0",                    "7",     "-7",  "+7",                 "5.",                    ".5",              "-.5",              "+.5",
+        "-0.0",                      "0.000",             "1.5",                   "-1.25", "007", "00.10",              ".",                     "-",               "+",                "-.",
+        "1.2.3",                     "1-2",               "--1",                   "+-1",   "1e5", "999999999999999999", "9999999999999999999",   "123456789012345", "1234567890123456", "0.1234567890123456789012",
+        "0.12345678901234567890123", "3.141592653589793", "-922337203685477580.8", "1#",    "1a2", "-x",                 "12345678901234567890x", "1.5-30",
     };
     var buf: [40]u8 = undefined;
+    var stream: [64]u8 = undefined;
+    var ended: usize = 0;
     var prng: std.Random.DefaultPrng = .init(0x7a706466);
     const rand = prng.random();
     var generated: usize = 0;
@@ -2448,7 +2464,9 @@ test "the numbers' fast path reads what the general one does, and leaves it the 
             break :blk buf[0..len];
         };
         const slow = numberSlow(w);
-        if (numberFast(w)) |fast| {
+        const alone = scanNumber(w, 0);
+        try testing.expectEqual(w.len, alone.end);
+        if (alone.token) |fast| {
             fast_taken += 1;
             const want = try slow;
             switch (fast) {
@@ -2457,9 +2475,18 @@ test "the numbers' fast path reads what the general one does, and leaves it the 
                 else => unreachable,
             }
         }
+        // "q " before the word; after it " Td", "/F1", "]" or nothing.
+        const afters = [_][]const u8{ " Td", "/F1", "]", "" };
+        const after = afters[k % afters.len];
+        const s = std.fmt.bufPrint(&stream, "q {s}{s}", .{ w, after }) catch unreachable;
+        const in_stream = scanNumber(s, 2);
+        try testing.expectEqual(2 + w.len, in_stream.end);
+        try testing.expectEqual(alone.token, in_stream.token);
+        if (after.len == 0) ended += 1;
     }
-    // The run did the work: most generated words are in the fast path's shapes.
-    try testing.expect(generated == 20000 and fast_taken > 10000);
+    // The run did the work: most generated words are in the fast path's shapes, and some words
+    // ended the stream.
+    try testing.expect(generated == 20000 and fast_taken > 10000 and ended > 1000);
 }
 
 test "file numbers that overflow are Malformed, not a crash" {
