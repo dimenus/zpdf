@@ -16,5 +16,5 @@
         },
     },
     // What a package that depends on zpdf needs: build.zig's first part reads only these.
-    .paths = .{ "build.zig", "build.zig.zon", "src", "tools/gen-abi.zig", "tools/gen-cid-table.zig", "LICENSE", "THIRD-PARTY-NOTICES.md" },
+    .paths = .{ "build.zig", "build.zig.zon", "src", "tools/gen-abi.zig", "tools/gen-cid-table.zig", "tools/gen-cmaps.zig", "LICENSE", "THIRD-PARTY-NOTICES.md" },
 }
