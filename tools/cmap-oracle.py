@@ -31,9 +31,13 @@ from pathlib import Path
 from pdfminer.cmapdb import CMapDB
 
 
+CMAPS = Path(__file__).resolve().parent.parent / "src/cmap"
+
+
 def adobe_file(name):
-    """({(length, code): cid}, {(length, code): notdef cid}) from src/cmap/<name>, usecmap first."""
-    text = Path("src/cmap", name).read_text(encoding="latin-1")
+    """({(length, code): cid}, {(length, code): notdef cid}) from src/cmap/<name>, usecmap first.
+    tools/read-oracle.py reads the CMaps through this too."""
+    text = (CMAPS / name).read_text(encoding="latin-1")
     cids, notdefs = {}, {}
     use = re.search(r"/(\S+)\s+usecmap", text)
     if use:
@@ -50,6 +54,17 @@ def adobe_file(name):
             for code, cid in re.findall(r"<([0-9a-fA-F]+)>\s*(\d+)", block):
                 target[(len(code) // 2, int(code, 16))] = int(cid)
     return cids, notdefs
+
+
+def adobe_codespace(name):
+    """[(length, low, high)]: the codespace ranges of src/cmap/<name>, or of the CMap it uses
+    when it has none of its own."""
+    text = (CMAPS / name).read_text(encoding="latin-1")
+    spaces = [(len(lo) // 2, int(lo, 16), int(hi, 16))
+              for block in re.findall(r"begincodespacerange(.*?)endcodespacerange", text, re.S)
+              for lo, hi in re.findall(r"<([0-9a-fA-F]+)>\s*<([0-9a-fA-F]+)>", block)]
+    use = re.search(r"/(\S+)\s+usecmap", text)
+    return spaces if spaces or not use else adobe_codespace(use.group(1))
 
 
 def pdfminer_codes(name):
