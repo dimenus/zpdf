@@ -20,6 +20,9 @@
   <machine> <pane>` runs `zig build test` and `dotnet-test` (and, on Linux, `tools/test-valgrind.sh`)
   from HEAD on each machine, in a shell pane
   that `herd-run` (on PATH, or `HERD_RUN`) can reach; it refuses a dirty tree. Run it before main moves.
+- `tools/consumer-test.sh` builds and runs `tests/consumer` against HEAD as `zig fetch` gets it (only
+  `build.zig.zon`'s `.paths`); a file the build needs but `.paths` leaves out fails only here. Run
+  it on this machine before main moves (test-platforms runs it on Linux; CI on Linux and macOS).
 - kb_text_shape comes from the fork `dimenus/kb`, branch `fixes`, pinned by commit in `build.zig.zon`.
   A kb change is made and tested in the fork first; then the pin moves here.
 - Before writing or changing code that calls a dependency (kb from `src/kb_shim.c` and `src/root.zig`),

@@ -31,12 +31,4 @@ jobs:
       # zpdf as another package gets it: fetched (only build.zig.zon's .paths), then built and run.
       - name: A package that depends on zpdf builds and runs
         if: runner.os != 'Windows'
-        run: |
-          set -euo pipefail
-          work=$(mktemp -d)
-          git archive --format=tar.gz -o "$work/zpdf.tar.gz" HEAD
-          cp -R tests/consumer "$work/consumer"
-          cd "$work/consumer"
-          zig fetch --save=zpdf "file://$work/zpdf.tar.gz"
-          zig build run
-          head -c 5 hello.pdf | grep -q '%PDF-'
+        run: tools/consumer-test.sh zig

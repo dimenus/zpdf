@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # zig build test and dotnet-test on other machines, from this checkout's HEAD, each machine in a shell
-# pane that herd-run can reach. With this machine's own `tools/zig build test`, that covers the
-# platforms CI covers, before anything is pushed.
+# pane that herd-run can reach, and on Linux test-valgrind and consumer-test too. With this
+# machine's own `tools/zig build test` and `tools/consumer-test.sh`, that covers what CI runs,
+# before anything is pushed.
 #
 #   tools/test-platforms.sh <linux|windows> <machine> <pane> [<linux|windows> <machine> <pane>]...
 #

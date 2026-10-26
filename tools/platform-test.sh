@@ -4,11 +4,11 @@
 #   platform-test.sh <commit>
 #
 # A fresh clone of $HOME/zpdf-platform-test.bundle into $HOME/zpdf-platform-test, which must be at
-# <commit>; then zig build test, dotnet-test, and tools/test-valgrind.sh with this machine's own
-# valgrind. Each must print its own result: a test count ("test success" with no count is a cached
-# step, and once passed for a run that never happened), and valgrind's "valgrind clean (N tests",
-# with libzpdf's static run in it.
-# Exit 0 when all three ran and passed, 1 when any failed or did not run, 2 when the clone is wrong.
+# <commit>; then zig build test, dotnet-test, tools/test-valgrind.sh with this machine's own
+# valgrind, and tools/consumer-test.sh. Each must print its own result: a test count ("test
+# success" with no count is a cached step, and once passed for a run that never happened),
+# valgrind's "valgrind clean (N tests", with libzpdf's static run in it, and the consumer's line.
+# Exit 0 when all four ran and passed, 1 when any failed or did not run, 2 when the clone is wrong.
 set -uo pipefail
 want=$1
 dir="$HOME/zpdf-platform-test"
@@ -43,7 +43,14 @@ if ! grep -qE "^valgrind clean \([1-9][0-9]* tests, and libzpdf under abi-test: 
   echo "no 'valgrind clean (N tests, and libzpdf under abi-test: ... static on musl' line (log: /tmp/zpdf-platform-valgrind.log)"
   v=3
 fi
-echo "zig build test exit=$t, dotnet-test exit=$d, test-valgrind exit=$v"
-if [ "$t" -ne 0 ] || [ "$d" -ne 0 ] || [ "$v" -ne 0 ]; then
+tools/consumer-test.sh > /tmp/zpdf-platform-consumer.log 2>&1
+c=$?
+grep -E "^consumer:" /tmp/zpdf-platform-consumer.log
+if ! grep -qE "^consumer: a package that depends on zpdf built" /tmp/zpdf-platform-consumer.log; then
+  echo "no 'consumer: ...' line: the consumer package did not build or run (log: /tmp/zpdf-platform-consumer.log)"
+  c=3
+fi
+echo "zig build test exit=$t, dotnet-test exit=$d, test-valgrind exit=$v, consumer-test exit=$c"
+if [ "$t" -ne 0 ] || [ "$d" -ne 0 ] || [ "$v" -ne 0 ] || [ "$c" -ne 0 ]; then
   exit 1
 fi
