@@ -38,7 +38,7 @@ Adobe's MustRead.html, which accompanies the AFM files:
 The glyph names are the Adobe Glyph List, glyphlist.txt, BSD-3-Clause, Copyright 2002-2019
 Adobe (https://github.com/adobe-type-tools/agl-aglfn); the ZapfDingbats names are the ITC
 Zapf Dingbats Glyph List, zapfdingbats.txt, from the same repository under the same terms.
-The Computer Modern names (TeX's) that the AGL lacks are zpdf's own, from Unicode's names.
+The names of TeX's fonts that the AGL lacks are zpdf's own, from Unicode's names.
 ```
 
 The Adobe Glyph List (https://github.com/adobe-type-tools/agl-aglfn), whose glyph names are

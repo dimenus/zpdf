@@ -387,8 +387,9 @@ fn utf16be(arena: Allocator, bytes: []const u8) Error![]const u21 {
 
 /// The characters a glyph name stands for: for a ZapfDingbats font, the ITC Zapf Dingbats Glyph
 /// List first (the AGL Specification's order, so its a1 to a191 are dingbats); then the Adobe
-/// Glyph List and TeX's Computer Modern names that it lacks (tables.glyph_names), then uniXXXX (one or more groups of four), uXXXX to uXXXXXX, then ligatures (a_b)
-/// and variants (a.sc) by their parts. Into `arena`: the result is a list's items, and parts of a
+/// Glyph List and the names of TeX's fonts that it lacks (tables.glyph_names), then uniXXXX (one
+/// or more groups of four), uXXXX to uXXXXXX, then ligatures (a_b) and variants (a.sc) by their
+/// parts. Into `arena`: the result is a list's items, and parts of a
 /// failed name are left there.
 fn glyphNameChars(arena: Allocator, name: []const u8, zapf_dingbats: bool, depth: u32) Error!?[]const u21 {
     const a = arena;
@@ -2753,6 +2754,28 @@ test "TeX's Computer Modern glyph names that the AGL lacks; a piece of a symbol 
     defer pt.deinit();
     try testing.expectEqual(@as(usize, 1), pt.runs.len);
     try testing.expectEqualStrings("\u{27e8}\u{27e9}\u{2016}\u{3b5}\u{3f5}(\u{2211}\u{fffd}", pt.runs[0].text);
+    try testing.expectEqual(@as(u32, 1), pt.runs[0].unmapped);
+}
+
+test "the AMS symbol fonts' and Euler's glyph names; a name two fonts use for two symbols has the first's" {
+    const gpa = testing.allocator;
+    const pdf = try read.test_util.build(gpa, &.{
+        "<< /Type /Catalog /Pages 2 0 R >>",
+        "<< /Type /Pages /Kids [3 0 R] /Count 1 /MediaBox [0 0 612 792] /Resources << /Font << /F 5 0 R >> >> >>",
+        "<< /Type /Page /Parent 2 0 R /Contents 4 0 R >>",
+        streamObject("", "BT /F 10 Tf 0 700 Td (ABCDEFG) Tj ET"),
+        // msam's \checkmark and \circeq, msbm's \nsubseteq and \nleqq (no character of its
+        // own: the plain relation's), Euler Fraktur's second d, its empty ghost, and msam's and
+        // msbm's followsorequal (msam's \succsim for both).
+        "<< /Type /Font /Subtype /Type1 /BaseFont /ABCDEF+MSAM10 /Encoding << /Differences [65 /check /circleequal /notsubseteql /notlessdblequal /dalt /ghost /followsorequal] >> >>",
+    }, "");
+    defer gpa.free(pdf);
+    var r = try Reader.open(gpa, pdf, .{});
+    defer r.deinit();
+    var pt = try r.pageText(gpa, 0);
+    defer pt.deinit();
+    try testing.expectEqual(@as(usize, 1), pt.runs.len);
+    try testing.expectEqualStrings("\u{2713}\u{2257}\u{2288}\u{2270}d\u{fffd}\u{227f}", pt.runs[0].text);
     try testing.expectEqual(@as(u32, 1), pt.runs[0].unmapped);
 }
 
