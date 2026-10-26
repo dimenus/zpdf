@@ -1,6 +1,6 @@
 # /// script
 # requires-python = ">=3.11"
-# dependencies = ["pdfminer.six==20260107"]
+# dependencies = ["pdfminer.six==20260107", "fonttools==4.60.1"]
 # ///
 """Compares what zpdf.read reads from PDFs with two readers that share no code with it: MuPDF
 (mutool, C) and pdfminer.six (Python).
@@ -43,9 +43,9 @@ excused; each one is in the code beside the place it applies:
   0o255 as a space and no bullet for WinAnsi's unused codes (Annex D); Symbol and ZapfDingbats
   with no base encoding by a Latin encoding instead of their built-in ones (9.6.6.1); and a
   ToUnicode space kept over a later U+00A0 for the same code.
-- pdfminer gives a ToUnicode value that is one UTF-16 half no character, and reads a CID font
-  with no /ToUnicode through an older copy of its collection's CID-to-Unicode table than zpdf's.
-  A page whose only differences in "order" are such glyphs is counted, and so is a "start" vote
+- pdfminer gives a ToUnicode value that is one UTF-16 half no character, reads a CID font
+  with no /ToUnicode through an older copy of its collection's CID-to-Unicode table than zpdf's,
+  and keeps the base encoding's character for a /Differences name it cannot read. A page whose only differences in "order" are such glyphs is counted, and so is a "start" vote
   that needs them (order_explanations).
 - mutool splits ligature characters unless asked not to (preserve-ligatures).
 - mutool draw leaves out text that the clip hides completely (FZ_STEXT_CLIP, set by mudraw.c
@@ -182,7 +182,10 @@ def pdfminer_pages(path):
     from pdfminer.cmapdb import CMapParser, FileCMap, FileUnicodeMap, PyUnicodeMap
     from pdfminer.converter import PDFLayoutAnalyzer, PDFPageAggregator
     from pdfminer.encodingdb import EncodingDB, name2unicode
-    from pdfminer.pdffont import FontMetricsDB, PDFCIDFont, PDFSimpleFont, PDFType1Font
+    from fontTools.cffLib import CFFFontSet
+    from fontTools.encodings.StandardEncoding import StandardEncoding
+    from pdfminer.pdffont import FontMetricsDB, PDFCIDFont, PDFSimpleFont, PDFType1Font, Type1FontHeaderParser
+    from pdfminer.psexceptions import PSEOF
     from pdfminer.layout import LTChar
     from pdfminer.pdfdevice import PDFTextDevice
     from pdfminer.pdfinterp import PDFPageInterpreter, PDFResourceManager
@@ -407,13 +410,54 @@ def pdfminer_pages(path):
         table = zpdf_cid_table(font.cidcoding)
         return None if table is None else table.get(cid)
 
+    def program_names(spec):
+        """{code: glyph name} of an embedded program's own encoding, for a simple font whose
+        /Encoding has no base encoding, which is then the base (9.6.6.1), as zpdf and MuPDF take
+        it: a Type 1 program's /Encoding in its cleartext, read with pdfminer's
+        Type1FontHeaderParser (pdfminer itself reads it only when the font has no /Encoding), or
+        a CFF program's (/FontFile3 /Type1C) encoding and glyph names, read with fontTools
+        (pdfminer's CFFFont maps a format 0 encoding's codes and glyphs the wrong way round).
+        Else {}."""
+        enc = resolve1(spec.get("Encoding"))
+        if enc is not None and not (isinstance(enc, dict) and "BaseEncoding" not in enc):
+            return {}
+        descriptor = resolve1(spec.get("FontDescriptor"))
+        if not isinstance(descriptor, dict):
+            return {}
+        try:
+            if isinstance(program := resolve1(descriptor.get("FontFile")), PDFStream):
+                parser = Type1FontHeaderParser(io.BytesIO(program.get_data()[:int(resolve1(program["Length1"]))]))
+                names = {}
+                while True:
+                    try:
+                        code, name = parser.nextobject()
+                    except PSEOF:
+                        return names
+                    names[code] = name
+            program = resolve1(descriptor.get("FontFile3"))
+            if isinstance(program, PDFStream) and literal_name(resolve1(program.get("Subtype"))) == "Type1C":
+                cff = CFFFontSet()
+                cff.decompile(io.BytesIO(program.get_data()), None)
+                encoding = cff[cff.fontNames[0]].Encoding
+                if encoding == "StandardEncoding":
+                    encoding = StandardEncoding
+                elif encoding == "ExpertEncoding":
+                    return {}
+                return {code: name for code, name in enumerate(encoding) if name != ".notdef"}
+        except Exception:
+            # A program neither can read gives no names: its codes are compared as before.
+            return {}
+        return {}
+
     differences = {}
 
     def code_info(font, cid):
-        """(its /Differences name or None, its ToUnicode value or None) for one drawn code."""
+        """(its glyph name or None, its ToUnicode value or None) for one drawn code: the name
+        from /Differences, else from the embedded program's own encoding (program_names)."""
         if id(font) not in differences:
-            names, code = {}, None
-            enc = resolve1(getattr(font, "_zpdf_spec", {}).get("Encoding"))
+            spec = getattr(font, "_zpdf_spec", {})
+            names, code = program_names(spec), None
+            enc = resolve1(spec.get("Encoding"))
             for d in (resolve1(enc.get("Differences")) or []) if isinstance(enc, dict) else []:
                 d = resolve1(d)
                 if isinstance(d, int):
@@ -649,6 +693,19 @@ def zpdf_cid_table(collection):
     src/cid, or None when zpdf has none for it."""
     path = pathlib.Path(__file__).resolve().parent.parent / "src/cid" / f"{collection}-UCS2"
     return ucs2_table(path.read_text(encoding="latin-1")) if path.is_file() else None
+
+
+@functools.cache
+def zpdf_glyph_names():
+    """{glyph name: code point} of zpdf's glyph_names (the AGL and TeX's Computer Modern names),
+    from src/read_tables.zig."""
+    path = pathlib.Path(__file__).resolve().parent.parent / "src/read_tables.zig"
+    text = path.read_text()
+    body = text[text.index("pub const glyph_names"):]
+    body = body[:body.index("};")]
+    names = {n: int(cp, 16) for n, cp in re.findall(r'\.name = "([^"]+)", \.cp = 0x([0-9A-F]+)', body)}
+    assert len(names) > 4000, len(names)
+    return names
 
 
 @functools.cache
@@ -975,11 +1032,24 @@ def joined_halves(a, b):
 def pdfminer_alternatives(geom, n):
     """{character: label}: what pdfminer's character n stands for once its counted deviations
     are allowed for (order_explanations): zpdf's CID-to-Unicode table's characters for its CID,
-    and the character a high half makes with the low half after it."""
+    the character a high half makes with the low half after it, and, for a glyph name that
+    pdfminer cannot read, MuPDF's character for it (mupdf_glyph_char) and zpdf's table's
+    (zpdf_glyph_names)."""
+    from pdfminer.encodingdb import name2unicode
+
     out = {}
     table = geom["tables"][n]
     if table is not None:
         out[table] = ORDER_TABLES
+    name, to_unicode = geom["codes"][n]
+    if name is not None and to_unicode is None:
+        try:
+            name2unicode(name)
+        except (KeyError, ValueError):
+            if mupdf_glyph_tables() is not None:
+                out.setdefault(mupdf_glyph_char(name), ORDER_NAMES)
+            if name in zpdf_glyph_names():
+                out.setdefault(chr(zpdf_glyph_names()[name]), ORDER_ZPDF_NAMES)
     if n + 1 < len(geom["chars"]):
         c = joined_halves(geom["chars"][n][0], geom["chars"][n + 1][0])
         if c is not None:
@@ -989,6 +1059,8 @@ def pdfminer_alternatives(geom, n):
 
 ORDER_TABLES = "order: only where pdfminer's CID-to-Unicode tables are another version"
 ORDER_HALVES = "order: only UTF-16 halves that pdfminer gives no character (zpdf joins a pair)"
+ORDER_NAMES = "order: only glyph names pdfminer cannot read, where zpdf reads them as MuPDF does"
+ORDER_ZPDF_NAMES = "order: only glyph names pdfminer cannot read, where zpdf reads them by its own table, not as MuPDF does"
 
 
 def order_explanations(runs, geom):
@@ -1001,7 +1073,12 @@ def order_explanations(runs, geom):
     - pdfminer decodes a ToUnicode value with "ignore", so one that is a single UTF-16 half gives
       no character (pdfminer_pages keeps the half): a high half and the low half after it must
       be zpdf's character for the two glyphs, on the first, and a half alone must be U+FFFD
-      (zpdf's unmapped character), on its glyph."""
+      (zpdf's unmapped character), on its glyph.
+    - pdfminer keeps the base encoding's character for a code whose /Differences name it cannot
+      read (EncodingDB.get_encoding), or none when the base has no character there: with no
+      ToUnicode, zpdf's character must be MuPDF's for that name (mupdf_glyph_char), or else what
+      zpdf's own table gives the name (zpdf_glyph_names: the cmex sizes and operators, which
+      MuPDF does not have), counted apart."""
     zs = [(r["actual_text"], t) for r in runs for t in glyph_texts(r)]
     chars = [c.replace("\x00", "\ufffd") for c, _, _ in geom["chars"]]
     assert len(zs) == len(chars), (len(zs), len(chars))
@@ -1019,8 +1096,8 @@ def order_explanations(runs, geom):
             continue
         if len(chars[j]) == 1 and 0xD800 <= ord(chars[j]) <= 0xDFFF and z == "\ufffd":
             labels.add(ORDER_HALVES)
-        elif alternatives.get(z) == ORDER_TABLES:
-            labels.add(ORDER_TABLES)
+        elif alternatives.get(z) in (ORDER_TABLES, ORDER_NAMES, ORDER_ZPDF_NAMES):
+            labels.add(alternatives[z])
         else:
             return None
         j += 1
@@ -1157,7 +1234,7 @@ def check(path, verbose):
                     allowed = allowed or any(a[:1] == t[0] for a in pdfminer_alternatives(geom, n))
                 votes["pdfminer"] = exact or allowed
                 if allowed and not exact:
-                    res["start: pdfminer agrees once its CID tables or UTF-16 halves are allowed for"] += 1
+                    res["start: pdfminer agrees once its CID tables, UTF-16 halves or glyph names are allowed for"] += 1
             if not votes:
                 continue
             if all(votes.values()):
