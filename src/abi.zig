@@ -1162,14 +1162,8 @@ pub fn capturePanic(msg: []const u8, first_trace_addr: ?usize) noreturn {
     @trap();
 }
 
-/// Where a new context's memory comes from: the system's malloc where libzpdf links libc, and
-/// smp_allocator on Linux, where it links none (build.zig, nativeModule).
-const base_allocator = if (is_wasm)
-    std.heap.wasm_allocator
-else if (builtin.link_libc)
-    std.heap.c_allocator
-else
-    std.heap.smp_allocator;
+/// Where a new context's memory comes from (zpdf.read.system_allocator says which, per build).
+const base_allocator = zpdf.read.system_allocator;
 
 /// The exports both builds have. tools/gen-abi.zig writes zpdf.h and the C# declarations from
 /// these: each doc comment goes with its function.

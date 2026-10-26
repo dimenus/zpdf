@@ -35,6 +35,7 @@ pub fn build(b: *std.Build) void {
     });
     mod.addOptions("abi_options", abiOptions(b, false, false));
     addKb(b, mod, kb, .libc);
+    addLibdeflate(b, mod, .libc);
     addCidMaps(mod, &cid, true);
     addValgrindMarks(mod);
 
@@ -110,6 +111,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addOptions("build_options", build_options);
     test_mod.addOptions("abi_options", abiOptions(b, false, false));
     addKb(b, test_mod, kb, .libc);
+    addLibdeflate(b, test_mod, .libc);
     addCidMaps(test_mod, &cid, true);
     addValgrindMarks(test_mod);
 
@@ -379,6 +381,7 @@ pub fn build(b: *std.Build) void {
     const notices = notices_run.addOutputFileArg("THIRD-PARTY-NOTICES.md");
     notices_run.addFileArg(b.path("src/read_tables.zig"));
     notices_run.addFileArg(kb.path("LICENSE"));
+    notices_run.addFileArg(b.dependency("libdeflate", .{}).path("COPYING"));
     for (cid_orderings) |ordering| notices_run.addFileArg(b.path(b.fmt("src/cid/Adobe-{s}-UCS2", .{ordering})));
     notices_run.addArg("--");
     for (cmapFiles(b)) |path| notices_run.addFileArg(b.path(path));
@@ -443,6 +446,7 @@ fn addZpdfModule(b: *std.Build, kb: *std.Build.Dependency, cid: *const CidMaps, 
     });
     m.addOptions("abi_options", abiOptions(b, false, false));
     addKb(b, m, kb, .libc);
+    addLibdeflate(b, m, .libc);
     addCidMaps(m, cid, true);
     addValgrindMarks(m);
     return m;
@@ -455,6 +459,7 @@ fn addNative(b: *std.Build, kb: *std.Build.Dependency, cid: *const CidMaps, targ
     const m = nativeModule(b, target, b.path("src/root.zig"), strip, valgrind);
     m.addOptions("abi_options", abiOptions(b, false, true));
     addKb(b, m, kb, if (m.link_libc == false) .no_crt_hidden else .libc_hidden);
+    addLibdeflate(b, m, if (m.link_libc == false) .no_crt_hidden else .libc_hidden);
     addCidMaps(m, cid, true);
     addValgrindMarks(m);
     return b.addLibrary(.{ .name = "zpdf", .linkage = linkage, .root_module = m });
@@ -533,6 +538,7 @@ fn addWasm(b: *std.Build, kb: *std.Build.Dependency, cid: *const CidMaps, name: 
     });
     wasm_mod.addOptions("abi_options", abiOptions(b, test_exports, false));
     addKb(b, wasm_mod, kb, .no_crt);
+    addLibdeflate(b, wasm_mod, .no_crt);
     addCidMaps(wasm_mod, cid, false);
     addValgrindMarks(wasm_mod);
     const wasm = b.addExecutable(.{
@@ -545,9 +551,13 @@ fn addWasm(b: *std.Build, kb: *std.Build.Dependency, cid: *const CidMaps, name: 
     return wasm;
 }
 
+/// How the C code built into a module (kb, libdeflate) gets its C runtime: none (wasm; Linux, where
+/// libzpdf links no libc) or libc, and whether its symbols are hidden from the library's exports.
+const CRuntime = enum { no_crt, no_crt_hidden, libc, libc_hidden };
+
 // kb_text_shape is compiled from src/kb_impl.c. Without a C runtime kb needs
 // memset and memcpy from somewhere, and takes its allocator from the caller.
-fn addKb(b: *std.Build, mod: *std.Build.Module, kb: *std.Build.Dependency, runtime: enum { no_crt, no_crt_hidden, libc, libc_hidden }) void {
+fn addKb(b: *std.Build, mod: *std.Build.Module, kb: *std.Build.Dependency, runtime: CRuntime) void {
     mod.addIncludePath(kb.path("."));
     mod.addCSourceFiles(.{
         .root = b.path("src"),
@@ -557,6 +567,24 @@ fn addKb(b: *std.Build, mod: *std.Build.Module, kb: *std.Build.Dependency, runti
             .no_crt_hidden => &.{ "-std=c11", "-ffreestanding", "-DKB_TEXT_SHAPE_NO_CRT", "-DKBTS_MEMSET=__builtin_memset", "-DKBTS_MEMCPY=__builtin_memcpy", "-fvisibility=hidden" },
             .libc => &.{"-std=c11"},
             .libc_hidden => &.{ "-std=c11", "-fvisibility=hidden" },
+        },
+    });
+}
+
+/// libdeflate's decompressor, for src/read.zig's inflate, compiled from src/libdeflate_impl.c (which
+/// says what it includes and why). Without a C runtime it is built FREESTANDING; it then never calls
+/// malloc, since read.zig passes its own allocator.
+fn addLibdeflate(b: *std.Build, mod: *std.Build.Module, runtime: CRuntime) void {
+    const libdeflate = b.dependency("libdeflate", .{});
+    mod.addIncludePath(libdeflate.path("."));
+    mod.addCSourceFiles(.{
+        .root = b.path("src"),
+        .files = &.{"libdeflate_impl.c"},
+        .flags = switch (runtime) {
+            .no_crt => &.{ "-std=c99", "-ffreestanding", "-DFREESTANDING" },
+            .no_crt_hidden => &.{ "-std=c99", "-ffreestanding", "-DFREESTANDING", "-fvisibility=hidden" },
+            .libc => &.{"-std=c99"},
+            .libc_hidden => &.{ "-std=c99", "-fvisibility=hidden" },
         },
     });
 }

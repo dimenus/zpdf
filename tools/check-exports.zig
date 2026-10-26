@@ -7,7 +7,9 @@
 //! only when C# first calls it (EntryPointNotFoundException); one exported but not declared is ABI
 //! that no binding covers. Each library is read by its own format, whatever the host: ELF (.dynsym),
 //! Mach-O (LC_SYMTAB, defined external symbols, without the leading underscore) or PE (the export
-//! directory). Only names starting with "zpdf_" count; the rest are the linker's own.
+//! directory). Names starting with "zpdf_" count, and those of the C code built in (kb's "kbts_",
+//! libdeflate's "libdeflate_"), which must all be hidden: one exported could bind to another copy
+//! of that library in the same process, or it to ours. The rest are the linker's own.
 //!
 //! An ELF libzpdf (Linux) must also need no other library (no DT_NEEDED) and import no symbol
 //! beyond `elf_imports`. It links no libc, so one file loads in a glibc process and in a musl
@@ -105,7 +107,9 @@ fn cString(bytes: []const u8, at: usize) ![]const u8 {
 }
 
 fn keep(arena: std.mem.Allocator, names: *Names, name: []const u8) !void {
-    if (std.mem.startsWith(u8, name, "zpdf_")) try names.put(arena, name, {});
+    for ([_][]const u8{ "zpdf_", "kbts_", "libdeflate_" }) |prefix| {
+        if (std.mem.startsWith(u8, name, prefix)) return names.put(arena, name, {});
+    }
 }
 
 /// From .dynsym, what the dynamic linker resolves: the defined global or weak functions (`names`)
