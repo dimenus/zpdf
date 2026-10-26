@@ -3,12 +3,14 @@
 # ///
 """Time libzpdf through its C ABI, as .NET and C call it: this tree against --base.
 
-    uv run tools/bench-abi.py [--base main] [--runs 10]
+    uv run tools/bench-abi.py [--base main] [--runs 10] [--pdf file.pdf ...]
 
 Builds libzpdf (`zig build abi`, ReleaseSafe as it ships, baseline CPU as native-all builds it) from
 this tree and from --base (a detached worktree), and tools/bench-abi.c from this tree against each.
 Cases: write the grid with 1 and 4 threads, and read a PDF's text with 1 and 4 threads, each thread
-with its own context (bench-abi.c says what each does). The two builds alternate run by run, so
+with its own context (bench-abi.c says what each does). With --pdf, the cases are instead each
+file's text read three times on 1 thread: the grid is one writer's PDF, and real files from other
+writers (pick them by measured read time) load the reader differently. The two builds alternate run by run, so
 drift on the machine falls on both.
 
 Each case must give the same output bytes, above zero, in every run of both builds, or the
@@ -90,7 +92,7 @@ def report(results, runs):
         for b in BUILDS:
             walls = [w for w, _ in by_build[b]]
             rss = statistics.median(r for _, r in by_build[b]) / 1024
-            print(f"{case:<18} {b:<5} wall ms median {statistics.median(walls):7.0f} "
+            print(f"{case:<22} {b:<5} wall ms median {statistics.median(walls):7.0f} "
                   f"({min(walls)} to {max(walls)})   peak RSS MB median {rss:6.1f}")
     # Before any message on stderr, so the table comes first.
     sys.stdout.flush()
@@ -100,20 +102,25 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--base", default="main")
     parser.add_argument("--runs", type=int, default=10)
+    parser.add_argument("--pdf", type=Path, action="append", default=[],
+                        help="read this file instead of the grid cases (repeatable)")
     args = parser.parse_args()
 
     font = ab.harfbuzz_test_dir() / ab.FONT
     with tempfile.TemporaryDirectory(prefix="zpdf-bench-abi-") as tmp:
         work = Path(tmp)
         harness = build(work, args.base)
-        pdf = work / "input.pdf"
-        run([harness["new"], "write", "1", "20000", font, pdf])
-        cases = {
-            "write 1 thread": ["write", "1", "100000", font, "-"],
-            "write 4 threads": ["write", "4", "100000", font, "-"],
-            "read 1 thread": ["read", "1", "5", pdf],
-            "read 4 threads": ["read", "4", "5", pdf],
-        }
+        if args.pdf:
+            cases = {f"read {p.name}": ["read", "1", "3", p.resolve()] for p in args.pdf}
+        else:
+            pdf = work / "input.pdf"
+            run([harness["new"], "write", "1", "20000", font, pdf])
+            cases = {
+                "write 1 thread": ["write", "1", "100000", font, "-"],
+                "write 4 threads": ["write", "4", "100000", font, "-"],
+                "read 1 thread": ["read", "1", "5", pdf],
+                "read 4 threads": ["read", "4", "5", pdf],
+            }
         results = measure(harness, cases, args.runs)
         report(results, args.runs)
         gaps = {case: argv for case, argv in cases.items() if slower(results[case])}

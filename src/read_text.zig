@@ -1225,7 +1225,13 @@ const Interp = struct {
                 },
                 else => {
                     if (operands.items.len >= 1 << 16) return error.TooLarge;
-                    try operands.append(self.scratch, try p.fromToken(t, 0));
+                    // A number is its own operand. Parser.fromToken would read two tokens ahead
+                    // for an `n g R` reference, which a content stream cannot hold (7.8.2).
+                    try operands.append(self.scratch, switch (t) {
+                        .integer => |i| .{ .integer = i },
+                        .real => |r| .{ .real = r },
+                        else => try p.fromToken(t, 0),
+                    });
                 },
             }
         }

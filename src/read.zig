@@ -1069,7 +1069,7 @@ pub const Scope = struct {
         const keyword = "endstream";
         if (!std.mem.startsWith(u8, s.r.bytes[at..], keyword)) return error.Malformed;
         at += keyword.len;
-        if (at < s.r.bytes.len and !isWhite(s.r.bytes[at]) and !isDelimiter(s.r.bytes[at])) return error.Malformed;
+        if (at < s.r.bytes.len and isRegular(s.r.bytes[at])) return error.Malformed;
         lx.pos = at;
         return .{ .stream = .{ .dict = dict, .raw = s.r.bytes[start..end], .ref = ref } };
     }
@@ -1145,23 +1145,33 @@ pub const Token = union(enum) {
     dict_close,
 };
 
-pub fn isWhite(c: u8) bool {
-    return switch (c) {
-        0, 9, 10, 12, 13, 32 => true,
-        else => false,
-    };
+/// The three kinds of character (7.2.3): white space, delimiters, and the regular characters that
+/// make up words. One table, so the lexer's inner loops do one lookup per byte.
+const CharClass = enum(u2) { regular, white, delimiter };
+
+const char_class: [256]CharClass = blk: {
+    var t: [256]CharClass = @splat(.regular);
+    for ([_]u8{ 0, 9, 10, 12, 13, 32 }) |c| t[c] = .white;
+    for ("()<>[]{}/%") |c| t[c] = .delimiter;
+    break :blk t;
+};
+
+pub inline fn isWhite(c: u8) bool {
+    return char_class[c] == .white;
 }
 
-pub fn isDelimiter(c: u8) bool {
-    return switch (c) {
-        '(', ')', '<', '>', '[', ']', '{', '}', '/', '%' => true,
-        else => false,
-    };
+pub inline fn isDelimiter(c: u8) bool {
+    return char_class[c] == .delimiter;
 }
 
-/// PDF tokens (ISO 32000-1 7.2, 7.3). Strings and escaped names are decoded into the arena
-/// `next` is given; keywords, numbers' text and plain names are slices of `src`. So a token
-/// borrows from both: it is valid while both live, and a payload is never freed.
+inline fn isRegular(c: u8) bool {
+    return char_class[c] == .regular;
+}
+
+/// PDF tokens (ISO 32000-1 7.2, 7.3). Hex strings, literal strings with an escape, a parenthesis or
+/// a CR, and escaped names are decoded into the arena `next` is given; keywords, numbers' text,
+/// other literal strings and plain names are slices of `src`. So a token borrows from both: it is
+/// valid while both live, and a payload is never freed.
 pub const Lexer = struct {
     src: []const u8,
     pos: usize,
@@ -1222,7 +1232,7 @@ pub const Lexer = struct {
             else => {},
         }
         const start = self.pos;
-        while (self.pos < self.src.len and !isWhite(self.src[self.pos]) and !isDelimiter(self.src[self.pos])) self.pos += 1;
+        while (self.pos < self.src.len and isRegular(self.src[self.pos])) self.pos += 1;
         const word = self.src[start..self.pos];
         if (isNumberStart(word[0])) return number(word);
         return .{ .keyword = word };
@@ -1231,9 +1241,12 @@ pub const Lexer = struct {
     fn name(self: *Lexer, arena: *std.heap.ArenaAllocator) Error![]const u8 {
         const a = arena.allocator();
         const start = self.pos;
-        while (self.pos < self.src.len and !isWhite(self.src[self.pos]) and !isDelimiter(self.src[self.pos])) self.pos += 1;
+        var escaped = false;
+        while (self.pos < self.src.len and isRegular(self.src[self.pos])) : (self.pos += 1) {
+            if (self.src[self.pos] == '#') escaped = true;
+        }
         const raw = self.src[start..self.pos];
-        if (std.mem.indexOfScalar(u8, raw, '#') == null) return raw;
+        if (!escaped) return raw;
         var out = try a.alloc(u8, raw.len);
         var n: usize = 0;
         var i: usize = 0;
@@ -1276,6 +1289,16 @@ pub const Lexer = struct {
     fn literalString(self: *Lexer, arena: *std.heap.ArenaAllocator) Error![]const u8 {
         const a = arena.allocator();
         self.pos += 1;
+        // A string with no escape, nested parenthesis or CR is its bytes as they are.
+        for (self.src[self.pos..], self.pos..) |c, j| switch (c) {
+            ')' => {
+                const plain = self.src[self.pos..j];
+                self.pos = j + 1;
+                return plain;
+            },
+            '(', '\\', '\r' => break,
+            else => {},
+        };
         var out: std.ArrayList(u8) = .empty;
         var depth: usize = 1;
         while (true) {
@@ -1337,6 +1360,52 @@ pub fn isNumberStart(c: u8) bool {
 }
 
 fn number(word: []const u8) Error!Token {
+    return numberFast(word) orelse numberSlow(word);
+}
+
+/// The common shapes, [+-]digits and [+-]digits.digits, read without std.fmt: an integer of at most
+/// 18 digits, and a real of at most 15 digits with at most 22 after the point. Then the digits as an
+/// integer and the power of ten are both exact as f64, so one division is the correctly rounded
+/// value, the one numberSlow's parseFloat gives. Anything else (more digits, a lone sign or point,
+/// a character that is not a digit) is left to numberSlow: null.
+fn numberFast(word: []const u8) ?Token {
+    const pow10 = comptime blk: {
+        var t: [23]f64 = undefined;
+        var v: f64 = 1;
+        for (&t) |*e| {
+            e.* = v;
+            v *= 10;
+        }
+        break :blk t;
+    };
+    var i: usize = 0;
+    const neg = word[0] == '-';
+    if (word[0] == '-' or word[0] == '+') i = 1;
+    var mantissa: u64 = 0;
+    var digits: usize = 0;
+    var point: ?usize = null;
+    while (i < word.len) : (i += 1) {
+        const c = word[i];
+        if (c >= '0' and c <= '9') {
+            if (digits == 18) return null;
+            mantissa = mantissa * 10 + (c - '0');
+            digits += 1;
+        } else if (c == '.' and point == null) {
+            point = digits;
+        } else return null;
+    }
+    if (digits == 0) return null;
+    const p = point orelse {
+        const v: i64 = @intCast(mantissa);
+        return .{ .integer = if (neg) -v else v };
+    };
+    const after = digits - p;
+    if (digits > 15 or after > 22) return null;
+    const v = @as(f64, @floatFromInt(mantissa)) / pow10[after];
+    return .{ .real = if (neg) -v else v };
+}
+
+fn numberSlow(word: []const u8) Error!Token {
     for (word) |c| {
         if (!(std.ascii.isDigit(c) or c == '+' or c == '-' or c == '.')) return error.Malformed;
     }
@@ -2034,6 +2103,14 @@ test "the lexer decodes strings, names and numbers as ISO 32000-1 7.3 says" {
     try testing.expectEqualStrings("true", (try lx.next(&arena_state)).keyword);
     try testing.expectEqualStrings("R", (try lx.next(&arena_state)).keyword);
     try testing.expectEqual(Token.eof, try lx.next(&arena_state));
+    // A string whose only special characters are balanced parentheses, which the plain-string
+    // path must not end at the first ')'; and a comment straight after a word, which ends it.
+    var more: Lexer = .{ .src = "(a(b)c) (plain) 12%c\n13", .pos = 0 };
+    try testing.expectEqualStrings("a(b)c", (try more.next(&arena_state)).string);
+    try testing.expectEqualStrings("plain", (try more.next(&arena_state)).string);
+    try testing.expectEqual(@as(i64, 12), (try more.next(&arena_state)).integer);
+    try testing.expectEqual(@as(i64, 13), (try more.next(&arena_state)).integer);
+    try testing.expectEqual(Token.eof, try more.next(&arena_state));
     for ([_][]const u8{ "1-2", "--1", "(open", "<4g>", "/A#2", ">", "1e5" }) |bad| {
         var l: Lexer = .{ .src = bad, .pos = 0 };
         try testing.expectError(error.Malformed, l.next(&arena_state));
@@ -2215,6 +2292,69 @@ const TestFile = struct {
         try self.aw.writer.writeAll("\nendstream\nendobj\n");
     }
 };
+
+test "the numbers' fast path reads what the general one does, and leaves it the rest" {
+    // Shapes and edges by hand, then generated words: each must read as numberSlow reads it, to
+    // the bit, or be left to it.
+    const words = [_][]const u8{
+        "0",                         "-0",                "+0",                    "7",     "-7",  "+7",                 "5.",                  ".5",              "-.5",              "+.5",
+        "-0.0",                      "0.000",             "1.5",                   "-1.25", "007", "00.10",              ".",                   "-",               "+",                "-.",
+        "1.2.3",                     "1-2",               "--1",                   "+-1",   "1e5", "999999999999999999", "9999999999999999999", "123456789012345", "1234567890123456", "0.1234567890123456789012",
+        "0.12345678901234567890123", "3.141592653589793", "-922337203685477580.8",
+    };
+    var buf: [40]u8 = undefined;
+    var prng: std.Random.DefaultPrng = .init(0x7a706466);
+    const rand = prng.random();
+    var generated: usize = 0;
+    var fast_taken: usize = 0;
+    var k: usize = 0;
+    while (k < words.len + 20000) : (k += 1) {
+        const w: []const u8 = if (k < words.len) words[k] else blk: {
+            // Three in four in the fast path's shape (a sign, digits, a point, digits, near its
+            // limits), one in four any mix of digits, points and signs.
+            var len: usize = 0;
+            if (rand.uintLessThan(u8, 4) == 0) {
+                len = rand.intRangeAtMost(usize, 1, 24);
+                for (buf[0..len]) |*c| c.* = "0123456789.-+"[rand.uintLessThan(u8, 13)];
+            } else {
+                if (rand.boolean()) {
+                    buf[0] = "-+"[rand.uintLessThan(u8, 2)];
+                    len = 1;
+                }
+                for (0..rand.uintAtMost(usize, 16)) |_| {
+                    buf[len] = '0' + rand.uintLessThan(u8, 10);
+                    len += 1;
+                }
+                if (rand.boolean()) {
+                    buf[len] = '.';
+                    len += 1;
+                    for (0..rand.uintAtMost(usize, 23 - @min(len, 23))) |_| {
+                        buf[len] = '0' + rand.uintLessThan(u8, 10);
+                        len += 1;
+                    }
+                }
+                if (len == 0) {
+                    buf[0] = '0';
+                    len = 1;
+                }
+            }
+            generated += 1;
+            break :blk buf[0..len];
+        };
+        const slow = numberSlow(w);
+        if (numberFast(w)) |fast| {
+            fast_taken += 1;
+            const want = try slow;
+            switch (fast) {
+                .integer => |v| try testing.expectEqual(want.integer, v),
+                .real => |v| try testing.expectEqual(@as(u64, @bitCast(want.real)), @as(u64, @bitCast(v))),
+                else => unreachable,
+            }
+        }
+    }
+    // The run did the work: most generated words are in the fast path's shapes.
+    try testing.expect(generated == 20000 and fast_taken > 10000);
+}
 
 test "file numbers that overflow are Malformed, not a crash" {
     const gpa = testing.allocator;
