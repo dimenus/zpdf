@@ -1384,14 +1384,18 @@ const ScannedNumber = struct {
 };
 
 /// The word at `start` (a number's first character), found and read in one pass. The common
-/// shapes, [+-]digits and [+-]digits.digits, are read without std.fmt: an integer of at most 18
-/// digits, and a real of at most 15 digits with at most 22 after the point. Then the digits as an
-/// integer and the power of ten are both exact as f64, so one division is the correctly rounded
-/// value, the one numberSlow's parseFloat gives. Anything else (more digits, a lone sign or point,
-/// a regular character that is not a digit) gives a null token, and the word is left to numberSlow.
+/// shapes, [+-]digits and [+-]digits.digits, are read without std.fmt: an integer of at most
+/// `max_int_digits` digits, and a real of at most `max_real_digits` digits with at most
+/// `max_after_point` after the point. Then the digits as an integer and the power of ten are both
+/// exact as f64, so one division is the correctly rounded value, the one numberSlow's parseFloat
+/// gives. Anything else (more digits, a lone sign or point, a regular character that is not a
+/// digit) gives a null token, and the word is left to numberSlow.
 fn scanNumber(src: []const u8, start: usize) ScannedNumber {
+    const max_int_digits = 18;
+    const max_real_digits = 15;
+    const max_after_point = 22;
     const pow10 = comptime blk: {
-        var t: [23]f64 = undefined;
+        var t: [max_after_point + 1]f64 = undefined;
         var v: f64 = 1;
         for (&t) |*e| {
             e.* = v;
@@ -1399,6 +1403,12 @@ fn scanNumber(src: []const u8, start: usize) ScannedNumber {
         }
         break :blk t;
     };
+    // The limits are what make the fast path exact; raising one past these fails the build.
+    comptime {
+        std.debug.assert(std.math.pow(u64, 10, max_int_digits) - 1 <= std.math.maxInt(i64));
+        std.debug.assert(std.math.pow(u64, 10, max_real_digits) - 1 <= 1 << (std.math.floatMantissaBits(f64) + 1));
+        for (pow10, 0..) |p, n| std.debug.assert(@as(u128, @intFromFloat(p)) == std.math.pow(u128, 10, n));
+    }
     var i = start;
     const neg = src[i] == '-';
     if (src[i] == '-' or src[i] == '+') i += 1;
@@ -1407,8 +1417,8 @@ fn scanNumber(src: []const u8, start: usize) ScannedNumber {
     var point: ?usize = null;
     const end = while (i < src.len) : (i += 1) {
         const c = src[i];
-        if (c >= '0' and c <= '9') {
-            if (digits == 18) break null;
+        if (std.ascii.isDigit(c)) {
+            if (digits == max_int_digits) break null;
             mantissa = mantissa * 10 + (c - '0');
             digits += 1;
         } else if (c == '.' and point == null) {
@@ -1427,7 +1437,7 @@ fn scanNumber(src: []const u8, start: usize) ScannedNumber {
         return .{ .end = e, .token = .{ .integer = if (neg) -v else v } };
     };
     const after = digits - p;
-    if (digits > 15 or after > 22) return .{ .end = e, .token = null };
+    if (digits > max_real_digits or after > max_after_point) return .{ .end = e, .token = null };
     const v = @as(f64, @floatFromInt(mantissa)) / pow10[after];
     return .{ .end = e, .token = .{ .real = if (neg) -v else v } };
 }
